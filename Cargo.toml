@@ -7,6 +7,7 @@ description = "Pure Rust HEIF/HEIC/AVIF decoder (work in progress)"
 readme = "README.md"
 
 [dependencies]
+heic-decoder = { path = "vendor/heic-decoder" }
 libc = "0.2"
 png = "0.18"
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }

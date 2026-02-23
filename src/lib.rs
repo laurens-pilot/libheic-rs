@@ -1,3 +1,4 @@
+use heic_decoder::DecodedFrame as HeicDecoderFrame;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{
@@ -123,6 +124,27 @@ pub enum HeicPixelLayout {
     Yuv420,
     Yuv422,
     Yuv444,
+}
+
+/// One decoded HEIC image plane in row-major order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicPlane {
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<u16>,
+}
+
+/// Decoded HEIC image in planar YUV form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedHeicImage {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub layout: HeicPixelLayout,
+    pub y_plane: HeicPlane,
+    pub u_plane: Option<HeicPlane>,
+    pub v_plane: Option<HeicPlane>,
 }
 
 /// Parsed HEIC image metadata extracted from the primary HEVC SPS.
@@ -359,6 +381,12 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
 pub enum DecodeHeicError {
     ParsePrimaryProperties(isobmff::ParsePrimaryHeicPropertiesError),
     ExtractPrimaryPayload(isobmff::ExtractHeicItemDataError),
+    BackendDecodeFailed {
+        detail: String,
+    },
+    InvalidDecodedFrame {
+        detail: String,
+    },
     InvalidNalLengthSize {
         nal_length_size: u8,
     },
@@ -396,6 +424,7 @@ pub enum DecodeHeicError {
     UnsupportedSpsChromaArrayType {
         chroma_array_type: u8,
     },
+    MissingVclNalUnit,
     DecodedGeometryMismatch {
         expected_width: u32,
         expected_height: u32,
@@ -409,6 +438,12 @@ impl Display for DecodeHeicError {
         match self {
             DecodeHeicError::ParsePrimaryProperties(err) => write!(f, "{err}"),
             DecodeHeicError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
+            DecodeHeicError::BackendDecodeFailed { detail } => {
+                write!(f, "pure-Rust HEVC backend failed to decode frame: {detail}")
+            }
+            DecodeHeicError::InvalidDecodedFrame { detail } => {
+                write!(f, "decoded HEVC frame is invalid: {detail}")
+            }
             DecodeHeicError::InvalidNalLengthSize { nal_length_size } => write!(
                 f,
                 "HEVC nal_length_size must be in 1..=4, got {nal_length_size}"
@@ -458,6 +493,10 @@ impl Display for DecodeHeicError {
             DecodeHeicError::UnsupportedSpsChromaArrayType { chroma_array_type } => write!(
                 f,
                 "decoded HEVC SPS reports unsupported chroma_array_type {chroma_array_type}"
+            ),
+            DecodeHeicError::MissingVclNalUnit => write!(
+                f,
+                "length-prefixed HEVC stream does not contain a VCL NAL unit"
             ),
             DecodeHeicError::DecodedGeometryMismatch {
                 expected_width,
@@ -551,6 +590,12 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
     assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)
 }
 
+/// Decode the primary HEIC item into an internal planar YUV image model.
+pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
+    let stream = assemble_primary_heic_hevc_stream(input)?;
+    decode_hevc_stream_to_image(&stream)
+}
+
 /// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
@@ -570,6 +615,202 @@ pub fn decode_primary_heic_to_metadata(
     }
 
     Ok(decoded)
+}
+
+fn decode_hevc_stream_to_image(stream: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
+    let parsed_nals = parse_length_prefixed_hevc_nal_units(stream)?;
+    if !parsed_nals
+        .iter()
+        .any(|nal| nal.class() == HevcNalClass::Vcl)
+    {
+        return Err(DecodeHeicError::MissingVclNalUnit);
+    }
+
+    let mut backend_stream = Vec::with_capacity(stream.len());
+    for nal_unit in parsed_nals {
+        append_nal_with_u32_length_prefix(nal_unit.bytes, &mut backend_stream)?;
+    }
+
+    let decoded = heic_decoder::hevc::decode(&backend_stream).map_err(|err| {
+        DecodeHeicError::BackendDecodeFailed {
+            detail: err.to_string(),
+        }
+    })?;
+    heic_decoder_frame_to_internal_image(&decoded)
+}
+
+fn heic_decoder_frame_to_internal_image(
+    frame: &HeicDecoderFrame,
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    let width = frame.cropped_width();
+    let height = frame.cropped_height();
+    if width == 0 || height == 0 {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("cropped geometry must be non-zero, got {width}x{height}"),
+        });
+    }
+
+    let layout = heic_layout_from_sps_chroma_array_type(frame.chroma_format)?;
+    let y_plane = extract_cropped_heic_plane(
+        &frame.y_plane,
+        frame.y_stride(),
+        frame.crop_left,
+        frame.crop_top,
+        width,
+        height,
+        "Y",
+    )?;
+
+    let (u_plane, v_plane) = match layout {
+        HeicPixelLayout::Yuv400 => (None, None),
+        HeicPixelLayout::Yuv420 | HeicPixelLayout::Yuv422 | HeicPixelLayout::Yuv444 => {
+            let (subsample_x, subsample_y) = heic_chroma_subsampling(layout);
+            if !frame.crop_left.is_multiple_of(subsample_x)
+                || !frame.crop_right.is_multiple_of(subsample_x)
+                || !frame.crop_top.is_multiple_of(subsample_y)
+                || !frame.crop_bottom.is_multiple_of(subsample_y)
+            {
+                return Err(DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!(
+                        "chroma crop alignment mismatch for layout {layout:?}: crop=({}, {}, {}, {})",
+                        frame.crop_left, frame.crop_right, frame.crop_top, frame.crop_bottom
+                    ),
+                });
+            }
+
+            let chroma_width = width.div_ceil(subsample_x);
+            let chroma_height = height.div_ceil(subsample_y);
+            let chroma_crop_left = frame.crop_left / subsample_x;
+            let chroma_crop_top = frame.crop_top / subsample_y;
+
+            let cb_plane = extract_cropped_heic_plane(
+                &frame.cb_plane,
+                frame.c_stride(),
+                chroma_crop_left,
+                chroma_crop_top,
+                chroma_width,
+                chroma_height,
+                "U",
+            )?;
+            let cr_plane = extract_cropped_heic_plane(
+                &frame.cr_plane,
+                frame.c_stride(),
+                chroma_crop_left,
+                chroma_crop_top,
+                chroma_width,
+                chroma_height,
+                "V",
+            )?;
+            (Some(cb_plane), Some(cr_plane))
+        }
+    };
+
+    Ok(DecodedHeicImage {
+        width,
+        height,
+        bit_depth_luma: frame.bit_depth,
+        bit_depth_chroma: frame.bit_depth,
+        layout,
+        y_plane,
+        u_plane,
+        v_plane,
+    })
+}
+
+fn heic_chroma_subsampling(layout: HeicPixelLayout) -> (u32, u32) {
+    match layout {
+        HeicPixelLayout::Yuv400 | HeicPixelLayout::Yuv444 => (1, 1),
+        HeicPixelLayout::Yuv420 => (2, 2),
+        HeicPixelLayout::Yuv422 => (2, 1),
+    }
+}
+
+fn extract_cropped_heic_plane(
+    source: &[u16],
+    stride: usize,
+    crop_left: u32,
+    crop_top: u32,
+    width: u32,
+    height: u32,
+    plane: &'static str,
+) -> Result<HeicPlane, DecodeHeicError> {
+    let width_usize = usize::try_from(width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!("{plane} plane width does not fit in usize ({width})"),
+    })?;
+    let height_usize =
+        usize::try_from(height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} plane height does not fit in usize ({height})"),
+        })?;
+    let crop_left_usize =
+        usize::try_from(crop_left).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} plane crop_left does not fit in usize ({crop_left})"),
+        })?;
+    let crop_top_usize =
+        usize::try_from(crop_top).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} plane crop_top does not fit in usize ({crop_top})"),
+        })?;
+
+    let row_end = crop_left_usize
+        .checked_add(width_usize)
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} plane row bound overflows: crop_left={crop_left_usize}, width={width_usize}"
+            ),
+        })?;
+    if row_end > stride {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane} plane stride {stride} smaller than crop+width bound {row_end}"
+            ),
+        });
+    }
+
+    let expected_samples = width_usize.checked_mul(height_usize).ok_or_else(|| {
+        DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} plane sample count overflow for {width_usize}x{height_usize}"),
+        }
+    })?;
+    let mut samples = Vec::with_capacity(expected_samples);
+
+    for row in 0..height_usize {
+        let src_row = crop_top_usize.checked_add(row).ok_or_else(|| {
+            DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{plane} plane row index overflow: crop_top={crop_top_usize}, row={row}"
+                ),
+            }
+        })?;
+        let src_start = src_row
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(crop_left_usize))
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{plane} plane source index overflow at row {row} (stride={stride}, crop_left={crop_left_usize})"
+                ),
+            })?;
+        let src_end = src_start
+            .checked_add(width_usize)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{plane} plane source row end overflow at row {row} (start={src_start}, width={width_usize})"
+                ),
+            })?;
+        if src_end > source.len() {
+            return Err(DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{plane} plane row {row} exceeds decoded buffer: end={src_end}, available={}",
+                    source.len()
+                ),
+            });
+        }
+        samples.extend_from_slice(&source[src_start..src_end]);
+    }
+
+    Ok(HeicPlane {
+        width,
+        height,
+        samples,
+    })
 }
 
 fn assemble_heic_hevc_stream_from_components(
@@ -1610,9 +1851,10 @@ mod tests {
     use super::{
         append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
         convert_avif_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
-        decode_primary_avif_to_image, decode_primary_heic_to_metadata,
-        parse_length_prefixed_hevc_nal_units, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeHeicError, DecodedAvifImage, HeicPixelLayout, HevcNalClass,
+        decode_hevc_stream_to_image, decode_primary_avif_to_image, decode_primary_heic_to_image,
+        decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units, AvifPixelLayout,
+        AvifPlane, AvifPlaneSamples, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
+        HeicPixelLayout, HevcNalClass,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -1805,6 +2047,21 @@ mod tests {
     }
 
     #[test]
+    fn decodes_primary_heic_image_for_fixture_without_pixi_property() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+
+        let decoded = decode_primary_heic_to_image(&input)
+            .expect("fixture without pixi should decode to planar HEIC image");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert!(decoded.bit_depth_luma >= 8);
+        assert!(decoded.bit_depth_chroma >= 8);
+        assert_heic_plane_shapes(&decoded);
+    }
+
+    #[test]
     fn reports_missing_sps_for_length_prefixed_stream_without_sps_nal() {
         // NAL header with nal_unit_type=34 (PPS), layer_id=0, temporal_id_plus1=1.
         let pps_nal = [0x44, 0x01, 0x80];
@@ -1830,6 +2087,18 @@ mod tests {
                 available: 2,
             }
         ));
+    }
+
+    #[test]
+    fn reports_missing_vcl_when_decoding_heic_stream_image() {
+        let sps_nal = [0x42, 0x01, 0x01];
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&(sps_nal.len() as u32).to_be_bytes());
+        stream.extend_from_slice(&sps_nal);
+
+        let err = decode_hevc_stream_to_image(&stream)
+            .expect_err("stream without VCL NAL must fail backend image decode");
+        assert!(matches!(err, DecodeHeicError::MissingVclNalUnit));
     }
 
     #[test]
@@ -1900,6 +2169,42 @@ mod tests {
         match &plane.samples {
             AvifPlaneSamples::U8(samples) => assert_eq!(samples.len(), expected_samples),
             AvifPlaneSamples::U16(samples) => assert_eq!(samples.len(), expected_samples),
+        }
+    }
+
+    fn assert_heic_plane_shapes(decoded: &DecodedHeicImage) {
+        let y_expected = decoded.width as usize * decoded.height as usize;
+        assert_eq!(decoded.y_plane.width, decoded.width);
+        assert_eq!(decoded.y_plane.height, decoded.height);
+        assert_eq!(decoded.y_plane.samples.len(), y_expected);
+
+        match decoded.layout {
+            HeicPixelLayout::Yuv400 => {
+                assert!(decoded.u_plane.is_none());
+                assert!(decoded.v_plane.is_none());
+            }
+            HeicPixelLayout::Yuv420 | HeicPixelLayout::Yuv422 | HeicPixelLayout::Yuv444 => {
+                let (chroma_width, chroma_height) =
+                    heic_chroma_dimensions(decoded.width, decoded.height, decoded.layout);
+                let expected_chroma_samples = chroma_width as usize * chroma_height as usize;
+                let u_plane = decoded.u_plane.as_ref().expect("U plane should exist");
+                let v_plane = decoded.v_plane.as_ref().expect("V plane should exist");
+                assert_eq!(u_plane.width, chroma_width);
+                assert_eq!(u_plane.height, chroma_height);
+                assert_eq!(v_plane.width, chroma_width);
+                assert_eq!(v_plane.height, chroma_height);
+                assert_eq!(u_plane.samples.len(), expected_chroma_samples);
+                assert_eq!(v_plane.samples.len(), expected_chroma_samples);
+            }
+        }
+    }
+
+    fn heic_chroma_dimensions(width: u32, height: u32, layout: HeicPixelLayout) -> (u32, u32) {
+        match layout {
+            HeicPixelLayout::Yuv400 => (0, 0),
+            HeicPixelLayout::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+            HeicPixelLayout::Yuv422 => (width.div_ceil(2), height),
+            HeicPixelLayout::Yuv444 => (width, height),
         }
     }
 }
