@@ -7,13 +7,13 @@ Pure Rust HEIF/HEIC/AVIF decoder (work in progress).
 Build:
 
 ```bash
-cargo build --release --bin heif-decode
+cargo build --manifest-path libheic-rs/Cargo.toml --release --bin heif-decode
 ```
 
 Usage:
 
 ```bash
-target/release/heif-decode <input.heif|.heic|.avif> <output.png>
+libheic-rs/target/release/heif-decode <input.heif|.heic|.avif> <output.png>
 ```
 
 ## Status
