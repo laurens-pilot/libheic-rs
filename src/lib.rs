@@ -90,6 +90,13 @@ pub enum AvifPixelLayout {
     Yuv444,
 }
 
+/// Decoded YCbCr sample range derived from nclx signalling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum YCbCrRange {
+    Full,
+    Limited,
+}
+
 /// Decoded AVIF plane samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AvifPlaneSamples {
@@ -112,6 +119,7 @@ pub struct DecodedAvifImage {
     pub height: u32,
     pub bit_depth: u8,
     pub layout: AvifPixelLayout,
+    pub ycbcr_range: YCbCrRange,
     pub y_plane: AvifPlane,
     pub u_plane: Option<AvifPlane>,
     pub v_plane: Option<AvifPlane>,
@@ -142,6 +150,7 @@ pub struct DecodedHeicImage {
     pub bit_depth_luma: u8,
     pub bit_depth_chroma: u8,
     pub layout: HeicPixelLayout,
+    pub ycbcr_range: YCbCrRange,
     pub y_plane: HeicPlane,
     pub u_plane: Option<HeicPlane>,
     pub v_plane: Option<HeicPlane>,
@@ -564,9 +573,11 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
     // libheif/libheif/codecs/avif_dec.cc:Decoder_AVIF::read_bitstream_configuration_data.
     let item_data = isobmff::extract_primary_avif_item_data(input)?;
     let payload = item_data.payload;
+    let mut ycbcr_range = YCbCrRange::Full;
     let (elementary_stream, expected_geometry) =
         match isobmff::parse_primary_avif_item_properties(input) {
             Ok(properties) => {
+                ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
                 let mut stream = properties.av1c.config_obus.clone();
                 stream.extend_from_slice(&payload);
                 (
@@ -586,7 +597,8 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
             Err(err) => return Err(DecodeAvifError::ParsePrimaryProperties(err)),
         };
 
-    let decoded = decode_av1_bitstream_to_image(&elementary_stream)?;
+    let mut decoded = decode_av1_bitstream_to_image(&elementary_stream)?;
+    decoded.ycbcr_range = ycbcr_range;
     if let Some((expected_width, expected_height)) = expected_geometry {
         if decoded.width != expected_width || decoded.height != expected_height {
             return Err(DecodeAvifError::DecodedGeometryMismatch {
@@ -615,8 +627,9 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
 /// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
-    let (stream, metadata) = decode_primary_heic_stream_and_metadata(input)?;
-    let decoded = decode_hevc_stream_to_image(&stream)?;
+    let (stream, metadata, ycbcr_range) = decode_primary_heic_stream_and_metadata(input)?;
+    let mut decoded = decode_hevc_stream_to_image(&stream)?;
+    decoded.ycbcr_range = ycbcr_range;
     validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
     Ok(decoded)
 }
@@ -625,15 +638,16 @@ pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, De
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    let (_, metadata) = decode_primary_heic_stream_and_metadata(input)?;
+    let (_, metadata, _) = decode_primary_heic_stream_and_metadata(input)?;
     Ok(metadata)
 }
 
 fn decode_primary_heic_stream_and_metadata(
     input: &[u8],
-) -> Result<(Vec<u8>, DecodedHeicImageMetadata), DecodeHeicError> {
+) -> Result<(Vec<u8>, DecodedHeicImageMetadata, YCbCrRange), DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
+    let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
     let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
     validate_decoded_heic_geometry_against_ispe(
@@ -641,7 +655,7 @@ fn decode_primary_heic_stream_and_metadata(
         properties.ispe.width,
         properties.ispe.height,
     )?;
-    Ok((stream, decoded))
+    Ok((stream, decoded, ycbcr_range))
 }
 
 fn validate_decoded_heic_geometry_against_ispe(
@@ -794,6 +808,7 @@ fn heic_decoder_frame_to_internal_image(
         bit_depth_luma: frame.bit_depth,
         bit_depth_chroma: frame.bit_depth,
         layout,
+        ycbcr_range: YCbCrRange::Full,
         y_plane,
         u_plane,
         v_plane,
@@ -1052,6 +1067,17 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     )))
 }
 
+fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> YCbCrRange {
+    // Provenance: mirrors libheif default/input range selection in
+    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace,
+    // where full range is assumed unless an nclx profile explicitly marks
+    // limited range.
+    match colr.nclx.as_ref().map(|nclx| nclx.full_range_flag) {
+        Some(true) | None => YCbCrRange::Full,
+        Some(false) => YCbCrRange::Limited,
+    }
+}
+
 // Provenance: conversion constants/mapping align with libheif's full-range
 // YCbCr->RGB defaults in libheif/libheif/color-conversion/yuv2rgb.cc
 // (Op_YCbCr420_to_RGB32::convert_colorspace) and libheif/libheif/nclx.cc
@@ -1231,7 +1257,7 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_chroma_u8(decoded)?;
-    let half_range = chroma_half_range(decoded.bit_depth);
+    let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
 
     for y in 0..height {
         let row_start = y
@@ -1252,8 +1278,8 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
                 })?;
             let y_sample = i32::from(y_samples[y_index]);
 
-            let (cb_centered, cr_centered) = match &chroma {
-                ChromaPlanesU8::Monochrome => (0, 0),
+            let (cb_sample, cr_sample) = match &chroma {
+                ChromaPlanesU8::Monochrome => (chroma_midpoint, chroma_midpoint),
                 ChromaPlanesU8::Color {
                     u_samples,
                     v_samples,
@@ -1262,14 +1288,19 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
                 } => {
                     let chroma_index = chroma_sample_index(x, y, *chroma_width, *layout);
                     (
-                        i32::from(u_samples[chroma_index]) - half_range,
-                        i32::from(v_samples[chroma_index]) - half_range,
+                        i32::from(u_samples[chroma_index]),
+                        i32::from(v_samples[chroma_index]),
                     )
                 }
             };
 
-            let (r, g, b) =
-                ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, decoded.bit_depth);
+            let (r, g, b) = ycbcr_to_rgb_components(
+                y_sample,
+                cb_sample,
+                cr_sample,
+                decoded.bit_depth,
+                decoded.ycbcr_range,
+            );
             out.push(scale_sample_to_u8(r, decoded.bit_depth));
             out.push(scale_sample_to_u8(g, decoded.bit_depth));
             out.push(scale_sample_to_u8(b, decoded.bit_depth));
@@ -1314,7 +1345,7 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_chroma_u16(decoded)?;
-    let half_range = chroma_half_range(decoded.bit_depth);
+    let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
 
     for y in 0..height {
         let row_start = y
@@ -1335,8 +1366,8 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
                 })?;
             let y_sample = i32::from(y_samples[y_index]);
 
-            let (cb_centered, cr_centered) = match &chroma {
-                ChromaPlanesU16::Monochrome => (0, 0),
+            let (cb_sample, cr_sample) = match &chroma {
+                ChromaPlanesU16::Monochrome => (chroma_midpoint, chroma_midpoint),
                 ChromaPlanesU16::Color {
                     u_samples,
                     v_samples,
@@ -1345,14 +1376,19 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
                 } => {
                     let chroma_index = chroma_sample_index(x, y, *chroma_width, *layout);
                     (
-                        i32::from(u_samples[chroma_index]) - half_range,
-                        i32::from(v_samples[chroma_index]) - half_range,
+                        i32::from(u_samples[chroma_index]),
+                        i32::from(v_samples[chroma_index]),
                     )
                 }
             };
 
-            let (r, g, b) =
-                ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, decoded.bit_depth);
+            let (r, g, b) = ycbcr_to_rgb_components(
+                y_sample,
+                cb_sample,
+                cr_sample,
+                decoded.bit_depth,
+                decoded.ycbcr_range,
+            );
             out.push(scale_sample_to_u16(r, decoded.bit_depth));
             out.push(scale_sample_to_u16(g, decoded.bit_depth));
             out.push(scale_sample_to_u16(b, decoded.bit_depth));
@@ -1397,7 +1433,7 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_heic_chroma(decoded)?;
-    let half_range = chroma_half_range(bit_depth);
+    let chroma_midpoint = chroma_midpoint(bit_depth);
 
     for y in 0..height {
         let row_start =
@@ -1417,8 +1453,8 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                     })?;
             let y_sample = i32::from(decoded.y_plane.samples[y_index]);
 
-            let (cb_centered, cr_centered) = match &chroma {
-                HeicChromaPlanes::Monochrome => (0, 0),
+            let (cb_sample, cr_sample) = match &chroma {
+                HeicChromaPlanes::Monochrome => (chroma_midpoint, chroma_midpoint),
                 HeicChromaPlanes::Color {
                     u_samples,
                     v_samples,
@@ -1427,13 +1463,19 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                 } => {
                     let chroma_index = heic_chroma_sample_index(x, y, *chroma_width, *layout);
                     (
-                        i32::from(u_samples[chroma_index]) - half_range,
-                        i32::from(v_samples[chroma_index]) - half_range,
+                        i32::from(u_samples[chroma_index]),
+                        i32::from(v_samples[chroma_index]),
                     )
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, bit_depth);
+            let (r, g, b) = ycbcr_to_rgb_components(
+                y_sample,
+                cb_sample,
+                cr_sample,
+                bit_depth,
+                decoded.ycbcr_range,
+            );
             out.push(scale_sample_to_u8(r, bit_depth));
             out.push(scale_sample_to_u8(g, bit_depth));
             out.push(scale_sample_to_u8(b, bit_depth));
@@ -1478,7 +1520,7 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_heic_chroma(decoded)?;
-    let half_range = chroma_half_range(bit_depth);
+    let chroma_midpoint = chroma_midpoint(bit_depth);
 
     for y in 0..height {
         let row_start =
@@ -1498,8 +1540,8 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                     })?;
             let y_sample = i32::from(decoded.y_plane.samples[y_index]);
 
-            let (cb_centered, cr_centered) = match &chroma {
-                HeicChromaPlanes::Monochrome => (0, 0),
+            let (cb_sample, cr_sample) = match &chroma {
+                HeicChromaPlanes::Monochrome => (chroma_midpoint, chroma_midpoint),
                 HeicChromaPlanes::Color {
                     u_samples,
                     v_samples,
@@ -1508,13 +1550,19 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                 } => {
                     let chroma_index = heic_chroma_sample_index(x, y, *chroma_width, *layout);
                     (
-                        i32::from(u_samples[chroma_index]) - half_range,
-                        i32::from(v_samples[chroma_index]) - half_range,
+                        i32::from(u_samples[chroma_index]),
+                        i32::from(v_samples[chroma_index]),
                     )
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, bit_depth);
+            let (r, g, b) = ycbcr_to_rgb_components(
+                y_sample,
+                cb_sample,
+                cr_sample,
+                bit_depth,
+                decoded.ycbcr_range,
+            );
             out.push(scale_sample_to_u16(r, bit_depth));
             out.push(scale_sample_to_u16(g, bit_depth));
             out.push(scale_sample_to_u16(b, bit_depth));
@@ -1891,18 +1939,23 @@ fn chroma_sample_index(x: usize, y: usize, chroma_width: usize, layout: AvifPixe
 }
 
 fn ycbcr_to_rgb_components(
-    y: i32,
-    cb_centered: i32,
-    cr_centered: i32,
+    y_sample: i32,
+    cb_sample: i32,
+    cr_sample: i32,
     bit_depth: u8,
+    range: YCbCrRange,
 ) -> (u16, u16, u16) {
-    let r = y + ((YCBCR_TO_RGB_R_CR_COEFF_FP8 * cr_centered + 128) >> 8);
-    let g = y
-        + ((YCBCR_TO_RGB_G_CB_COEFF_FP8 * cb_centered
-            + YCBCR_TO_RGB_G_CR_COEFF_FP8 * cr_centered
+    let (y, cb_centered, cr_centered) =
+        normalize_nclx_ycbcr_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
+    let r = i64::from(y)
+        + ((i64::from(YCBCR_TO_RGB_R_CR_COEFF_FP8) * i64::from(cr_centered) + 128) >> 8);
+    let g = i64::from(y)
+        + ((i64::from(YCBCR_TO_RGB_G_CB_COEFF_FP8) * i64::from(cb_centered)
+            + i64::from(YCBCR_TO_RGB_G_CR_COEFF_FP8) * i64::from(cr_centered)
             + 128)
             >> 8);
-    let b = y + ((YCBCR_TO_RGB_B_CB_COEFF_FP8 * cb_centered + 128) >> 8);
+    let b = i64::from(y)
+        + ((i64::from(YCBCR_TO_RGB_B_CB_COEFF_FP8) * i64::from(cb_centered) + 128) >> 8);
 
     (
         clip_to_bit_depth(r, bit_depth),
@@ -1911,12 +1964,58 @@ fn ycbcr_to_rgb_components(
     )
 }
 
-fn chroma_half_range(bit_depth: u8) -> i32 {
+fn normalize_nclx_ycbcr_samples(
+    y_sample: i32,
+    cb_sample: i32,
+    cr_sample: i32,
+    bit_depth: u8,
+    range: YCbCrRange,
+) -> (i32, i32, i32) {
+    let chroma_midpoint = chroma_midpoint(bit_depth);
+    if range == YCbCrRange::Full {
+        return (
+            y_sample,
+            cb_sample - chroma_midpoint,
+            cr_sample - chroma_midpoint,
+        );
+    }
+
+    // Provenance: limited-range normalization mirrors the pre-matrix scaling in
+    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace:
+    // y'=(y-offset)*(256/219) and cb/cr centered terms scaled by (256/224).
+    let limited_offset = limited_range_offset(bit_depth);
+    let y_scaled = div_round_nearest(i64::from(y_sample - limited_offset) * 256, 219) as i32;
+    let cb_scaled = div_round_nearest(i64::from(cb_sample - chroma_midpoint) * 256, 224) as i32;
+    let cr_scaled = div_round_nearest(i64::from(cr_sample - chroma_midpoint) * 256, 224) as i32;
+    (y_scaled, cb_scaled, cr_scaled)
+}
+
+fn div_round_nearest(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0);
+    if value >= 0 {
+        (value + (divisor / 2)) / divisor
+    } else {
+        (value - (divisor / 2)) / divisor
+    }
+}
+
+fn limited_range_offset(bit_depth: u8) -> i32 {
+    if bit_depth == 0 {
+        return 0;
+    }
+    if bit_depth >= 8 {
+        16_i32 << u32::from(bit_depth - 8)
+    } else {
+        16_i32 >> u32::from(8 - bit_depth)
+    }
+}
+
+fn chroma_midpoint(bit_depth: u8) -> i32 {
     1_i32 << u32::from(bit_depth.saturating_sub(1))
 }
 
-fn clip_to_bit_depth(value: i32, bit_depth: u8) -> u16 {
-    let max_value = ((1_i32 << bit_depth) - 1).max(0);
+fn clip_to_bit_depth(value: i64, bit_depth: u8) -> u16 {
+    let max_value = ((1_i64 << bit_depth) - 1).max(0);
     value.clamp(0, max_value) as u16
 }
 
@@ -2134,6 +2233,7 @@ fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage,
         height,
         bit_depth,
         layout,
+        ycbcr_range: YCbCrRange::Full,
         y_plane,
         u_plane,
         v_plane,
@@ -2272,12 +2372,13 @@ fn copy_plane_samples(
 mod tests {
     use super::{
         append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
-        convert_avif_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
-        decode_hevc_stream_to_image, decode_primary_avif_to_image, decode_primary_heic_to_image,
+        convert_avif_to_rgba8, convert_heic_to_rgba8, decode_file_to_png,
+        decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
+        decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
         validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
         DecodeHeicError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
-        HeicPixelLayout, HeicPlane, HevcNalClass,
+        HeicPixelLayout, HeicPlane, HevcNalClass, YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -2390,6 +2491,7 @@ mod tests {
             height: 1,
             bit_depth: 8,
             layout: AvifPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
             y_plane: AvifPlane {
                 width: 2,
                 height: 1,
@@ -2401,6 +2503,51 @@ mod tests {
 
         let rgba = convert_avif_to_rgba8(&image).expect("YUV400 should convert to RGBA8");
         assert_eq!(rgba, vec![32, 32, 32, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn applies_nclx_limited_range_when_converting_avif_monochrome_to_rgba8() {
+        let image = DecodedAvifImage {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Limited,
+            y_plane: AvifPlane {
+                width: 2,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![16, 235]),
+            },
+            u_plane: None,
+            v_plane: None,
+        };
+
+        let rgba = convert_avif_to_rgba8(&image)
+            .expect("limited-range YUV400 AVIF should normalize to full-range RGBA");
+        assert_eq!(rgba, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn applies_nclx_limited_range_when_converting_heic_monochrome_to_rgba8() {
+        let image = DecodedHeicImage {
+            width: 2,
+            height: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: HeicPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Limited,
+            y_plane: HeicPlane {
+                width: 2,
+                height: 1,
+                samples: vec![16, 235],
+            },
+            u_plane: None,
+            v_plane: None,
+        };
+
+        let rgba = convert_heic_to_rgba8(&image)
+            .expect("limited-range YUV400 HEIC should normalize to full-range RGBA");
+        assert_eq!(rgba, vec![0, 0, 0, 255, 255, 255, 255, 255]);
     }
 
     #[test]
@@ -2546,6 +2693,7 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             layout: HeicPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
             y_plane: HeicPlane {
                 width: 2,
                 height: 1,
@@ -2581,6 +2729,7 @@ mod tests {
             bit_depth_luma: 10,
             bit_depth_chroma: 10,
             layout: HeicPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
             y_plane: HeicPlane {
                 width: 2,
                 height: 1,
