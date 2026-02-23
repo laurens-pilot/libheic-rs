@@ -10,6 +10,7 @@ use rav1d::src::lib::{
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 use rav1d::Dav1dResult;
+use scuffle_h265::{NALUnitType, SpsNALUnit};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
@@ -113,6 +114,25 @@ pub struct DecodedAvifImage {
     pub y_plane: AvifPlane,
     pub u_plane: Option<AvifPlane>,
     pub v_plane: Option<AvifPlane>,
+}
+
+/// Decoded HEIC chroma layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeicPixelLayout {
+    Yuv400,
+    Yuv420,
+    Yuv422,
+    Yuv444,
+}
+
+/// Parsed HEIC image metadata extracted from the primary HEVC SPS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedHeicImageMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub layout: HeicPixelLayout,
 }
 
 /// Errors from the AVIF decode path and internal image model conversion.
@@ -312,6 +332,33 @@ pub enum DecodeHeicError {
     NalUnitTooLarge {
         nal_size: usize,
     },
+    TruncatedLengthPrefixedStreamLength {
+        offset: usize,
+        available: usize,
+    },
+    TruncatedLengthPrefixedStreamNalUnit {
+        offset: usize,
+        declared: usize,
+        available: usize,
+    },
+    MissingSpsNalUnit,
+    SpsParseFailed {
+        offset: usize,
+        detail: String,
+    },
+    InvalidSpsGeometry {
+        width: u64,
+        height: u64,
+    },
+    UnsupportedSpsChromaArrayType {
+        chroma_array_type: u8,
+    },
+    DecodedGeometryMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
 }
 
 impl Display for DecodeHeicError {
@@ -342,6 +389,42 @@ impl Display for DecodeHeicError {
             DecodeHeicError::NalUnitTooLarge { nal_size } => {
                 write!(f, "HEVC NAL unit size {nal_size} exceeds 32-bit length limit")
             }
+            DecodeHeicError::TruncatedLengthPrefixedStreamLength { offset, available } => write!(
+                f,
+                "truncated length-prefixed HEVC stream at offset {offset}: need 4-byte NAL length field, have {available}"
+            ),
+            DecodeHeicError::TruncatedLengthPrefixedStreamNalUnit {
+                offset,
+                declared,
+                available,
+            } => write!(
+                f,
+                "truncated length-prefixed HEVC NAL unit at offset {offset}: declared {declared} bytes, have {available}"
+            ),
+            DecodeHeicError::MissingSpsNalUnit => write!(
+                f,
+                "length-prefixed HEVC stream does not contain an SPS NAL unit"
+            ),
+            DecodeHeicError::SpsParseFailed { offset, detail } => {
+                write!(f, "failed to parse SPS NAL unit at stream offset {offset}: {detail}")
+            }
+            DecodeHeicError::InvalidSpsGeometry { width, height } => write!(
+                f,
+                "decoded HEVC SPS reports invalid geometry ({width}x{height})"
+            ),
+            DecodeHeicError::UnsupportedSpsChromaArrayType { chroma_array_type } => write!(
+                f,
+                "decoded HEVC SPS reports unsupported chroma_array_type {chroma_array_type}"
+            ),
+            DecodeHeicError::DecodedGeometryMismatch {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                f,
+                "decoded HEVC SPS geometry mismatch: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+            ),
         }
     }
 }
@@ -422,7 +505,34 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
     // libheif/libheif/codecs/hevc_boxes.cc:Box_hvcC::get_header_nals.
     let properties = isobmff::parse_primary_heic_item_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
+    assemble_heic_hevc_stream_from_components(&properties, &item_data.payload)
+}
 
+/// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
+pub fn decode_primary_heic_to_metadata(
+    input: &[u8],
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    let properties = isobmff::parse_primary_heic_item_properties(input)?;
+    let item_data = isobmff::extract_primary_heic_item_data(input)?;
+    let stream = assemble_heic_hevc_stream_from_components(&properties, &item_data.payload)?;
+    let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
+
+    if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
+        return Err(DecodeHeicError::DecodedGeometryMismatch {
+            expected_width: properties.ispe.width,
+            expected_height: properties.ispe.height,
+            actual_width: decoded.width,
+            actual_height: decoded.height,
+        });
+    }
+
+    Ok(decoded)
+}
+
+fn assemble_heic_hevc_stream_from_components(
+    properties: &isobmff::HeicPrimaryItemProperties,
+    payload: &[u8],
+) -> Result<Vec<u8>, DecodeHeicError> {
     let nal_length_size = properties.hvcc.nal_length_size;
     if !(1..=4).contains(&nal_length_size) {
         return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
@@ -430,12 +540,111 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
     let mut stream = Vec::new();
     append_hvcc_header_nals(&properties.hvcc.nal_arrays, &mut stream)?;
-    append_normalized_hevc_payload_nals(
-        &item_data.payload,
-        usize::from(nal_length_size),
-        &mut stream,
-    )?;
+    append_normalized_hevc_payload_nals(payload, usize::from(nal_length_size), &mut stream)?;
     Ok(stream)
+}
+
+fn decode_hevc_stream_metadata_from_sps(
+    stream: &[u8],
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    // Provenance: length-prefixed NAL iteration mirrors libheif's decoder
+    // plugin handoff loop in libheif/libheif/plugins/decoder_libde265.cc
+    // (libde265_v2_push_data/libde265_v1_push_data2), while SPS parsing is
+    // delegated to the pure-Rust scuffle-h265 backend.
+    let mut cursor = 0usize;
+    while cursor < stream.len() {
+        let length_offset = cursor;
+        let remaining = stream.len() - cursor;
+        if remaining < 4 {
+            return Err(DecodeHeicError::TruncatedLengthPrefixedStreamLength {
+                offset: length_offset,
+                available: remaining,
+            });
+        }
+
+        let nal_size = u32::from_be_bytes([
+            stream[cursor],
+            stream[cursor + 1],
+            stream[cursor + 2],
+            stream[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+
+        let available = stream.len() - cursor;
+        if available < nal_size {
+            return Err(DecodeHeicError::TruncatedLengthPrefixedStreamNalUnit {
+                offset: cursor,
+                declared: nal_size,
+                available,
+            });
+        }
+
+        let nal_offset = cursor;
+        let nal_end = cursor + nal_size;
+        let nal_unit = &stream[nal_offset..nal_end];
+        cursor = nal_end;
+
+        if !is_sps_nal_unit(nal_unit) {
+            continue;
+        }
+
+        let sps_nal = SpsNALUnit::parse(std::io::Cursor::new(nal_unit)).map_err(|err| {
+            DecodeHeicError::SpsParseFailed {
+                offset: nal_offset,
+                detail: err.to_string(),
+            }
+        })?;
+        let width_raw = sps_nal.rbsp.cropped_width();
+        let height_raw = sps_nal.rbsp.cropped_height();
+        if width_raw == 0 || height_raw == 0 {
+            return Err(DecodeHeicError::InvalidSpsGeometry {
+                width: width_raw,
+                height: height_raw,
+            });
+        }
+
+        let width = u32::try_from(width_raw).map_err(|_| DecodeHeicError::InvalidSpsGeometry {
+            width: width_raw,
+            height: height_raw,
+        })?;
+        let height =
+            u32::try_from(height_raw).map_err(|_| DecodeHeicError::InvalidSpsGeometry {
+                width: width_raw,
+                height: height_raw,
+            })?;
+        let layout = heic_layout_from_sps_chroma_array_type(sps_nal.rbsp.chroma_array_type())?;
+
+        return Ok(DecodedHeicImageMetadata {
+            width,
+            height,
+            bit_depth_luma: sps_nal.rbsp.bit_depth_y(),
+            bit_depth_chroma: sps_nal.rbsp.bit_depth_c(),
+            layout,
+        });
+    }
+
+    Err(DecodeHeicError::MissingSpsNalUnit)
+}
+
+fn is_sps_nal_unit(nal_unit: &[u8]) -> bool {
+    if nal_unit.len() < 2 {
+        return false;
+    }
+
+    let nal_unit_type = NALUnitType::from((nal_unit[0] >> 1) & 0x3f);
+    nal_unit_type == NALUnitType::SpsNut
+}
+
+fn heic_layout_from_sps_chroma_array_type(
+    chroma_array_type: u8,
+) -> Result<HeicPixelLayout, DecodeHeicError> {
+    match chroma_array_type {
+        0 => Ok(HeicPixelLayout::Yuv400),
+        1 => Ok(HeicPixelLayout::Yuv420),
+        2 => Ok(HeicPixelLayout::Yuv422),
+        3 => Ok(HeicPixelLayout::Yuv444),
+        _ => Err(DecodeHeicError::UnsupportedSpsChromaArrayType { chroma_array_type }),
+    }
 }
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
@@ -1350,8 +1559,9 @@ fn copy_plane_samples(
 mod tests {
     use super::{
         append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
-        convert_avif_to_rgba8, decode_file_to_png, decode_primary_avif_to_image, AvifPixelLayout,
-        AvifPlane, AvifPlaneSamples, DecodeHeicError, DecodedAvifImage,
+        convert_avif_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
+        decode_primary_avif_to_image, decode_primary_heic_to_metadata, AvifPixelLayout, AvifPlane,
+        AvifPlaneSamples, DecodeHeicError, DecodedAvifImage, HeicPixelLayout,
     };
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -1459,6 +1669,54 @@ mod tests {
                 }
             ) if property_type.as_bytes() == *b"pixi"
         ));
+    }
+
+    #[test]
+    fn parses_heic_sps_metadata_from_length_prefixed_stream() {
+        let sps_nal = b"\x42\x01\x01\x01\x40\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x78\xa0\x03\xc0\x80\x11\x07\xcb\x96\xb4\xa4\x25\x92\xe3\x01\x6a\x02\x02\x02\x08\x00\x00\x03\x00\x08\x00\x00\x03\x00\xf3\x00\x2e\xf2\x88\x00\x02\x62\x5a\x00\x00\x13\x12\xd0\x20";
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&(sps_nal.len() as u32).to_be_bytes());
+        stream.extend_from_slice(sps_nal);
+
+        let metadata = decode_hevc_stream_metadata_from_sps(&stream)
+            .expect("valid SPS NAL should decode metadata");
+        assert_eq!(metadata.width, 1920);
+        assert_eq!(metadata.height, 1080);
+        assert_eq!(metadata.bit_depth_luma, 8);
+        assert_eq!(metadata.bit_depth_chroma, 8);
+        assert_eq!(metadata.layout, HeicPixelLayout::Yuv420);
+    }
+
+    #[test]
+    fn reports_missing_pixi_when_decoding_primary_heic_metadata_for_fixture() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+
+        let err = decode_primary_heic_to_metadata(&input)
+            .expect_err("fixture without pixi should still fail strict HEIC preflight");
+        assert!(matches!(
+            err,
+            DecodeHeicError::ParsePrimaryProperties(
+                crate::isobmff::ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+                    property_type,
+                    ..
+                }
+            ) if property_type.as_bytes() == *b"pixi"
+        ));
+    }
+
+    #[test]
+    fn reports_missing_sps_for_length_prefixed_stream_without_sps_nal() {
+        // NAL header with nal_unit_type=34 (PPS), layer_id=0, temporal_id_plus1=1.
+        let pps_nal = [0x44, 0x01, 0x80];
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&(pps_nal.len() as u32).to_be_bytes());
+        stream.extend_from_slice(&pps_nal);
+
+        let err = decode_hevc_stream_metadata_from_sps(&stream)
+            .expect_err("stream without SPS NAL should fail metadata decode");
+        assert!(matches!(err, DecodeHeicError::MissingSpsNalUnit));
     }
 
     #[test]

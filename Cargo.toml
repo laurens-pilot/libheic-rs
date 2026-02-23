@@ -10,6 +10,7 @@ readme = "README.md"
 libc = "0.2"
 png = "0.18"
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+scuffle-h265 = "0.2.2"
 
 [lib]
 name = "libheic_rs"
