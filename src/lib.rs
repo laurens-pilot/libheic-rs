@@ -97,6 +97,24 @@ pub enum YCbCrRange {
     Limited,
 }
 
+/// Decoded matrix metadata derived from nclx signalling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct YCbCrMatrixCoefficients {
+    pub matrix_coefficients: u16,
+    pub colour_primaries: u16,
+}
+
+impl Default for YCbCrMatrixCoefficients {
+    fn default() -> Self {
+        // Provenance: matches libheif undefined-profile defaults from
+        // libheif/libheif/nclx.cc:nclx_profile::set_undefined.
+        Self {
+            matrix_coefficients: 2,
+            colour_primaries: 2,
+        }
+    }
+}
+
 /// Decoded AVIF plane samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AvifPlaneSamples {
@@ -120,6 +138,7 @@ pub struct DecodedAvifImage {
     pub bit_depth: u8,
     pub layout: AvifPixelLayout,
     pub ycbcr_range: YCbCrRange,
+    pub ycbcr_matrix: YCbCrMatrixCoefficients,
     pub y_plane: AvifPlane,
     pub u_plane: Option<AvifPlane>,
     pub v_plane: Option<AvifPlane>,
@@ -151,6 +170,7 @@ pub struct DecodedHeicImage {
     pub bit_depth_chroma: u8,
     pub layout: HeicPixelLayout,
     pub ycbcr_range: YCbCrRange,
+    pub ycbcr_matrix: YCbCrMatrixCoefficients,
     pub y_plane: HeicPlane,
     pub u_plane: Option<HeicPlane>,
     pub v_plane: Option<HeicPlane>,
@@ -273,6 +293,9 @@ pub enum DecodeAvifError {
         expected: usize,
         actual: usize,
     },
+    UnsupportedMatrixCoefficients {
+        matrix_coefficients: u16,
+    },
 }
 
 impl Display for DecodeAvifError {
@@ -358,6 +381,12 @@ impl Display for DecodeAvifError {
             } => write!(
                 f,
                 "decoded AV1 {plane} plane has {actual} samples, expected {expected}"
+            ),
+            DecodeAvifError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            } => write!(
+                f,
+                "AVIF nclx matrix_coefficients {matrix_coefficients} is not supported for YCbCr->RGB conversion"
             ),
         }
     }
@@ -450,6 +479,9 @@ pub enum DecodeHeicError {
         expected: HeicPixelLayout,
         actual: HeicPixelLayout,
     },
+    UnsupportedMatrixCoefficients {
+        matrix_coefficients: u16,
+    },
 }
 
 impl Display for DecodeHeicError {
@@ -539,6 +571,12 @@ impl Display for DecodeHeicError {
                 f,
                 "decoded HEVC chroma layout mismatch: expected {expected:?}, got {actual:?}"
             ),
+            DecodeHeicError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            } => write!(
+                f,
+                "HEIC nclx matrix_coefficients {matrix_coefficients} is not supported for YCbCr->RGB conversion"
+            ),
         }
     }
 }
@@ -574,10 +612,12 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
     let item_data = isobmff::extract_primary_avif_item_data(input)?;
     let payload = item_data.payload;
     let mut ycbcr_range = YCbCrRange::Full;
+    let mut ycbcr_matrix = YCbCrMatrixCoefficients::default();
     let (elementary_stream, expected_geometry) =
         match isobmff::parse_primary_avif_item_properties(input) {
             Ok(properties) => {
                 ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
+                ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
                 let mut stream = properties.av1c.config_obus.clone();
                 stream.extend_from_slice(&payload);
                 (
@@ -599,6 +639,7 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
 
     let mut decoded = decode_av1_bitstream_to_image(&elementary_stream)?;
     decoded.ycbcr_range = ycbcr_range;
+    decoded.ycbcr_matrix = ycbcr_matrix;
     if let Some((expected_width, expected_height)) = expected_geometry {
         if decoded.width != expected_width || decoded.height != expected_height {
             return Err(DecodeAvifError::DecodedGeometryMismatch {
@@ -627,9 +668,11 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
 /// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
-    let (stream, metadata, ycbcr_range) = decode_primary_heic_stream_and_metadata(input)?;
+    let (stream, metadata, ycbcr_range, ycbcr_matrix) =
+        decode_primary_heic_stream_and_metadata(input)?;
     let mut decoded = decode_hevc_stream_to_image(&stream)?;
     decoded.ycbcr_range = ycbcr_range;
+    decoded.ycbcr_matrix = ycbcr_matrix;
     validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
     Ok(decoded)
 }
@@ -638,16 +681,25 @@ pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, De
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    let (_, metadata, _) = decode_primary_heic_stream_and_metadata(input)?;
+    let (_, metadata, _, _) = decode_primary_heic_stream_and_metadata(input)?;
     Ok(metadata)
 }
 
 fn decode_primary_heic_stream_and_metadata(
     input: &[u8],
-) -> Result<(Vec<u8>, DecodedHeicImageMetadata, YCbCrRange), DecodeHeicError> {
+) -> Result<
+    (
+        Vec<u8>,
+        DecodedHeicImageMetadata,
+        YCbCrRange,
+        YCbCrMatrixCoefficients,
+    ),
+    DecodeHeicError,
+> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
     let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
+    let ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
     let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
     validate_decoded_heic_geometry_against_ispe(
@@ -655,7 +707,7 @@ fn decode_primary_heic_stream_and_metadata(
         properties.ispe.width,
         properties.ispe.height,
     )?;
-    Ok((stream, decoded, ycbcr_range))
+    Ok((stream, decoded, ycbcr_range, ycbcr_matrix))
 }
 
 fn validate_decoded_heic_geometry_against_ispe(
@@ -809,6 +861,7 @@ fn heic_decoder_frame_to_internal_image(
         bit_depth_chroma: frame.bit_depth,
         layout,
         ycbcr_range: YCbCrRange::Full,
+        ycbcr_matrix: YCbCrMatrixCoefficients::default(),
         y_plane,
         u_plane,
         v_plane,
@@ -1078,14 +1131,261 @@ fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> 
     }
 }
 
-// Provenance: conversion constants/mapping align with libheif's full-range
-// YCbCr->RGB defaults in libheif/libheif/color-conversion/yuv2rgb.cc
-// (Op_YCbCr420_to_RGB32::convert_colorspace) and libheif/libheif/nclx.cc
+fn ycbcr_matrix_from_primary_colr(
+    colr: &isobmff::PrimaryItemColorProperties,
+) -> YCbCrMatrixCoefficients {
+    // Provenance: default/parsed matrix metadata mirrors libheif nclx handling in
+    // libheif/libheif/nclx.cc:{nclx_profile::set_undefined,Box_colr::parse}.
+    match colr.nclx.as_ref() {
+        Some(nclx) => YCbCrMatrixCoefficients {
+            matrix_coefficients: nclx.matrix_coefficients,
+            colour_primaries: nclx.colour_primaries,
+        },
+        None => YCbCrMatrixCoefficients::default(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum YCbCrToRgbTransform {
+    Identity,
+    Matrix(YCbCrToRgbCoefficientsFp8),
+}
+
+#[derive(Clone, Copy)]
+struct YCbCrToRgbCoefficientsFp8 {
+    r_cr: i32,
+    g_cb: i32,
+    g_cr: i32,
+    b_cb: i32,
+}
+
+#[derive(Clone, Copy)]
+struct ColourPrimaries {
+    red_x: f64,
+    red_y: f64,
+    green_x: f64,
+    green_y: f64,
+    blue_x: f64,
+    blue_y: f64,
+    white_x: f64,
+    white_y: f64,
+}
+
+// Provenance: default conversion constants/mapping align with libheif's
+// YCbCr->RGB defaults in libheif/libheif/nclx.cc
 // (YCbCr_to_RGB_coefficients::defaults).
-const YCBCR_TO_RGB_R_CR_COEFF_FP8: i32 = 359;
-const YCBCR_TO_RGB_G_CB_COEFF_FP8: i32 = -88;
-const YCBCR_TO_RGB_G_CR_COEFF_FP8: i32 = -183;
-const YCBCR_TO_RGB_B_CB_COEFF_FP8: i32 = 454;
+const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8: YCbCrToRgbCoefficientsFp8 =
+    YCbCrToRgbCoefficientsFp8 {
+        r_cr: 359,
+        g_cb: -88,
+        g_cr: -183,
+        b_cb: 454,
+    };
+
+fn ycbcr_transform_from_matrix(
+    matrix: YCbCrMatrixCoefficients,
+) -> Result<YCbCrToRgbTransform, u16> {
+    // Provenance: unsupported-matrix behavior follows libheif's RGB-conversion
+    // operation selection in libheif/libheif/color-conversion/yuv2rgb.cc:
+    // Op_YCbCr_to_RGB::state_after_conversion (matrix 11/14 rejected) and the
+    // dedicated matrix-specific paths in convert_colorspace (identity=0, YCgCo=8,
+    // ICTCP=16).
+    if matrix.matrix_coefficients == 0 {
+        return Ok(YCbCrToRgbTransform::Identity);
+    }
+
+    if matches!(matrix.matrix_coefficients, 8 | 11 | 14 | 16) {
+        return Err(matrix.matrix_coefficients);
+    }
+
+    Ok(YCbCrToRgbTransform::Matrix(ycbcr_coefficients_from_matrix(
+        matrix.matrix_coefficients,
+        matrix.colour_primaries,
+    )))
+}
+
+fn ycbcr_coefficients_from_matrix(
+    matrix_coefficients: u16,
+    colour_primaries: u16,
+) -> YCbCrToRgbCoefficientsFp8 {
+    // Provenance: coefficient derivation mirrors
+    // libheif/libheif/nclx.cc:{get_Kr_Kb,get_YCbCr_to_RGB_coefficients}.
+    let Some((kr, kb)) = kr_kb_from_matrix(matrix_coefficients, colour_primaries) else {
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+    };
+
+    if kr == 0.0 && kb == 0.0 {
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+    }
+
+    let denom = kb + kr - 1.0;
+    if denom == 0.0 {
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+    }
+
+    ycbcr_coefficients_from_kr_kb(kr, kb)
+}
+
+fn ycbcr_coefficients_from_kr_kb(kr: f64, kb: f64) -> YCbCrToRgbCoefficientsFp8 {
+    let r_cr = 2.0 * (1.0 - kr);
+    let g_cb = 2.0 * kb * (1.0 - kb) / (kb + kr - 1.0);
+    let g_cr = 2.0 * kr * (1.0 - kr) / (kb + kr - 1.0);
+    let b_cb = 2.0 * (1.0 - kb);
+
+    YCbCrToRgbCoefficientsFp8 {
+        r_cr: (256.0 * r_cr).round() as i32,
+        g_cb: (256.0 * g_cb).round() as i32,
+        g_cr: (256.0 * g_cr).round() as i32,
+        b_cb: (256.0 * b_cb).round() as i32,
+    }
+}
+
+fn kr_kb_from_matrix(matrix_coefficients: u16, colour_primaries: u16) -> Option<(f64, f64)> {
+    match matrix_coefficients {
+        1 => Some((0.2126, 0.0722)),
+        4 => Some((0.30, 0.11)),
+        5 | 6 => Some((0.299, 0.114)),
+        7 => Some((0.212, 0.087)),
+        9 | 10 => Some((0.2627, 0.0593)),
+        12 | 13 => chromaticity_derived_kr_kb(colour_primaries),
+        _ => None,
+    }
+}
+
+fn chromaticity_derived_kr_kb(colour_primaries: u16) -> Option<(f64, f64)> {
+    let p = colour_primaries_from_index(colour_primaries)?;
+    let zr = 1.0 - (p.red_x + p.red_y);
+    let zg = 1.0 - (p.green_x + p.green_y);
+    let zb = 1.0 - (p.blue_x + p.blue_y);
+    let zw = 1.0 - (p.white_x + p.white_y);
+
+    let denom = p.white_y
+        * (p.red_x * (p.green_y * zb - p.blue_y * zg)
+            + p.green_x * (p.blue_y * zr - p.red_y * zb)
+            + p.blue_x * (p.red_y * zg - p.green_y * zr));
+    if denom == 0.0 {
+        return None;
+    }
+
+    let kr = (p.red_y
+        * (p.white_x * (p.green_y * zb - p.blue_y * zg)
+            + p.white_y * (p.blue_x * zg - p.green_x * zb)
+            + zw * (p.green_x * p.blue_y - p.blue_x * p.green_y)))
+        / denom;
+    let kb = (p.blue_y
+        * (p.white_x * (p.red_y * zg - p.green_y * zr)
+            + p.white_y * (p.green_x * zr - p.red_x * zg)
+            + zw * (p.red_x * p.green_y - p.green_x * p.red_y)))
+        / denom;
+    Some((kr, kb))
+}
+
+fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
+    // Provenance: primaries table mirrors libheif/libheif/nclx.cc:get_colour_primaries.
+    match primaries_idx {
+        1 => Some(ColourPrimaries {
+            green_x: 0.300,
+            green_y: 0.600,
+            blue_x: 0.150,
+            blue_y: 0.060,
+            red_x: 0.640,
+            red_y: 0.330,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        4 => Some(ColourPrimaries {
+            green_x: 0.21,
+            green_y: 0.71,
+            blue_x: 0.14,
+            blue_y: 0.08,
+            red_x: 0.67,
+            red_y: 0.33,
+            white_x: 0.310,
+            white_y: 0.316,
+        }),
+        5 => Some(ColourPrimaries {
+            green_x: 0.29,
+            green_y: 0.60,
+            blue_x: 0.15,
+            blue_y: 0.06,
+            red_x: 0.64,
+            red_y: 0.33,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        6 | 7 => Some(ColourPrimaries {
+            green_x: 0.310,
+            green_y: 0.595,
+            blue_x: 0.155,
+            blue_y: 0.070,
+            red_x: 0.630,
+            red_y: 0.340,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        8 => Some(ColourPrimaries {
+            green_x: 0.243,
+            green_y: 0.692,
+            blue_x: 0.145,
+            blue_y: 0.049,
+            red_x: 0.681,
+            red_y: 0.319,
+            white_x: 0.310,
+            white_y: 0.316,
+        }),
+        9 => Some(ColourPrimaries {
+            green_x: 0.170,
+            green_y: 0.797,
+            blue_x: 0.131,
+            blue_y: 0.046,
+            red_x: 0.708,
+            red_y: 0.292,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        10 => Some(ColourPrimaries {
+            green_x: 0.0,
+            green_y: 1.0,
+            blue_x: 0.0,
+            blue_y: 0.0,
+            red_x: 1.0,
+            red_y: 0.0,
+            white_x: 0.333333,
+            white_y: 0.333333,
+        }),
+        11 => Some(ColourPrimaries {
+            green_x: 0.265,
+            green_y: 0.690,
+            blue_x: 0.150,
+            blue_y: 0.060,
+            red_x: 0.680,
+            red_y: 0.320,
+            white_x: 0.314,
+            white_y: 0.351,
+        }),
+        12 => Some(ColourPrimaries {
+            green_x: 0.265,
+            green_y: 0.690,
+            blue_x: 0.150,
+            blue_y: 0.060,
+            red_x: 0.680,
+            red_y: 0.320,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        22 => Some(ColourPrimaries {
+            green_x: 0.295,
+            green_y: 0.605,
+            blue_x: 0.155,
+            blue_y: 0.077,
+            red_x: 0.630,
+            red_y: 0.340,
+            white_x: 0.3127,
+            white_y: 0.3290,
+        }),
+        _ => None,
+    }
+}
 
 fn write_decoded_avif_to_png(
     decoded: &DecodedAvifImage,
@@ -1224,6 +1524,13 @@ fn write_rgba16_png(
 }
 
 fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAvifError> {
+    let ycbcr_transform =
+        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
+            DecodeAvifError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            }
+        })?;
+
     validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
     let y_samples = plane_samples_u8(&decoded.y_plane, "Y")?;
     let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
@@ -1300,6 +1607,7 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
                 cr_sample,
                 decoded.bit_depth,
                 decoded.ycbcr_range,
+                ycbcr_transform,
             );
             out.push(scale_sample_to_u8(r, decoded.bit_depth));
             out.push(scale_sample_to_u8(g, decoded.bit_depth));
@@ -1312,6 +1620,13 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
 }
 
 fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, DecodeAvifError> {
+    let ycbcr_transform =
+        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
+            DecodeAvifError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            }
+        })?;
+
     validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
     let y_samples = plane_samples_u16(&decoded.y_plane, "Y")?;
     let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
@@ -1388,6 +1703,7 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
                 cr_sample,
                 decoded.bit_depth,
                 decoded.ycbcr_range,
+                ycbcr_transform,
             );
             out.push(scale_sample_to_u16(r, decoded.bit_depth));
             out.push(scale_sample_to_u16(g, decoded.bit_depth));
@@ -1400,6 +1716,13 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
 }
 
 fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHeicError> {
+    let ycbcr_transform =
+        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
+            DecodeHeicError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            }
+        })?;
+
     let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
 
     validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
@@ -1475,6 +1798,7 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                 cr_sample,
                 bit_depth,
                 decoded.ycbcr_range,
+                ycbcr_transform,
             );
             out.push(scale_sample_to_u8(r, bit_depth));
             out.push(scale_sample_to_u8(g, bit_depth));
@@ -1487,6 +1811,13 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
 }
 
 fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, DecodeHeicError> {
+    let ycbcr_transform =
+        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
+            DecodeHeicError::UnsupportedMatrixCoefficients {
+                matrix_coefficients,
+            }
+        })?;
+
     let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
 
     validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
@@ -1562,6 +1893,7 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                 cr_sample,
                 bit_depth,
                 decoded.ycbcr_range,
+                ycbcr_transform,
             );
             out.push(scale_sample_to_u16(r, bit_depth));
             out.push(scale_sample_to_u16(g, bit_depth));
@@ -1944,24 +2276,56 @@ fn ycbcr_to_rgb_components(
     cr_sample: i32,
     bit_depth: u8,
     range: YCbCrRange,
+    transform: YCbCrToRgbTransform,
 ) -> (u16, u16, u16) {
-    let (y, cb_centered, cr_centered) =
-        normalize_nclx_ycbcr_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
-    let r = i64::from(y)
-        + ((i64::from(YCBCR_TO_RGB_R_CR_COEFF_FP8) * i64::from(cr_centered) + 128) >> 8);
-    let g = i64::from(y)
-        + ((i64::from(YCBCR_TO_RGB_G_CB_COEFF_FP8) * i64::from(cb_centered)
-            + i64::from(YCBCR_TO_RGB_G_CR_COEFF_FP8) * i64::from(cr_centered)
-            + 128)
-            >> 8);
-    let b = i64::from(y)
-        + ((i64::from(YCBCR_TO_RGB_B_CB_COEFF_FP8) * i64::from(cb_centered) + 128) >> 8);
+    match transform {
+        YCbCrToRgbTransform::Identity => {
+            let (r, g, b) =
+                normalize_nclx_identity_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
+            (
+                clip_to_bit_depth(i64::from(r), bit_depth),
+                clip_to_bit_depth(i64::from(g), bit_depth),
+                clip_to_bit_depth(i64::from(b), bit_depth),
+            )
+        }
+        YCbCrToRgbTransform::Matrix(coeffs) => {
+            let (y, cb_centered, cr_centered) =
+                normalize_nclx_ycbcr_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
+            let r = i64::from(y) + ((i64::from(coeffs.r_cr) * i64::from(cr_centered) + 128) >> 8);
+            let g = i64::from(y)
+                + ((i64::from(coeffs.g_cb) * i64::from(cb_centered)
+                    + i64::from(coeffs.g_cr) * i64::from(cr_centered)
+                    + 128)
+                    >> 8);
+            let b = i64::from(y) + ((i64::from(coeffs.b_cb) * i64::from(cb_centered) + 128) >> 8);
 
-    (
-        clip_to_bit_depth(r, bit_depth),
-        clip_to_bit_depth(g, bit_depth),
-        clip_to_bit_depth(b, bit_depth),
-    )
+            (
+                clip_to_bit_depth(r, bit_depth),
+                clip_to_bit_depth(g, bit_depth),
+                clip_to_bit_depth(b, bit_depth),
+            )
+        }
+    }
+}
+
+fn normalize_nclx_identity_samples(
+    y_sample: i32,
+    cb_sample: i32,
+    cr_sample: i32,
+    bit_depth: u8,
+    range: YCbCrRange,
+) -> (i32, i32, i32) {
+    // Provenance: matrix_coefficients=0 handling mirrors
+    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace.
+    if range == YCbCrRange::Full {
+        return (cr_sample, y_sample, cb_sample);
+    }
+
+    let limited_offset = limited_range_offset(bit_depth);
+    let r = div_round_nearest(i64::from(cr_sample - limited_offset) * 256, 224) as i32;
+    let g = div_round_nearest(i64::from(y_sample - limited_offset) * 256, 219) as i32;
+    let b = div_round_nearest(i64::from(cb_sample - limited_offset) * 256, 224) as i32;
+    (r, g, b)
 }
 
 fn normalize_nclx_ycbcr_samples(
@@ -2234,6 +2598,7 @@ fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage,
         bit_depth,
         layout,
         ycbcr_range: YCbCrRange::Full,
+        ycbcr_matrix: YCbCrMatrixCoefficients::default(),
         y_plane,
         u_plane,
         v_plane,
@@ -2377,8 +2742,9 @@ mod tests {
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
         validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeHeicError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
-        HeicPixelLayout, HeicPlane, HevcNalClass, YCbCrRange,
+        DecodeAvifError, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
+        DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
+        YCbCrMatrixCoefficients, YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -2492,6 +2858,7 @@ mod tests {
             bit_depth: 8,
             layout: AvifPixelLayout::Yuv400,
             ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
             y_plane: AvifPlane {
                 width: 2,
                 height: 1,
@@ -2513,6 +2880,7 @@ mod tests {
             bit_depth: 8,
             layout: AvifPixelLayout::Yuv400,
             ycbcr_range: YCbCrRange::Limited,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
             y_plane: AvifPlane {
                 width: 2,
                 height: 1,
@@ -2536,6 +2904,7 @@ mod tests {
             bit_depth_chroma: 8,
             layout: HeicPixelLayout::Yuv400,
             ycbcr_range: YCbCrRange::Limited,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
             y_plane: HeicPlane {
                 width: 2,
                 height: 1,
@@ -2548,6 +2917,118 @@ mod tests {
         let rgba = convert_heic_to_rgba8(&image)
             .expect("limited-range YUV400 HEIC should normalize to full-range RGBA");
         assert_eq!(rgba, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn applies_nclx_identity_matrix_when_converting_avif_to_rgba8() {
+        let image = DecodedAvifImage {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv444,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients {
+                matrix_coefficients: 0,
+                colour_primaries: 1,
+            },
+            y_plane: AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![20]),
+            },
+            u_plane: Some(AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![30]),
+            }),
+            v_plane: Some(AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![40]),
+            }),
+        };
+
+        let rgba = convert_avif_to_rgba8(&image).expect("matrix=0 should map channels as GBR->RGB");
+        assert_eq!(rgba, vec![40, 20, 30, 255]);
+    }
+
+    #[test]
+    fn reports_unsupported_nclx_matrix_when_converting_avif_to_rgba8() {
+        let image = DecodedAvifImage {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv444,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients {
+                matrix_coefficients: 8,
+                colour_primaries: 1,
+            },
+            y_plane: AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![64]),
+            },
+            u_plane: Some(AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![96]),
+            }),
+            v_plane: Some(AvifPlane {
+                width: 1,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![128]),
+            }),
+        };
+
+        let err = convert_avif_to_rgba8(&image)
+            .expect_err("matrix=8 should fail with unsupported-matrix error");
+        assert!(matches!(
+            err,
+            DecodeAvifError::UnsupportedMatrixCoefficients {
+                matrix_coefficients: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn reports_unsupported_nclx_matrix_when_converting_heic_to_rgba8() {
+        let image = DecodedHeicImage {
+            width: 1,
+            height: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: HeicPixelLayout::Yuv444,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients {
+                matrix_coefficients: 8,
+                colour_primaries: 1,
+            },
+            y_plane: HeicPlane {
+                width: 1,
+                height: 1,
+                samples: vec![64],
+            },
+            u_plane: Some(HeicPlane {
+                width: 1,
+                height: 1,
+                samples: vec![96],
+            }),
+            v_plane: Some(HeicPlane {
+                width: 1,
+                height: 1,
+                samples: vec![128],
+            }),
+        };
+
+        let err = convert_heic_to_rgba8(&image)
+            .expect_err("matrix=8 should fail with unsupported-matrix error");
+        assert!(matches!(
+            err,
+            DecodeHeicError::UnsupportedMatrixCoefficients {
+                matrix_coefficients: 8,
+            }
+        ));
     }
 
     #[test]
@@ -2694,6 +3175,7 @@ mod tests {
             bit_depth_chroma: 8,
             layout: HeicPixelLayout::Yuv400,
             ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
             y_plane: HeicPlane {
                 width: 2,
                 height: 1,
@@ -2730,6 +3212,7 @@ mod tests {
             bit_depth_chroma: 10,
             layout: HeicPixelLayout::Yuv400,
             ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
             y_plane: HeicPlane {
                 width: 2,
                 height: 1,
