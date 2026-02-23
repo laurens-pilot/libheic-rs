@@ -23,6 +23,8 @@ const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
 const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
+const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
+const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -590,6 +592,14 @@ pub struct ResolvedPrimaryItemGraph<'a> {
 /// Extracted primary AVIF item payload ready for AV1 decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPrimaryItemData {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Extracted primary HEIC item payload ready for HEVC decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicPrimaryItemData {
     pub item_id: u32,
     pub construction_method: u8,
     pub payload: Vec<u8>,
@@ -1787,6 +1797,126 @@ impl Error for ExtractAvifItemDataError {
     }
 }
 
+/// Errors returned when extracting the primary HEIC payload from BMFF boxes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtractHeicItemDataError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    UnsupportedDataReferenceIndex {
+        item_id: u32,
+        data_reference_index: u16,
+    },
+    UnsupportedConstructionMethod {
+        item_id: u32,
+        construction_method: u8,
+    },
+    MissingIdatBox {
+        item_id: u32,
+    },
+    MetaChildBoxes(ParseBoxError),
+    ExtentOffsetOverflow {
+        item_id: u32,
+        base_offset: u64,
+        extent_offset: u64,
+        extent_length: u64,
+    },
+    ExtentOutOfBounds {
+        item_id: u32,
+        construction_method: u8,
+        start: u64,
+        length: u64,
+        available: u64,
+    },
+    PayloadTooLarge {
+        item_id: u32,
+        length: u64,
+    },
+}
+
+impl Display for ExtractHeicItemDataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractHeicItemDataError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ExtractHeicItemDataError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ExtractHeicItemDataError::Meta(err) => write!(f, "{err}"),
+            ExtractHeicItemDataError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ExtractHeicItemDataError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected hvc1 or hev1"
+            ),
+            ExtractHeicItemDataError::UnexpectedPrimaryItemType { item_id, actual } => write!(
+                f,
+                "primary item_ID {item_id} has infe item_type {actual}, expected hvc1 or hev1"
+            ),
+            ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
+                item_id,
+                data_reference_index,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc data_reference_index {data_reference_index}"
+            ),
+            ExtractHeicItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc construction_method {construction_method}"
+            ),
+            ExtractHeicItemDataError::MissingIdatBox { item_id } => write!(
+                f,
+                "primary item_ID {item_id} references idat-backed iloc extents but no idat box exists in meta"
+            ),
+            ExtractHeicItemDataError::MetaChildBoxes(err) => write!(f, "{err}"),
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset,
+                extent_offset,
+                extent_length,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent offset overflow (base_offset={base_offset}, extent_offset={extent_offset}, extent_length={extent_length})"
+            ),
+            ExtractHeicItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length,
+                available,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent (construction_method={construction_method}, start={start}, length={length}) exceeds available bytes {available}"
+            ),
+            ExtractHeicItemDataError::PayloadTooLarge { item_id, length } => write!(
+                f,
+                "primary item_ID {item_id} payload length {length} cannot be represented on this platform"
+            ),
+        }
+    }
+}
+
+impl Error for ExtractHeicItemDataError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ExtractHeicItemDataError::TopLevelBoxes(err) => Some(err),
+            ExtractHeicItemDataError::Meta(err) => Some(err),
+            ExtractHeicItemDataError::ResolvePrimaryItem(err) => Some(err),
+            ExtractHeicItemDataError::MetaChildBoxes(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseBoxError {
@@ -2105,6 +2235,91 @@ pub fn extract_primary_avif_item_data(
     })
 }
 
+/// Extract the primary HEIC (`hvc1`/`hev1`) coded payload from `iloc` extents.
+pub fn extract_primary_heic_item_data(
+    input: &[u8],
+) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
+    // Provenance: mirrors the HEIC primary-item selection and extent read flow
+    // from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::set_decoder_input_data,
+    // libheif/libheif/box.cc:Box_iloc::read_data, and
+    // libheif/libheif/box.cc:Box_idat::read_data.
+    let top_level = parse_boxes(input).map_err(ExtractHeicItemDataError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ExtractHeicItemDataError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ExtractHeicItemDataError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ExtractHeicItemDataError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ExtractHeicItemDataError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != HVC1_ITEM_TYPE && item_type.as_bytes() != HEV1_ITEM_TYPE {
+        return Err(ExtractHeicItemDataError::UnexpectedPrimaryItemType {
+            item_id,
+            actual: item_type,
+        });
+    }
+
+    let location = &resolved.primary_item.location;
+    if location.data_reference_index != 0 {
+        return Err(ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
+            item_id,
+            data_reference_index: location.data_reference_index,
+        });
+    }
+
+    let total_length = location
+        .extents
+        .iter()
+        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
+        .ok_or(ExtractHeicItemDataError::PayloadTooLarge {
+            item_id,
+            length: u64::MAX,
+        })?;
+    let payload_capacity =
+        usize::try_from(total_length).map_err(|_| ExtractHeicItemDataError::PayloadTooLarge {
+            item_id,
+            length: total_length,
+        })?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+
+    match location.construction_method {
+        0 => append_iloc_extents_to_payload_for_heic(input, location, item_id, 0, &mut payload)?,
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractHeicItemDataError::MissingIdatBox { item_id })?;
+            append_iloc_extents_to_payload_for_heic(
+                idat_box.payload,
+                location,
+                item_id,
+                1,
+                &mut payload,
+            )?;
+        }
+        construction_method => {
+            return Err(ExtractHeicItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            });
+        }
+    }
+
+    Ok(HeicPrimaryItemData {
+        item_id,
+        construction_method: location.construction_method,
+        payload,
+    })
+}
+
 fn append_iloc_extents_to_payload(
     source: &[u8],
     location: &ItemLocationItem,
@@ -2148,6 +2363,58 @@ fn append_iloc_extents_to_payload(
                 length: end,
             })?;
         let end = usize::try_from(end).map_err(|_| ExtractAvifItemDataError::PayloadTooLarge {
+            item_id,
+            length: end,
+        })?;
+        output.extend_from_slice(&source[start..end]);
+    }
+
+    Ok(())
+}
+
+fn append_iloc_extents_to_payload_for_heic(
+    source: &[u8],
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractHeicItemDataError> {
+    let available = source.len() as u64;
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        if end > available {
+            return Err(ExtractHeicItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+
+        let start =
+            usize::try_from(start).map_err(|_| ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            })?;
+        let end = usize::try_from(end).map_err(|_| ExtractHeicItemDataError::PayloadTooLarge {
             item_id,
             length: end,
         })?;
@@ -3323,8 +3590,9 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_primary_avif_item_data, parse_boxes, parse_primary_avif_item_properties, BoxIter,
-        ExtractAvifItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
+        extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
+        parse_primary_avif_item_properties, BoxIter, ExtractAvifItemDataError,
+        ExtractHeicItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
         ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
         ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
         ParseItemLocationBoxError, ParseItemPropertiesBoxError,
@@ -5000,6 +5268,109 @@ mod tests {
     }
 
     #[test]
+    fn extracts_primary_heic_payload_from_mdat_backed_iloc_extents() {
+        let mdat = make_basic_box(*b"mdat", &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&(BASIC_HEADER_SIZE as u32).to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&2_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // extent_offset[0]
+        iloc_payload.extend_from_slice(&2_u32.to_be_bytes()); // extent_length[0]
+        iloc_payload.extend_from_slice(&4_u32.to_be_bytes()); // extent_offset[1]
+        iloc_payload.extend_from_slice(&2_u32.to_be_bytes()); // extent_length[1]
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_heic_meta(iloc, &[]);
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let extracted =
+            extract_primary_heic_item_data(&file).expect("HEIC mdat-backed payload must extract");
+        assert_eq!(extracted.item_id, 1);
+        assert_eq!(extracted.construction_method, 0);
+        assert_eq!(extracted.payload, vec![0xaa, 0xbb, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn extracts_primary_heic_payload_from_idat_backed_iloc_extents() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4, index=0
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // construction_method=1
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&1_u32.to_be_bytes()); // extent_offset
+        iloc_payload.extend_from_slice(&3_u32.to_be_bytes()); // extent_length
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let idat = make_basic_box(*b"idat", &[0x10, 0x11, 0x12, 0x13, 0x14]);
+        let meta = make_primary_heic_meta(iloc, &[idat]);
+
+        let extracted =
+            extract_primary_heic_item_data(&meta).expect("HEIC idat-backed payload must extract");
+        assert_eq!(extracted.item_id, 1);
+        assert_eq!(extracted.construction_method, 1);
+        assert_eq!(extracted.payload, vec![0x11, 0x12, 0x13]);
+    }
+
+    #[test]
+    fn accepts_primary_heic_extraction_for_hev1_item_type() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&(BASIC_HEADER_SIZE as u32).to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // extent_offset
+        iloc_payload.extend_from_slice(&2_u32.to_be_bytes()); // extent_length
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let mdat = make_basic_box(*b"mdat", &[0xaa, 0xbb, 0xcc, 0xdd]);
+        let meta = make_primary_heic_meta_with_item_type(*b"hev1", iloc, &[]);
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let extracted =
+            extract_primary_heic_item_data(&file).expect("HEIC hev1 payload should extract");
+        assert_eq!(extracted.payload, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn rejects_primary_heic_extraction_for_unexpected_primary_item_type() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // size fields all zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_avif_meta(iloc, &[]);
+        let err = extract_primary_heic_item_data(&meta)
+            .expect_err("non-HEIC primary item type must fail");
+        assert_eq!(
+            err,
+            ExtractHeicItemDataError::UnexpectedPrimaryItemType {
+                item_id: 1,
+                actual: FourCc::new(*b"av01"),
+            }
+        );
+    }
+
+    #[test]
     fn parses_primary_avif_properties_from_item_graph() {
         let mut iloc_payload = Vec::new();
         iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
@@ -5149,10 +5520,36 @@ mod tests {
             make_ispe_property(640, 480),
             make_pixi_property(0, &[8, 8, 8]),
         ];
-        make_primary_avif_meta_with_properties(iloc, &properties, additional_children)
+        make_primary_item_meta_with_properties(*b"av01", iloc, &properties, additional_children)
     }
 
     fn make_primary_avif_meta_with_properties(
+        iloc: Vec<u8>,
+        properties: &[Vec<u8>],
+        additional_children: &[Vec<u8>],
+    ) -> Vec<u8> {
+        make_primary_item_meta_with_properties(*b"av01", iloc, properties, additional_children)
+    }
+
+    fn make_primary_heic_meta(iloc: Vec<u8>, additional_children: &[Vec<u8>]) -> Vec<u8> {
+        make_primary_heic_meta_with_item_type(*b"hvc1", iloc, additional_children)
+    }
+
+    fn make_primary_heic_meta_with_item_type(
+        item_type: [u8; 4],
+        iloc: Vec<u8>,
+        additional_children: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let properties = vec![
+            make_hvcc_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+        ];
+        make_primary_item_meta_with_properties(item_type, iloc, &properties, additional_children)
+    }
+
+    fn make_primary_item_meta_with_properties(
+        item_type: [u8; 4],
         iloc: Vec<u8>,
         properties: &[Vec<u8>],
         additional_children: &[Vec<u8>],
@@ -5163,7 +5560,7 @@ mod tests {
         infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
         infe_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
         infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
-        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(&item_type); // item_type
         infe_payload.extend_from_slice(b"primary\0"); // item_name
         let infe = make_basic_box(*b"infe", &infe_payload);
 
@@ -5201,6 +5598,10 @@ mod tests {
         let mut children = vec![pitm, iloc, iinf, iprp];
         children.extend_from_slice(additional_children);
         make_meta_box(&children)
+    }
+
+    fn make_hvcc_property() -> Vec<u8> {
+        make_basic_box(*b"hvcC", &[0x01])
     }
 
     fn make_av1c_property() -> Vec<u8> {
