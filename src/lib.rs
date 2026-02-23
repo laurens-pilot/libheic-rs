@@ -1382,6 +1382,224 @@ fn heic_layout_from_sps_chroma_array_type(
     }
 }
 
+const META_BOX_TYPE: [u8; 4] = *b"meta";
+const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
+const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
+const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
+const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
+const AUXC_PROPERTY_TYPE: [u8; 4] = *b"auxC";
+const HVCC_PROPERTY_TYPE: [u8; 4] = *b"hvcC";
+const ALPHA_AUX_TYPES: [&[u8]; 3] = [
+    b"urn:mpeg:avc:2015:auxid:1",
+    b"urn:mpeg:hevc:2015:auxid:1",
+    b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HeicAuxiliaryAlphaPlane {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    samples: Vec<u16>,
+}
+
+fn decode_primary_heic_auxiliary_alpha_plane(
+    input: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Option<HeicAuxiliaryAlphaPlane> {
+    // Provenance: mirrors libheif auxiliary alpha linkage in
+    // libheif/libheif/context.cc (auxl reference direction, auxC alpha-type
+    // filtering) and auxC payload parsing in libheif/libheif/box.cc:Box_auxC::parse.
+    let top_level = isobmff::parse_boxes(input).ok()?;
+    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
+    let meta = meta_box.parse_meta().ok()?;
+    let resolved = meta.resolve_primary_item().ok()?;
+    let iref = resolved.iref.as_ref()?;
+    let primary_item_id = resolved.primary_item.item_id;
+
+    for reference in &iref.references {
+        if reference.reference_type.as_bytes() != AUXL_REFERENCE_TYPE {
+            continue;
+        }
+        if !reference.to_item_ids.contains(&primary_item_id) {
+            continue;
+        }
+
+        let Some(alpha_plane) =
+            decode_auxiliary_alpha_item_candidate(input, &meta, &resolved, reference.from_item_id)
+        else {
+            continue;
+        };
+
+        if alpha_plane.width != expected_width || alpha_plane.height != expected_height {
+            continue;
+        }
+        return Some(alpha_plane);
+    }
+
+    None
+}
+
+fn decode_auxiliary_alpha_item_candidate<'a>(
+    input: &[u8],
+    meta: &isobmff::MetaBox<'a>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    item_id: u32,
+) -> Option<HeicAuxiliaryAlphaPlane> {
+    let item_info = resolved
+        .iinf
+        .entries
+        .iter()
+        .find(|entry| entry.item_id == item_id)?;
+    let item_type = item_info.item_type?;
+    if item_type.as_bytes() != HVC1_ITEM_TYPE && item_type.as_bytes() != HEV1_ITEM_TYPE {
+        return None;
+    }
+
+    let location = resolved
+        .iloc
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)?;
+    if location.data_reference_index != 0 {
+        return None;
+    }
+
+    let properties = resolved_item_properties_for_item(resolved, item_id)?;
+    if !properties
+        .iter()
+        .any(property_is_alpha_auxiliary_type_property)
+    {
+        return None;
+    }
+
+    let hvcc = properties
+        .iter()
+        .find(|property| property.header.box_type.as_bytes() == HVCC_PROPERTY_TYPE)?
+        .parse_hvcc()
+        .ok()?;
+
+    let payload = extract_heic_item_payload(input, meta, location)?;
+    let stream = assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()?;
+    let decoded = decode_hevc_stream_to_image(&stream).ok()?;
+    let expected_alpha_samples = heic_sample_count(decoded.width, decoded.height, "alpha").ok()?;
+    if decoded.y_plane.samples.len() != expected_alpha_samples {
+        return None;
+    }
+
+    Some(HeicAuxiliaryAlphaPlane {
+        width: decoded.width,
+        height: decoded.height,
+        bit_depth: decoded.bit_depth_luma,
+        samples: decoded.y_plane.samples,
+    })
+}
+
+fn resolved_item_properties_for_item<'a>(
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    item_id: u32,
+) -> Option<Vec<isobmff::ParsedBox<'a>>> {
+    let mut flattened_properties = Vec::new();
+    for container in &resolved.iprp.property_containers {
+        flattened_properties.extend(container.properties.iter().cloned());
+    }
+
+    let mut properties = Vec::new();
+    for association_box in &resolved.iprp.associations {
+        for entry in &association_box.entries {
+            if entry.item_id != item_id {
+                continue;
+            }
+
+            for association in &entry.associations {
+                if association.property_index == 0 {
+                    continue;
+                }
+                let property_index = usize::from(association.property_index - 1);
+                let property = flattened_properties.get(property_index)?.clone();
+                properties.push(property);
+            }
+        }
+    }
+
+    Some(properties)
+}
+
+fn property_is_alpha_auxiliary_type_property(property: &isobmff::ParsedBox<'_>) -> bool {
+    if property.header.box_type.as_bytes() != AUXC_PROPERTY_TYPE {
+        return false;
+    }
+    if property.payload.len() < 4 {
+        return false;
+    }
+    if property.payload[0] != 0 {
+        return false;
+    }
+
+    let aux_payload = &property.payload[4..];
+    let aux_type_end = aux_payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(aux_payload.len());
+    let aux_type = &aux_payload[..aux_type_end];
+    ALPHA_AUX_TYPES.contains(&aux_type)
+}
+
+fn extract_heic_item_payload(
+    input: &[u8],
+    meta: &isobmff::MetaBox<'_>,
+    location: &isobmff::ItemLocationItem,
+) -> Option<Vec<u8>> {
+    let total_length = location
+        .extents
+        .iter()
+        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))?;
+    let payload_capacity = usize::try_from(total_length).ok()?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+
+    match location.construction_method {
+        0 => append_heic_item_location_extents(input, location, &mut payload)?,
+        1 => {
+            let children = meta.parse_children().ok()?;
+            let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
+            append_heic_item_location_extents(idat_box.payload, location, &mut payload)?;
+        }
+        _ => return None,
+    }
+
+    Some(payload)
+}
+
+fn append_heic_item_location_extents(
+    source: &[u8],
+    location: &isobmff::ItemLocationItem,
+    output: &mut Vec<u8>,
+) -> Option<()> {
+    let available = source.len() as u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset)?;
+        let end = start.checked_add(extent.length)?;
+        if end > available {
+            return None;
+        }
+
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        output.extend_from_slice(&source[start..end]);
+    }
+    Some(())
+}
+
+fn find_first_box_by_type<'a, 'b>(
+    boxes: &'b [isobmff::ParsedBox<'a>],
+    box_type: [u8; 4],
+) -> Option<&'b isobmff::ParsedBox<'a>> {
+    boxes
+        .iter()
+        .find(|child| child.header.box_type.as_bytes() == box_type)
+}
+
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
 pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
     if !input_path.exists() {
@@ -1414,9 +1632,12 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
             .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
         let icc_profile = primary_icc_profile_from_heic(&input);
         let decoded = decode_primary_heic_to_image(&input)?;
+        let auxiliary_alpha =
+            decode_primary_heic_auxiliary_alpha_plane(&input, decoded.width, decoded.height);
         write_decoded_heic_to_png(
             &decoded,
             &transforms.transforms,
+            auxiliary_alpha.as_ref(),
             icc_profile.as_deref(),
             output_path,
         )?;
@@ -1736,20 +1957,125 @@ fn write_decoded_avif_to_png(
 fn write_decoded_heic_to_png(
     decoded: &DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth_luma <= 8 {
-        let pixels = convert_heic_to_rgba8(decoded)?;
+        let mut pixels = convert_heic_to_rgba8(decoded)?;
+        if let Some(alpha) = auxiliary_alpha {
+            apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
+        }
         let (width, height, transformed) =
             apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
         return write_rgba8_png(width, height, &transformed, icc_profile, output_path);
     }
 
-    let pixels = convert_heic_to_rgba16(decoded)?;
+    let mut pixels = convert_heic_to_rgba16(decoded)?;
+    if let Some(alpha) = auxiliary_alpha {
+        apply_auxiliary_alpha_to_rgba16(&mut pixels, decoded.width, decoded.height, alpha)?;
+    }
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
     write_rgba16_png(width, height, &transformed, icc_profile, output_path)
+}
+
+fn apply_auxiliary_alpha_to_rgba8(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    alpha: &HeicAuxiliaryAlphaPlane,
+) -> Result<(), DecodeHeicError> {
+    let pixel_count = validate_auxiliary_alpha_plane(alpha, width, height)?;
+    let expected_rgba_samples =
+        pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "RGBA8 alpha composition sample-count overflow for {width}x{height}"
+                ),
+            })?;
+    if rgba.len() != expected_rgba_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "RGBA8 alpha composition input has {} samples, expected {expected_rgba_samples}",
+                rgba.len()
+            ),
+        });
+    }
+
+    for (pixel, alpha_sample) in rgba.chunks_exact_mut(4).zip(alpha.samples.iter()) {
+        pixel[3] = scale_sample_to_u8(*alpha_sample, alpha.bit_depth);
+    }
+
+    Ok(())
+}
+
+fn apply_auxiliary_alpha_to_rgba16(
+    rgba: &mut [u16],
+    width: u32,
+    height: u32,
+    alpha: &HeicAuxiliaryAlphaPlane,
+) -> Result<(), DecodeHeicError> {
+    let pixel_count = validate_auxiliary_alpha_plane(alpha, width, height)?;
+    let expected_rgba_samples =
+        pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "RGBA16 alpha composition sample-count overflow for {width}x{height}"
+                ),
+            })?;
+    if rgba.len() != expected_rgba_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "RGBA16 alpha composition input has {} samples, expected {expected_rgba_samples}",
+                rgba.len()
+            ),
+        });
+    }
+
+    for (pixel, alpha_sample) in rgba.chunks_exact_mut(4).zip(alpha.samples.iter()) {
+        pixel[3] = scale_sample_to_u16(*alpha_sample, alpha.bit_depth);
+    }
+
+    Ok(())
+}
+
+fn validate_auxiliary_alpha_plane(
+    alpha: &HeicAuxiliaryAlphaPlane,
+    width: u32,
+    height: u32,
+) -> Result<usize, DecodeHeicError> {
+    if alpha.width != width || alpha.height != height {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "auxiliary alpha plane dimensions {}x{} do not match primary image {}x{}",
+                alpha.width, alpha.height, width, height
+            ),
+        });
+    }
+
+    if alpha.bit_depth == 0 || alpha.bit_depth > 16 {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "auxiliary alpha bit depth {} is outside supported range 1..=16",
+                alpha.bit_depth
+            ),
+        });
+    }
+
+    let pixel_count = heic_sample_count(width, height, "alpha")?;
+    if alpha.samples.len() != pixel_count {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "auxiliary alpha plane has {} samples, expected {pixel_count}",
+                alpha.samples.len()
+            ),
+        });
+    }
+
+    Ok(pixel_count)
 }
 
 fn apply_primary_item_transforms_rgba<T: Copy + Default>(
@@ -3726,6 +4052,46 @@ mod tests {
     }
 
     #[test]
+    fn decodes_colors_with_alpha_heic_to_png_with_non_opaque_alpha() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/fuzzing/data/corpus/colors-with-alpha.heic");
+        let output = test_output_png_path("colors-with-alpha");
+        let _guard = TempFileGuard(output.clone());
+
+        decode_file_to_png(&fixture, &output)
+            .expect("HEIC colors-with-alpha fixture should decode to PNG");
+        let (min_alpha, max_alpha, max_sample) = png_alpha_range(&output);
+        assert!(
+            min_alpha < max_sample,
+            "decoded PNG alpha channel should contain transparent samples"
+        );
+        assert!(
+            min_alpha < max_alpha,
+            "decoded PNG alpha channel should contain varying alpha values"
+        );
+    }
+
+    #[test]
+    fn decodes_colors_with_alpha_thumbnail_heic_to_png_with_non_opaque_alpha() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/fuzzing/data/corpus/colors-with-alpha-thumbnail.heic");
+        let output = test_output_png_path("colors-with-alpha-thumbnail");
+        let _guard = TempFileGuard(output.clone());
+
+        decode_file_to_png(&fixture, &output)
+            .expect("HEIC colors-with-alpha-thumbnail fixture should decode to PNG");
+        let (min_alpha, max_alpha, max_sample) = png_alpha_range(&output);
+        assert!(
+            min_alpha < max_sample,
+            "decoded thumbnail PNG alpha channel should contain transparent samples"
+        );
+        assert!(
+            min_alpha < max_alpha,
+            "decoded thumbnail PNG alpha channel should contain varying alpha values"
+        );
+    }
+
+    #[test]
     fn writes_rgba8_png_with_embedded_icc_profile() {
         let output = test_output_png_path("rgba8-icc");
         let _guard = TempFileGuard(output.clone());
@@ -4544,6 +4910,60 @@ mod tests {
             "libheic-rs-{label}-{}-{nanos}.png",
             std::process::id()
         ))
+    }
+
+    fn png_alpha_range(path: &PathBuf) -> (u16, u16, u16) {
+        let png_data = std::fs::read(path).expect("PNG fixture should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0_u8; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+
+        let pixel_count = usize::try_from(frame_info.width)
+            .expect("PNG width should fit usize")
+            .checked_mul(usize::try_from(frame_info.height).expect("PNG height should fit usize"))
+            .expect("PNG pixel count should not overflow usize");
+
+        match frame_info.bit_depth {
+            png::BitDepth::Eight => {
+                let expected_len = pixel_count
+                    .checked_mul(4)
+                    .expect("RGBA8 sample count should not overflow");
+                assert_eq!(frame.len(), expected_len);
+                let mut min_alpha = u8::MAX;
+                let mut max_alpha = u8::MIN;
+                for pixel in frame.chunks_exact(4) {
+                    min_alpha = min_alpha.min(pixel[3]);
+                    max_alpha = max_alpha.max(pixel[3]);
+                }
+                (
+                    u16::from(min_alpha),
+                    u16::from(max_alpha),
+                    u16::from(u8::MAX),
+                )
+            }
+            png::BitDepth::Sixteen => {
+                let expected_len = pixel_count
+                    .checked_mul(8)
+                    .expect("RGBA16 byte count should not overflow");
+                assert_eq!(frame.len(), expected_len);
+                let mut min_alpha = u16::MAX;
+                let mut max_alpha = u16::MIN;
+                for pixel in frame.chunks_exact(8) {
+                    let alpha = u16::from_be_bytes([pixel[6], pixel[7]]);
+                    min_alpha = min_alpha.min(alpha);
+                    max_alpha = max_alpha.max(alpha);
+                }
+                (min_alpha, max_alpha, u16::MAX)
+            }
+            other => panic!("unexpected PNG bit depth for alpha test: {other:?}"),
+        }
     }
 
     fn png_icc_profile(path: &PathBuf) -> Option<Vec<u8>> {
