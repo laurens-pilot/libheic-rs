@@ -24,6 +24,7 @@ const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
 const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
+const CLAP_BOX_TYPE: [u8; 4] = *b"clap";
 const NCLX_COLOR_TYPE: [u8; 4] = *b"nclx";
 const NCLC_COLOR_TYPE: [u8; 4] = *b"nclc";
 const PROF_COLOR_TYPE: [u8; 4] = *b"prof";
@@ -341,6 +342,20 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_imir_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as a `clap` property.
+    pub fn parse_clap(
+        &self,
+    ) -> Result<ImageCleanApertureProperty, ParseImageCleanAperturePropertyError> {
+        if self.header.box_type.as_bytes() != CLAP_BOX_TYPE {
+            return Err(ParseImageCleanAperturePropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_clap_payload(self.payload, self.payload_offset())
     }
 }
 
@@ -779,9 +794,23 @@ pub struct ImageMirrorProperty {
     pub direction: ImageMirrorDirection,
 }
 
+/// Parsed `clap` property fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageCleanApertureProperty {
+    pub clean_aperture_width_num: u32,
+    pub clean_aperture_width_den: u32,
+    pub clean_aperture_height_num: u32,
+    pub clean_aperture_height_den: u32,
+    pub horizontal_offset_num: i32,
+    pub horizontal_offset_den: u32,
+    pub vertical_offset_num: i32,
+    pub vertical_offset_den: u32,
+}
+
 /// Parsed primary-item transform property in associated-property order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimaryItemTransformProperty {
+    CleanAperture(ImageCleanApertureProperty),
     Rotation(ImageRotationProperty),
     Mirror(ImageMirrorProperty),
 }
@@ -1909,6 +1938,49 @@ impl Display for ParseImageMirrorPropertyError {
 
 impl Error for ParseImageMirrorPropertyError {}
 
+/// Errors returned when parsing a `clap` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseImageCleanAperturePropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        available: usize,
+        required: usize,
+    },
+    ZeroDenominator {
+        offset: u64,
+        field: &'static str,
+    },
+}
+
+impl Display for ParseImageCleanAperturePropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseImageCleanAperturePropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected clap box at offset {offset}, got box type {actual}"
+            ),
+            ParseImageCleanAperturePropertyError::PayloadTooSmall {
+                offset,
+                available,
+                required,
+            } => write!(
+                f,
+                "clap payload too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseImageCleanAperturePropertyError::ZeroDenominator { offset, field } => write!(
+                f,
+                "clap field {field} has zero denominator at offset {offset}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseImageCleanAperturePropertyError {}
+
 /// Errors returned when parsing primary-item transform properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryItemTransformPropertiesError {
@@ -1916,6 +1988,7 @@ pub enum ParsePrimaryItemTransformPropertiesError {
     MissingMetaBox,
     Meta(ParseMetaBoxError),
     ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    ImageCleanAperture(ParseImageCleanAperturePropertyError),
     ImageRotation(ParseImageRotationPropertyError),
     ImageMirror(ParseImageMirrorPropertyError),
 }
@@ -1929,6 +2002,7 @@ impl Display for ParsePrimaryItemTransformPropertiesError {
             }
             ParsePrimaryItemTransformPropertiesError::Meta(err) => write!(f, "{err}"),
             ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::ImageCleanAperture(err) => write!(f, "{err}"),
             ParsePrimaryItemTransformPropertiesError::ImageRotation(err) => write!(f, "{err}"),
             ParsePrimaryItemTransformPropertiesError::ImageMirror(err) => write!(f, "{err}"),
         }
@@ -1941,6 +2015,7 @@ impl Error for ParsePrimaryItemTransformPropertiesError {
             ParsePrimaryItemTransformPropertiesError::TopLevelBoxes(err) => Some(err),
             ParsePrimaryItemTransformPropertiesError::Meta(err) => Some(err),
             ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem(err) => Some(err),
+            ParsePrimaryItemTransformPropertiesError::ImageCleanAperture(err) => Some(err),
             ParsePrimaryItemTransformPropertiesError::ImageRotation(err) => Some(err),
             ParsePrimaryItemTransformPropertiesError::ImageMirror(err) => Some(err),
             _ => None,
@@ -2541,13 +2616,13 @@ pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
 }
 
-/// Parse primary-item orientation transforms (`irot`/`imir`) in property order.
+/// Parse primary-item transforms (`clap`/`irot`/`imir`) in property order.
 pub fn parse_primary_item_transform_properties(
     input: &[u8],
 ) -> Result<PrimaryItemTransformProperties, ParsePrimaryItemTransformPropertiesError> {
-    // Provenance: mirrors `irot`/`imir` parse semantics from
-    // libheif/libheif/box.cc:{Box_irot::parse,Box_imir::parse} and preserves
-    // associated-property order used by libheif transform application in
+    // Provenance: mirrors `clap`/`irot`/`imir` parse semantics from
+    // libheif/libheif/box.cc:{Box_clap::parse,Box_irot::parse,Box_imir::parse}
+    // and preserves associated-property order used by libheif transform application in
     // libheif/libheif/image-items/image_item.cc:ImageItem::decode_compressed_image.
     let top_level =
         parse_boxes(input).map_err(ParsePrimaryItemTransformPropertiesError::TopLevelBoxes)?;
@@ -2563,7 +2638,14 @@ pub fn parse_primary_item_transform_properties(
     let mut transforms = Vec::new();
     for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type;
-        if property_type.as_bytes() == IROT_BOX_TYPE {
+        if property_type.as_bytes() == CLAP_BOX_TYPE {
+            transforms.push(PrimaryItemTransformProperty::CleanAperture(
+                property
+                    .property
+                    .parse_clap()
+                    .map_err(ParsePrimaryItemTransformPropertiesError::ImageCleanAperture)?,
+            ));
+        } else if property_type.as_bytes() == IROT_BOX_TYPE {
             transforms.push(PrimaryItemTransformProperty::Rotation(
                 property
                     .property
@@ -3537,6 +3619,73 @@ fn parse_imir_payload(
         ImageMirrorDirection::Vertical
     };
     Ok(ImageMirrorProperty { direction })
+}
+
+fn parse_clap_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ImageCleanApertureProperty, ParseImageCleanAperturePropertyError> {
+    // Provenance: mirrors libheif/libheif/box.cc:Box_clap::parse field order
+    // and denominator validity checks.
+    const CLAP_PAYLOAD_SIZE: usize = 32;
+    let required = CLAP_PAYLOAD_SIZE;
+    if payload.len() < required {
+        return Err(ParseImageCleanAperturePropertyError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+            required,
+        });
+    }
+
+    let clean_aperture_width_num = read_u32_be(&payload[0..4]);
+    let clean_aperture_width_den = read_u32_be(&payload[4..8]);
+    let clean_aperture_height_num = read_u32_be(&payload[8..12]);
+    let clean_aperture_height_den = read_u32_be(&payload[12..16]);
+    let horizontal_offset_num = read_i32_be(&payload[16..20]);
+    let horizontal_offset_den = read_u32_be(&payload[20..24]);
+    let vertical_offset_num = read_i32_be(&payload[24..28]);
+    let vertical_offset_den = read_u32_be(&payload[28..32]);
+
+    for (field, denominator, byte_offset) in [
+        (
+            "clean_aperture_width_den",
+            clean_aperture_width_den,
+            payload_offset + 4,
+        ),
+        (
+            "clean_aperture_height_den",
+            clean_aperture_height_den,
+            payload_offset + 12,
+        ),
+        (
+            "horizontal_offset_den",
+            horizontal_offset_den,
+            payload_offset + 20,
+        ),
+        (
+            "vertical_offset_den",
+            vertical_offset_den,
+            payload_offset + 28,
+        ),
+    ] {
+        if denominator == 0 {
+            return Err(ParseImageCleanAperturePropertyError::ZeroDenominator {
+                offset: byte_offset,
+                field,
+            });
+        }
+    }
+
+    Ok(ImageCleanApertureProperty {
+        clean_aperture_width_num,
+        clean_aperture_width_den,
+        clean_aperture_height_num,
+        clean_aperture_height_den,
+        horizontal_offset_num,
+        horizontal_offset_den,
+        vertical_offset_num,
+        vertical_offset_den,
+    })
 }
 
 fn parse_ftyp_payload(
@@ -4616,6 +4765,10 @@ fn read_u32_be(input: &[u8]) -> u32 {
     u32::from_be_bytes([input[0], input[1], input[2], input[3]])
 }
 
+fn read_i32_be(input: &[u8]) -> i32 {
+    i32::from_be_bytes([input[0], input[1], input[2], input[3]])
+}
+
 fn read_u16_be(input: &[u8]) -> u16 {
     u16::from_be_bytes([input[0], input[1]])
 }
@@ -4637,10 +4790,11 @@ mod tests {
         parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
         parse_primary_heic_item_properties, parse_primary_item_transform_properties, BoxIter,
         ColorInformation, ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc,
-        IccColorProfile, ImageMirrorDirection, ImageMirrorProperty, ImageRotationProperty,
-        ItemLocationField, NclxColorProfile, ParseAv1CodecConfigurationBoxError, ParseBoxError,
-        ParseColorInformationPropertyError, ParseFileTypeBoxError, ParseFullBoxError,
-        ParseHevcDecoderConfigurationBoxError, ParseImageMirrorPropertyError,
+        IccColorProfile, ImageCleanApertureProperty, ImageMirrorDirection, ImageMirrorProperty,
+        ImageRotationProperty, ItemLocationField, NclxColorProfile,
+        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseColorInformationPropertyError,
+        ParseFileTypeBoxError, ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
+        ParseImageCleanAperturePropertyError, ParseImageMirrorPropertyError,
         ParseImageRotationPropertyError, ParseImageSpatialExtentsPropertyError,
         ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
         ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
@@ -6896,6 +7050,79 @@ mod tests {
     }
 
     #[test]
+    fn parses_clap_property_fields() {
+        let clap = make_clap_property(ImageCleanApertureProperty {
+            clean_aperture_width_num: 640,
+            clean_aperture_width_den: 1,
+            clean_aperture_height_num: 480,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: -10,
+            horizontal_offset_den: 2,
+            vertical_offset_num: 6,
+            vertical_offset_den: 2,
+        });
+        let parsed = parse_boxes(&clap).expect("clap box should parse");
+        let property = parsed[0]
+            .parse_clap()
+            .expect("clap property should parse fields");
+        assert_eq!(
+            property,
+            ImageCleanApertureProperty {
+                clean_aperture_width_num: 640,
+                clean_aperture_width_den: 1,
+                clean_aperture_height_num: 480,
+                clean_aperture_height_den: 1,
+                horizontal_offset_num: -10,
+                horizontal_offset_den: 2,
+                vertical_offset_num: 6,
+                vertical_offset_den: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_clap_parse_when_payload_is_truncated() {
+        let clap = make_basic_box(*b"clap", &[0; 12]);
+        let parsed = parse_boxes(&clap).expect("clap box should parse");
+        let err = parsed[0]
+            .parse_clap()
+            .expect_err("truncated clap payload must fail");
+        assert_eq!(
+            err,
+            ParseImageCleanAperturePropertyError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 12,
+                required: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_clap_parse_when_denominator_is_zero() {
+        let clap = make_clap_property(ImageCleanApertureProperty {
+            clean_aperture_width_num: 640,
+            clean_aperture_width_den: 0,
+            clean_aperture_height_num: 480,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: 0,
+            horizontal_offset_den: 1,
+            vertical_offset_num: 0,
+            vertical_offset_den: 1,
+        });
+        let parsed = parse_boxes(&clap).expect("clap box should parse");
+        let err = parsed[0]
+            .parse_clap()
+            .expect_err("clap denominator zero must fail");
+        assert_eq!(
+            err,
+            ParseImageCleanAperturePropertyError::ZeroDenominator {
+                offset: BASIC_HEADER_SIZE as u64 + 4,
+                field: "clean_aperture_width_den",
+            }
+        );
+    }
+
+    #[test]
     fn parses_primary_item_transform_properties_in_association_order() {
         let mut iloc_payload = Vec::new();
         iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
@@ -6910,6 +7137,16 @@ mod tests {
             make_av1c_property(),
             make_ispe_property(640, 480),
             make_pixi_property(0, &[8, 8, 8]),
+            make_clap_property(ImageCleanApertureProperty {
+                clean_aperture_width_num: 638,
+                clean_aperture_width_den: 1,
+                clean_aperture_height_num: 478,
+                clean_aperture_height_den: 1,
+                horizontal_offset_num: -1,
+                horizontal_offset_den: 2,
+                vertical_offset_num: -1,
+                vertical_offset_den: 2,
+            }),
             make_imir_property(true),
             make_irot_property(1),
         ];
@@ -6921,6 +7158,16 @@ mod tests {
         assert_eq!(
             transforms.transforms,
             vec![
+                PrimaryItemTransformProperty::CleanAperture(ImageCleanApertureProperty {
+                    clean_aperture_width_num: 638,
+                    clean_aperture_width_den: 1,
+                    clean_aperture_height_num: 478,
+                    clean_aperture_height_den: 1,
+                    horizontal_offset_num: -1,
+                    horizontal_offset_den: 2,
+                    vertical_offset_num: -1,
+                    vertical_offset_den: 2,
+                }),
                 PrimaryItemTransformProperty::Mirror(ImageMirrorProperty {
                     direction: ImageMirrorDirection::Horizontal,
                 }),
@@ -7116,6 +7363,19 @@ mod tests {
     fn make_imir_property(horizontal: bool) -> Vec<u8> {
         let axis = if horizontal { 1 } else { 0 };
         make_basic_box(*b"imir", &[axis])
+    }
+
+    fn make_clap_property(property: ImageCleanApertureProperty) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&property.clean_aperture_width_num.to_be_bytes());
+        payload.extend_from_slice(&property.clean_aperture_width_den.to_be_bytes());
+        payload.extend_from_slice(&property.clean_aperture_height_num.to_be_bytes());
+        payload.extend_from_slice(&property.clean_aperture_height_den.to_be_bytes());
+        payload.extend_from_slice(&property.horizontal_offset_num.to_be_bytes());
+        payload.extend_from_slice(&property.horizontal_offset_den.to_be_bytes());
+        payload.extend_from_slice(&property.vertical_offset_num.to_be_bytes());
+        payload.extend_from_slice(&property.vertical_offset_den.to_be_bytes());
+        make_basic_box(*b"clap", &payload)
     }
 
     fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {

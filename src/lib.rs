@@ -1455,6 +1455,17 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
 
     for transform in transforms {
         match transform {
+            isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
+                let (next_width, next_height, next_pixels) = crop_rgba_by_clean_aperture(
+                    current_width,
+                    current_height,
+                    &current_pixels,
+                    *clean_aperture,
+                )?;
+                current_width = next_width;
+                current_height = next_height;
+                current_pixels = next_pixels;
+            }
             isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
                 let (next_width, next_height, next_pixels) = rotate_rgba_ccw(
                     current_width,
@@ -1631,6 +1642,256 @@ fn mirror_rgba<T: Copy + Default>(
     }
 
     Ok(out)
+}
+
+fn crop_rgba_by_clean_aperture<T: Copy>(
+    width: u32,
+    height: u32,
+    pixels: &[T],
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+) -> Result<(u32, u32, Vec<T>), DecodeError> {
+    if width == 0 || height == 0 {
+        return Err(DecodeError::Unsupported(format!(
+            "cannot apply clean aperture to empty image geometry {}x{}",
+            width, height
+        )));
+    }
+
+    let expected = checked_rgba_sample_count(width, height)?;
+    if pixels.len() != expected {
+        return Err(DecodeError::Unsupported(format!(
+            "RGBA sample count mismatch for clean-aperture input: got {}, expected {expected} for {}x{}",
+            pixels.len(),
+            width,
+            height
+        )));
+    }
+
+    // Provenance: crop rounding/clamp order mirrors libheif's primary decode
+    // transform path in libheif/libheif/image-items/image_item.cc:
+    // ImageItem::decode_image and Box_clap border math in
+    // libheif/libheif/box.cc:{Box_clap::left_rounded,right_rounded,top_rounded,bottom_rounded}.
+    let mut left = clap_left_rounded(clean_aperture, width);
+    let mut right = clap_right_rounded(clean_aperture, width);
+    let mut top = clap_top_rounded(clean_aperture, height);
+    let mut bottom = clap_bottom_rounded(clean_aperture, height);
+
+    left = left.max(0);
+    top = top.max(0);
+    let max_x = i128::from(width) - 1;
+    let max_y = i128::from(height) - 1;
+    right = right.min(max_x);
+    bottom = bottom.min(max_y);
+
+    if left > right || top > bottom {
+        return Err(DecodeError::Unsupported(format!(
+            "invalid clean aperture crop bounds after clamping for {}x{} image: left={left}, right={right}, top={top}, bottom={bottom}",
+            width, height
+        )));
+    }
+
+    let crop_width_i128 = right - left + 1;
+    let crop_height_i128 = bottom - top + 1;
+    let crop_width = u32::try_from(crop_width_i128).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture crop width does not fit in u32 ({crop_width_i128})"
+        ))
+    })?;
+    let crop_height = u32::try_from(crop_height_i128).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture crop height does not fit in u32 ({crop_height_i128})"
+        ))
+    })?;
+
+    let src_width = usize::try_from(width).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "source width does not fit in usize ({width}) while applying clean aperture"
+        ))
+    })?;
+    let left_usize = usize::try_from(left).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture left bound does not fit in usize ({left})"
+        ))
+    })?;
+    let right_usize = usize::try_from(right).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture right bound does not fit in usize ({right})"
+        ))
+    })?;
+    let top_usize = usize::try_from(top).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture top bound does not fit in usize ({top})"
+        ))
+    })?;
+    let bottom_usize = usize::try_from(bottom).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "clean aperture bottom bound does not fit in usize ({bottom})"
+        ))
+    })?;
+
+    let out_len = checked_rgba_sample_count(crop_width, crop_height)?;
+    let mut out = Vec::with_capacity(out_len);
+    for y in top_usize..=bottom_usize {
+        let row_pixel_start = y
+            .checked_mul(src_width)
+            .and_then(|row| row.checked_add(left_usize))
+            .ok_or_else(|| {
+                DecodeError::Unsupported(format!(
+                    "clean aperture source row start overflow at y={y} for {}x{} image",
+                    width, height
+                ))
+            })?;
+        let row_pixel_end = y
+            .checked_mul(src_width)
+            .and_then(|row| row.checked_add(right_usize))
+            .and_then(|pixel| pixel.checked_add(1))
+            .ok_or_else(|| {
+                DecodeError::Unsupported(format!(
+                    "clean aperture source row end overflow at y={y} for {}x{} image",
+                    width, height
+                ))
+            })?;
+        let row_sample_start = row_pixel_start.checked_mul(4).ok_or_else(|| {
+            DecodeError::Unsupported(format!(
+                "clean aperture source row sample start overflow at y={y} for {}x{} image",
+                width, height
+            ))
+        })?;
+        let row_sample_end = row_pixel_end.checked_mul(4).ok_or_else(|| {
+            DecodeError::Unsupported(format!(
+                "clean aperture source row sample end overflow at y={y} for {}x{} image",
+                width, height
+            ))
+        })?;
+
+        out.extend_from_slice(&pixels[row_sample_start..row_sample_end]);
+    }
+
+    debug_assert_eq!(out.len(), out_len);
+    Ok((crop_width, crop_height, out))
+}
+
+#[derive(Clone, Copy)]
+struct RationalValue {
+    numerator: i128,
+    denominator: i128,
+}
+
+impl RationalValue {
+    fn new(numerator: i128, denominator: i128) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
+    }
+
+    fn integer(value: i128) -> Self {
+        Self::new(value, 1)
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self::new(
+            self.numerator * other.denominator + other.numerator * self.denominator,
+            self.denominator * other.denominator,
+        )
+    }
+
+    fn sub(self, other: Self) -> Self {
+        Self::new(
+            self.numerator * other.denominator - other.numerator * self.denominator,
+            self.denominator * other.denominator,
+        )
+    }
+
+    fn sub_int(self, value: i128) -> Self {
+        Self::new(self.numerator - value * self.denominator, self.denominator)
+    }
+
+    fn div_int(self, value: i128) -> Self {
+        Self::new(self.numerator, self.denominator * value)
+    }
+
+    fn round_down(self) -> i128 {
+        self.numerator / self.denominator
+    }
+
+    fn round(self) -> i128 {
+        (self.numerator + self.denominator / 2) / self.denominator
+    }
+}
+
+fn clap_left_rounded(
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+    image_width: u32,
+) -> i128 {
+    let principal_x = RationalValue::new(
+        i128::from(clean_aperture.horizontal_offset_num),
+        i128::from(clean_aperture.horizontal_offset_den),
+    )
+    .add(RationalValue::new(i128::from(image_width) - 1, 2));
+    principal_x
+        .sub(
+            RationalValue::new(
+                i128::from(clean_aperture.clean_aperture_width_num),
+                i128::from(clean_aperture.clean_aperture_width_den),
+            )
+            .sub_int(1)
+            .div_int(2),
+        )
+        .round_down()
+}
+
+fn clap_right_rounded(
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+    image_width: u32,
+) -> i128 {
+    RationalValue::new(
+        i128::from(clean_aperture.clean_aperture_width_num),
+        i128::from(clean_aperture.clean_aperture_width_den),
+    )
+    .sub_int(1)
+    .add(RationalValue::integer(clap_left_rounded(
+        clean_aperture,
+        image_width,
+    )))
+    .round()
+}
+
+fn clap_top_rounded(
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+    image_height: u32,
+) -> i128 {
+    let principal_y = RationalValue::new(
+        i128::from(clean_aperture.vertical_offset_num),
+        i128::from(clean_aperture.vertical_offset_den),
+    )
+    .add(RationalValue::new(i128::from(image_height) - 1, 2));
+    principal_y
+        .sub(
+            RationalValue::new(
+                i128::from(clean_aperture.clean_aperture_height_num),
+                i128::from(clean_aperture.clean_aperture_height_den),
+            )
+            .sub_int(1)
+            .div_int(2),
+        )
+        .round()
+}
+
+fn clap_bottom_rounded(
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+    image_height: u32,
+) -> i128 {
+    RationalValue::new(
+        i128::from(clean_aperture.clean_aperture_height_num),
+        i128::from(clean_aperture.clean_aperture_height_den),
+    )
+    .sub_int(1)
+    .add(RationalValue::integer(clap_top_rounded(
+        clean_aperture,
+        image_height,
+    )))
+    .round()
 }
 
 fn append_hvcc_header_nals(
@@ -2962,7 +3223,7 @@ mod tests {
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
         validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeAvifError, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
+        DecodeAvifError, DecodeError, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
         DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
         YCbCrMatrixCoefficients, YCbCrRange,
     };
@@ -3129,6 +3390,76 @@ mod tests {
                 4_u8, 0, 0, 255, // D
             ]
         );
+    }
+
+    #[test]
+    fn applies_primary_clap_crop_transform() {
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A (0,0)
+            2_u8, 0, 0, 255, // B (1,0)
+            3_u8, 0, 0, 255, // C (2,0)
+            4_u8, 0, 0, 255, // D (0,1)
+            5_u8, 0, 0, 255, // E (1,1)
+            6_u8, 0, 0, 255, // F (2,1)
+        ];
+        let transforms = vec![crate::isobmff::PrimaryItemTransformProperty::CleanAperture(
+            crate::isobmff::ImageCleanApertureProperty {
+                clean_aperture_width_num: 2,
+                clean_aperture_width_den: 1,
+                clean_aperture_height_num: 1,
+                clean_aperture_height_den: 1,
+                horizontal_offset_num: 0,
+                horizontal_offset_den: 1,
+                vertical_offset_num: 0,
+                vertical_offset_den: 1,
+            },
+        )];
+
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(3, 2, pixels, &transforms)
+                .expect("clap transform should crop RGBA geometry and pixel order");
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(
+            transformed,
+            vec![
+                4_u8, 0, 0, 255, // D
+                5_u8, 0, 0, 255, // E
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_primary_clap_transform_with_empty_crop_after_clamp() {
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A
+            2_u8, 0, 0, 255, // B
+            3_u8, 0, 0, 255, // C
+            4_u8, 0, 0, 255, // D
+        ];
+        let transforms = vec![crate::isobmff::PrimaryItemTransformProperty::CleanAperture(
+            crate::isobmff::ImageCleanApertureProperty {
+                clean_aperture_width_num: 0,
+                clean_aperture_width_den: 1,
+                clean_aperture_height_num: 1,
+                clean_aperture_height_den: 1,
+                horizontal_offset_num: 0,
+                horizontal_offset_den: 1,
+                vertical_offset_num: 0,
+                vertical_offset_den: 1,
+            },
+        )];
+
+        let err = apply_primary_item_transforms_rgba(2, 2, pixels, &transforms)
+            .expect_err("empty clap crop should fail deterministically");
+        match err {
+            DecodeError::Unsupported(message) => {
+                assert!(
+                    message.contains("invalid clean aperture crop bounds after clamping"),
+                    "unexpected clap error message: {message}"
+                );
+            }
+            other => panic!("unexpected error kind for invalid clap crop: {other}"),
+        }
     }
 
     #[test]
