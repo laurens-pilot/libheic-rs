@@ -17,6 +17,9 @@ const IPRP_BOX_TYPE: [u8; 4] = *b"iprp";
 const IPCO_BOX_TYPE: [u8; 4] = *b"ipco";
 const IPMA_BOX_TYPE: [u8; 4] = *b"ipma";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
+const AV1C_BOX_TYPE: [u8; 4] = *b"av1C";
+const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
+const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
 const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
@@ -234,6 +237,48 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_iprp_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `av1C` box.
+    pub fn parse_av1c(
+        &self,
+    ) -> Result<Av1CodecConfigurationBox, ParseAv1CodecConfigurationBoxError> {
+        if self.header.box_type.as_bytes() != AV1C_BOX_TYPE {
+            return Err(ParseAv1CodecConfigurationBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_av1c_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `ispe` property.
+    pub fn parse_ispe(
+        &self,
+    ) -> Result<ImageSpatialExtentsProperty, ParseImageSpatialExtentsPropertyError> {
+        if self.header.box_type.as_bytes() != ISPE_BOX_TYPE {
+            return Err(ParseImageSpatialExtentsPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_ispe_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as a `pixi` property.
+    pub fn parse_pixi(
+        &self,
+    ) -> Result<PixelInformationProperty, ParsePixelInformationPropertyError> {
+        if self.header.box_type.as_bytes() != PIXI_BOX_TYPE {
+            return Err(ParsePixelInformationPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_pixi_payload(self.payload, self.payload_offset())
     }
 }
 
@@ -548,6 +593,49 @@ pub struct AvifPrimaryItemData {
     pub item_id: u32,
     pub construction_method: u8,
     pub payload: Vec<u8>,
+}
+
+/// Parsed `av1C` codec configuration fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Av1CodecConfigurationBox {
+    pub marker: bool,
+    pub version: u8,
+    pub seq_profile: u8,
+    pub seq_level_idx_0: u8,
+    pub seq_tier_0: bool,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub monochrome: bool,
+    pub chroma_subsampling_x: bool,
+    pub chroma_subsampling_y: bool,
+    pub chroma_sample_position: u8,
+    pub initial_presentation_delay_present: bool,
+    pub initial_presentation_delay_minus_one: Option<u8>,
+    pub config_obus: Vec<u8>,
+}
+
+/// Parsed `ispe` property fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageSpatialExtentsProperty {
+    pub full_box: FullBoxHeader,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Parsed `pixi` property fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PixelInformationProperty {
+    pub full_box: FullBoxHeader,
+    pub bits_per_channel: Vec<u8>,
+}
+
+/// Parsed primary AVIF properties needed before decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvifPrimaryItemProperties {
+    pub item_id: u32,
+    pub av1c: Av1CodecConfigurationBox,
+    pub ispe: ImageSpatialExtentsProperty,
+    pub pixi: PixelInformationProperty,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -1302,6 +1390,283 @@ impl From<ParseItemReferenceBoxError> for ResolvePrimaryItemGraphError {
     }
 }
 
+/// Errors returned when parsing an `av1C` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseAv1CodecConfigurationBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        available: usize,
+        required: usize,
+    },
+    InvalidMarkerBit {
+        offset: u64,
+        value: u8,
+    },
+}
+
+impl Display for ParseAv1CodecConfigurationBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseAv1CodecConfigurationBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected av1C box at offset {offset}, got box type {actual}"
+            ),
+            ParseAv1CodecConfigurationBoxError::PayloadTooSmall {
+                offset,
+                available,
+                required,
+            } => write!(
+                f,
+                "av1C payload too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseAv1CodecConfigurationBoxError::InvalidMarkerBit { offset, value } => write!(
+                f,
+                "av1C marker bit not set at offset {offset} (first byte: 0x{value:02x})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseAv1CodecConfigurationBoxError {}
+
+/// Errors returned when parsing an `ispe` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseImageSpatialExtentsPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseImageSpatialExtentsPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseImageSpatialExtentsPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected ispe box at offset {offset}, got box type {actual}"
+            ),
+            ParseImageSpatialExtentsPropertyError::FullBox(err) => write!(f, "{err}"),
+            ParseImageSpatialExtentsPropertyError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "ispe box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParseImageSpatialExtentsPropertyError::PayloadTooSmall {
+                offset,
+                available,
+                required,
+            } => write!(
+                f,
+                "ispe payload too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseImageSpatialExtentsPropertyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseImageSpatialExtentsPropertyError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseImageSpatialExtentsPropertyError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing a `pixi` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePixelInformationPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParsePixelInformationPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePixelInformationPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected pixi box at offset {offset}, got box type {actual}"
+            ),
+            ParsePixelInformationPropertyError::FullBox(err) => write!(f, "{err}"),
+            ParsePixelInformationPropertyError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "pixi box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParsePixelInformationPropertyError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "pixi payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParsePixelInformationPropertyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePixelInformationPropertyError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParsePixelInformationPropertyError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing/validating primary AVIF properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePrimaryAvifPropertiesError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    MissingRequiredProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    DuplicateProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    Av1Codec(ParseAv1CodecConfigurationBoxError),
+    ImageSpatialExtents(ParseImageSpatialExtentsPropertyError),
+    PixelInformation(ParsePixelInformationPropertyError),
+    InvalidImageExtent {
+        item_id: u32,
+        width: u32,
+        height: u32,
+    },
+    InvalidPixiChannelCount {
+        item_id: u32,
+        channel_count: usize,
+    },
+    InvalidPixiBitsPerChannel {
+        item_id: u32,
+        channel_index: usize,
+    },
+}
+
+impl Display for ParsePrimaryAvifPropertiesError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePrimaryAvifPropertiesError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ParsePrimaryAvifPropertiesError::Meta(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected av01"
+            ),
+            ParsePrimaryAvifPropertiesError::UnexpectedPrimaryItemType { item_id, actual } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} has infe item_type {actual}, expected av01"
+                )
+            }
+            ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} is missing required AVIF property {property_type}"
+            ),
+            ParsePrimaryAvifPropertiesError::DuplicateProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has multiple {property_type} properties"
+            ),
+            ParsePrimaryAvifPropertiesError::Av1Codec(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::ImageSpatialExtents(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::PixelInformation(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::InvalidImageExtent {
+                item_id,
+                width,
+                height,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid ispe dimensions ({width}x{height})"
+            ),
+            ParsePrimaryAvifPropertiesError::InvalidPixiChannelCount {
+                item_id,
+                channel_count,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid pixi channel count {channel_count}"
+            ),
+            ParsePrimaryAvifPropertiesError::InvalidPixiBitsPerChannel {
+                item_id,
+                channel_index,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid pixi bits_per_channel for channel index {channel_index}"
+            ),
+        }
+    }
+}
+
+impl Error for ParsePrimaryAvifPropertiesError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePrimaryAvifPropertiesError::TopLevelBoxes(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::Meta(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::ResolvePrimaryItem(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::Av1Codec(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::ImageSpatialExtents(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::PixelInformation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned when extracting the primary AVIF payload from BMFF boxes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractAvifItemDataError {
@@ -1537,6 +1902,131 @@ pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
 }
 
+/// Parse and validate primary AVIF properties needed before decode.
+pub fn parse_primary_avif_item_properties(
+    input: &[u8],
+) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
+    // Provenance: mirrors av1C/ispe/pixi parse semantics and AVIF decoder
+    // preconditions from libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
+    // libheif/libheif/box.cc:Box_ispe::parse, libheif/libheif/box.cc:Box_pixi::parse,
+    // and libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder.
+    let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ParsePrimaryAvifPropertiesError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ParsePrimaryAvifPropertiesError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ParsePrimaryAvifPropertiesError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ParsePrimaryAvifPropertiesError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != AV01_ITEM_TYPE {
+        return Err(ParsePrimaryAvifPropertiesError::UnexpectedPrimaryItemType {
+            item_id,
+            actual: item_type,
+        });
+    }
+
+    let mut av1c = None;
+    let mut ispe = None;
+    let mut pixi = None;
+
+    for property in &resolved.primary_item.properties {
+        let property_type = property.property.header.box_type;
+        if property_type.as_bytes() == AV1C_BOX_TYPE {
+            if av1c.is_some() {
+                return Err(ParsePrimaryAvifPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            av1c = Some(
+                property
+                    .property
+                    .parse_av1c()
+                    .map_err(ParsePrimaryAvifPropertiesError::Av1Codec)?,
+            );
+        } else if property_type.as_bytes() == ISPE_BOX_TYPE {
+            if ispe.is_some() {
+                return Err(ParsePrimaryAvifPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            ispe = Some(
+                property
+                    .property
+                    .parse_ispe()
+                    .map_err(ParsePrimaryAvifPropertiesError::ImageSpatialExtents)?,
+            );
+        } else if property_type.as_bytes() == PIXI_BOX_TYPE {
+            if pixi.is_some() {
+                return Err(ParsePrimaryAvifPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            pixi = Some(
+                property
+                    .property
+                    .parse_pixi()
+                    .map_err(ParsePrimaryAvifPropertiesError::PixelInformation)?,
+            );
+        }
+    }
+
+    let av1c = av1c.ok_or(ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(AV1C_BOX_TYPE),
+    })?;
+    let ispe = ispe.ok_or(ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(ISPE_BOX_TYPE),
+    })?;
+    let pixi = pixi.ok_or(ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(PIXI_BOX_TYPE),
+    })?;
+
+    if ispe.width == 0 || ispe.height == 0 {
+        return Err(ParsePrimaryAvifPropertiesError::InvalidImageExtent {
+            item_id,
+            width: ispe.width,
+            height: ispe.height,
+        });
+    }
+    if pixi.bits_per_channel.is_empty() {
+        return Err(ParsePrimaryAvifPropertiesError::InvalidPixiChannelCount {
+            item_id,
+            channel_count: 0,
+        });
+    }
+    if let Some((channel_index, _)) = pixi
+        .bits_per_channel
+        .iter()
+        .enumerate()
+        .find(|(_, bits)| **bits == 0)
+    {
+        return Err(ParsePrimaryAvifPropertiesError::InvalidPixiBitsPerChannel {
+            item_id,
+            channel_index,
+        });
+    }
+
+    Ok(AvifPrimaryItemProperties {
+        item_id,
+        av1c,
+        ispe,
+        pixi,
+    })
+}
+
 /// Extract the primary AVIF (`av01`) coded payload from `iloc` extents.
 pub fn extract_primary_avif_item_data(
     input: &[u8],
@@ -1674,6 +2164,122 @@ fn find_first_child_box<'a, 'b>(
     children
         .iter()
         .find(|child| child.header.box_type.as_bytes() == box_type)
+}
+
+fn parse_av1c_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<Av1CodecConfigurationBox, ParseAv1CodecConfigurationBoxError> {
+    if payload.len() < 4 {
+        return Err(ParseAv1CodecConfigurationBoxError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+            required: 4,
+        });
+    }
+
+    let byte0 = payload[0];
+    if (byte0 & 0x80) == 0 {
+        return Err(ParseAv1CodecConfigurationBoxError::InvalidMarkerBit {
+            offset: payload_offset,
+            value: byte0,
+        });
+    }
+
+    let byte1 = payload[1];
+    let byte2 = payload[2];
+    let byte3 = payload[3];
+    let initial_presentation_delay_present = (byte3 & 0x10) != 0;
+
+    Ok(Av1CodecConfigurationBox {
+        marker: true,
+        version: byte0 & 0x7F,
+        seq_profile: (byte1 >> 5) & 0x07,
+        seq_level_idx_0: byte1 & 0x1F,
+        seq_tier_0: (byte2 & 0x80) != 0,
+        high_bitdepth: (byte2 & 0x40) != 0,
+        twelve_bit: (byte2 & 0x20) != 0,
+        monochrome: (byte2 & 0x10) != 0,
+        chroma_subsampling_x: (byte2 & 0x08) != 0,
+        chroma_subsampling_y: (byte2 & 0x04) != 0,
+        chroma_sample_position: byte2 & 0x03,
+        initial_presentation_delay_present,
+        initial_presentation_delay_minus_one: initial_presentation_delay_present
+            .then_some(byte3 & 0x0F),
+        config_obus: payload[4..].to_vec(),
+    })
+}
+
+fn parse_ispe_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ImageSpatialExtentsProperty, ParseImageSpatialExtentsPropertyError> {
+    // Provenance: mirrors libheif/libheif/box.cc:Box_ispe::parse FullBox and
+    // width/height extraction (version 0, then 32-bit width/height).
+    let (full_box, ispe_payload, ispe_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version != 0 {
+        return Err(ParseImageSpatialExtentsPropertyError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    let required = size_of::<u32>() * 2;
+    if ispe_payload.len() < required {
+        return Err(ParseImageSpatialExtentsPropertyError::PayloadTooSmall {
+            offset: ispe_payload_offset,
+            available: ispe_payload.len(),
+            required,
+        });
+    }
+
+    Ok(ImageSpatialExtentsProperty {
+        full_box,
+        width: read_u32_be(&ispe_payload[0..4]),
+        height: read_u32_be(&ispe_payload[4..8]),
+    })
+}
+
+fn parse_pixi_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<PixelInformationProperty, ParsePixelInformationPropertyError> {
+    // Provenance: mirrors libheif/libheif/box.cc:Box_pixi::parse (FullBox
+    // version 0 + 8-bit channel count + N bits_per_channel values).
+    let (full_box, pixi_payload, pixi_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version != 0 {
+        return Err(ParsePixelInformationPropertyError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    if pixi_payload.is_empty() {
+        return Err(ParsePixelInformationPropertyError::PayloadTooSmall {
+            offset: pixi_payload_offset,
+            context: "num_channels",
+            available: 0,
+            required: 1,
+        });
+    }
+
+    let num_channels = usize::from(pixi_payload[0]);
+    let available_channels = pixi_payload.len().saturating_sub(1);
+    if available_channels < num_channels {
+        return Err(ParsePixelInformationPropertyError::PayloadTooSmall {
+            offset: pixi_payload_offset + 1,
+            context: "bits_per_channel",
+            available: available_channels,
+            required: num_channels,
+        });
+    }
+
+    Ok(PixelInformationProperty {
+        full_box,
+        bits_per_channel: pixi_payload[1..(1 + num_channels)].to_vec(),
+    })
 }
 
 fn parse_ftyp_payload(
@@ -2717,13 +3323,15 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_primary_avif_item_data, parse_boxes, BoxIter, ExtractAvifItemDataError, FourCc,
-        ItemLocationField, ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
-        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
-        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
-        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
-        ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
-        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        extract_primary_avif_item_data, parse_boxes, parse_primary_avif_item_properties, BoxIter,
+        ExtractAvifItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
+        ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
+        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
+        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
+        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
+        ParsePrimaryAvifPropertiesError, ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError,
+        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -4391,7 +4999,164 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_primary_avif_properties_from_item_graph() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_avif_meta(iloc, &[]);
+        let properties = parse_primary_avif_item_properties(&meta)
+            .expect("primary AVIF property parse should succeed");
+
+        assert_eq!(properties.item_id, 1);
+        assert!(properties.av1c.marker);
+        assert_eq!(properties.av1c.version, 1);
+        assert_eq!(properties.av1c.seq_profile, 2);
+        assert_eq!(properties.av1c.seq_level_idx_0, 21);
+        assert!(properties.av1c.seq_tier_0);
+        assert!(properties.av1c.high_bitdepth);
+        assert!(!properties.av1c.twelve_bit);
+        assert!(properties.av1c.monochrome);
+        assert!(properties.av1c.chroma_subsampling_x);
+        assert!(!properties.av1c.chroma_subsampling_y);
+        assert_eq!(properties.av1c.chroma_sample_position, 2);
+        assert_eq!(
+            properties.av1c.initial_presentation_delay_minus_one,
+            Some(5)
+        );
+        assert_eq!(properties.av1c.config_obus, vec![0xaa, 0xbb]);
+
+        assert_eq!(properties.ispe.width, 640);
+        assert_eq!(properties.ispe.height, 480);
+        assert_eq!(properties.pixi.bits_per_channel, vec![8, 8, 8]);
+    }
+
+    #[test]
+    fn rejects_primary_avif_property_parse_when_required_property_is_missing() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![make_av1c_property(), make_ispe_property(640, 480)];
+        let meta = make_primary_avif_meta_with_properties(iloc, &properties, &[]);
+        let err =
+            parse_primary_avif_item_properties(&meta).expect_err("missing pixi property must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+                item_id: 1,
+                property_type: FourCc::new(*b"pixi"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_primary_avif_property_parse_when_property_is_duplicated() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![
+            make_av1c_property(),
+            make_av1c_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+        ];
+        let meta = make_primary_avif_meta_with_properties(iloc, &properties, &[]);
+        let err = parse_primary_avif_item_properties(&meta)
+            .expect_err("duplicate av1C property must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryAvifPropertiesError::DuplicateProperty {
+                item_id: 1,
+                property_type: FourCc::new(*b"av1C"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_av1c_parse_when_marker_bit_is_unset() {
+        let av1c = make_basic_box(*b"av1C", &[0x01, 0x00, 0x00, 0x00]);
+        let parsed = parse_boxes(&av1c).expect("av1C box should parse");
+
+        let err = parsed[0]
+            .parse_av1c()
+            .expect_err("av1C marker-bit violation must fail");
+        assert_eq!(
+            err,
+            ParseAv1CodecConfigurationBoxError::InvalidMarkerBit {
+                offset: BASIC_HEADER_SIZE as u64,
+                value: 0x01,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ispe_parse_for_unsupported_version() {
+        let ispe = make_ispe_property_with_version(1, 640, 480);
+        let parsed = parse_boxes(&ispe).expect("ispe box should parse");
+
+        let err = parsed[0]
+            .parse_ispe()
+            .expect_err("unsupported ispe version must fail");
+        assert_eq!(
+            err,
+            ParseImageSpatialExtentsPropertyError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_pixi_parse_when_channel_data_is_truncated() {
+        let pixi = make_basic_box(*b"pixi", &[0x00, 0x00, 0x00, 0x00, 0x03, 0x08, 0x08]);
+        let parsed = parse_boxes(&pixi).expect("pixi box should parse");
+
+        let err = parsed[0]
+            .parse_pixi()
+            .expect_err("truncated pixi channel list must fail");
+        assert_eq!(
+            err,
+            ParsePixelInformationPropertyError::PayloadTooSmall {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE + 1) as u64,
+                context: "bits_per_channel",
+                available: 2,
+                required: 3,
+            }
+        );
+    }
+
     fn make_primary_avif_meta(iloc: Vec<u8>, additional_children: &[Vec<u8>]) -> Vec<u8> {
+        let properties = vec![
+            make_av1c_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+        ];
+        make_primary_avif_meta_with_properties(iloc, &properties, additional_children)
+    }
+
+    fn make_primary_avif_meta_with_properties(
+        iloc: Vec<u8>,
+        properties: &[Vec<u8>],
+        additional_children: &[Vec<u8>],
+    ) -> Vec<u8> {
         let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
         let mut infe_payload = Vec::new();
@@ -4408,15 +5173,24 @@ mod tests {
         iinf_payload.extend_from_slice(&infe);
         let iinf = make_basic_box(*b"iinf", &iinf_payload);
 
-        let ispe = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
-        let ipco = make_basic_box(*b"ipco", &ispe);
+        assert!(
+            properties.len() <= 0x7F,
+            "too many properties for test ipma"
+        );
+        let mut ipco_payload = Vec::new();
+        for property in properties {
+            ipco_payload.extend_from_slice(property);
+        }
+        let ipco = make_basic_box(*b"ipco", &ipco_payload);
 
         let mut ipma_payload = Vec::new();
         ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
         ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
         ipma_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
-        ipma_payload.push(1); // association_count
-        ipma_payload.push(0x01); // property_index=1
+        ipma_payload.push(properties.len() as u8); // association_count
+        for property_index in 1..=properties.len() {
+            ipma_payload.push(property_index as u8); // property_index
+        }
         let ipma = make_basic_box(*b"ipma", &ipma_payload);
 
         let mut iprp_payload = Vec::new();
@@ -4427,6 +5201,37 @@ mod tests {
         let mut children = vec![pitm, iloc, iinf, iprp];
         children.extend_from_slice(additional_children);
         make_meta_box(&children)
+    }
+
+    fn make_av1c_property() -> Vec<u8> {
+        make_basic_box(*b"av1C", &[0x81, 0x55, 0xDA, 0x15, 0xAA, 0xBB])
+    }
+
+    fn make_ispe_property(width: u32, height: u32) -> Vec<u8> {
+        make_ispe_property_with_version(0, width, height)
+    }
+
+    fn make_ispe_property_with_version(version: u8, width: u32, height: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(version);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&width.to_be_bytes());
+        payload.extend_from_slice(&height.to_be_bytes());
+        make_basic_box(*b"ispe", &payload)
+    }
+
+    fn make_pixi_property(version: u8, bits_per_channel: &[u8]) -> Vec<u8> {
+        assert!(
+            bits_per_channel.len() <= u8::MAX as usize,
+            "too many channels for test pixi property"
+        );
+
+        let mut payload = Vec::new();
+        payload.push(version);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00]);
+        payload.push(bits_per_channel.len() as u8);
+        payload.extend_from_slice(bits_per_channel);
+        make_basic_box(*b"pixi", &payload)
     }
 
     fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {
