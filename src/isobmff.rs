@@ -34,6 +34,8 @@ const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
+const GRID_ITEM_TYPE: [u8; 4] = *b"grid";
+const DIMG_REFERENCE_TYPE: [u8; 4] = *b"dimg";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -678,6 +680,41 @@ pub struct HeicPrimaryItemData {
     pub item_id: u32,
     pub construction_method: u8,
     pub payload: Vec<u8>,
+}
+
+/// Parsed HEIC `grid` primary item descriptor payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeicGridDescriptor {
+    pub version: u8,
+    pub rows: u16,
+    pub columns: u16,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+/// One resolved `dimg` tile item payload used by a HEIC `grid` primary item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicGridTileItemData {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Extracted HEIC `grid` primary item descriptor and resolved tile payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicGridPrimaryItemData {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub descriptor: HeicGridDescriptor,
+    pub tile_item_ids: Vec<u32>,
+    pub tiles: Vec<HeicGridTileItemData>,
+}
+
+/// Extracted HEIC primary item data, either direct coded payload or `grid`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeicPrimaryItemDataWithGrid {
+    Coded(HeicPrimaryItemData),
+    Grid(HeicGridPrimaryItemData),
 }
 
 /// Parsed `av1C` codec configuration fields.
@@ -2395,6 +2432,42 @@ pub enum ExtractHeicItemDataError {
         item_id: u32,
         actual: FourCc,
     },
+    GridDescriptorTooSmall {
+        item_id: u32,
+        available: usize,
+        required: usize,
+    },
+    UnsupportedGridDescriptorVersion {
+        item_id: u32,
+        version: u8,
+    },
+    MissingGridTileReferences {
+        item_id: u32,
+    },
+    GridTileCountMismatch {
+        item_id: u32,
+        rows: u16,
+        columns: u16,
+        expected: usize,
+        actual: usize,
+    },
+    MissingGridTileItemInfo {
+        item_id: u32,
+        tile_item_id: u32,
+    },
+    MissingGridTileItemType {
+        item_id: u32,
+        tile_item_id: u32,
+    },
+    UnexpectedGridTileItemType {
+        item_id: u32,
+        tile_item_id: u32,
+        actual: FourCc,
+    },
+    MissingGridTileLocation {
+        item_id: u32,
+        tile_item_id: u32,
+    },
     UnsupportedDataReferenceIndex {
         item_id: u32,
         data_reference_index: u16,
@@ -2442,6 +2515,63 @@ impl Display for ExtractHeicItemDataError {
             ExtractHeicItemDataError::UnexpectedPrimaryItemType { item_id, actual } => write!(
                 f,
                 "primary item_ID {item_id} has infe item_type {actual}, expected hvc1 or hev1"
+            ),
+            ExtractHeicItemDataError::GridDescriptorTooSmall {
+                item_id,
+                available,
+                required,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} descriptor is truncated (available: {available} bytes, required: {required})"
+            ),
+            ExtractHeicItemDataError::UnsupportedGridDescriptorVersion { item_id, version } => {
+                write!(
+                    f,
+                    "primary grid item_ID {item_id} has unsupported descriptor version {version}"
+                )
+            }
+            ExtractHeicItemDataError::MissingGridTileReferences { item_id } => write!(
+                f,
+                "primary grid item_ID {item_id} has no dimg tile references"
+            ),
+            ExtractHeicItemDataError::GridTileCountMismatch {
+                item_id,
+                rows,
+                columns,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} expects {rows}x{columns}={expected} dimg tile references, found {actual}"
+            ),
+            ExtractHeicItemDataError::MissingGridTileItemInfo {
+                item_id,
+                tile_item_id,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} references tile item_ID {tile_item_id} that is missing from iinf"
+            ),
+            ExtractHeicItemDataError::MissingGridTileItemType {
+                item_id,
+                tile_item_id,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} references tile item_ID {tile_item_id} without an infe item_type"
+            ),
+            ExtractHeicItemDataError::UnexpectedGridTileItemType {
+                item_id,
+                tile_item_id,
+                actual,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} references tile item_ID {tile_item_id} with infe item_type {actual}, expected hvc1 or hev1"
+            ),
+            ExtractHeicItemDataError::MissingGridTileLocation {
+                item_id,
+                tile_item_id,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} references tile item_ID {tile_item_id} that is missing from iloc"
             ),
             ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
                 item_id,
@@ -3057,15 +3187,7 @@ pub fn extract_primary_heic_item_data(
     // from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::set_decoder_input_data,
     // libheif/libheif/box.cc:Box_iloc::read_data, and
     // libheif/libheif/box.cc:Box_idat::read_data.
-    let top_level = parse_boxes(input).map_err(ExtractHeicItemDataError::TopLevelBoxes)?;
-    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
-        .ok_or(ExtractHeicItemDataError::MissingMetaBox)?;
-    let meta = meta_box
-        .parse_meta()
-        .map_err(ExtractHeicItemDataError::Meta)?;
-    let resolved = meta
-        .resolve_primary_item()
-        .map_err(ExtractHeicItemDataError::ResolvePrimaryItem)?;
+    let (meta, resolved) = resolve_primary_heic_item_graph(input)?;
 
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
@@ -3080,7 +3202,170 @@ pub fn extract_primary_heic_item_data(
         });
     }
 
-    let location = &resolved.primary_item.location;
+    let (construction_method, payload) = extract_heic_item_payload_from_location(
+        input,
+        &meta,
+        &resolved.primary_item.location,
+        item_id,
+    )?;
+
+    Ok(HeicPrimaryItemData {
+        item_id,
+        construction_method,
+        payload,
+    })
+}
+
+/// Extract primary HEIC item data, including `grid` item descriptor + tiles.
+pub fn extract_primary_heic_item_data_with_grid(
+    input: &[u8],
+) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
+    // Provenance: mirrors libheif `grid` descriptor parsing and tile-reference
+    // resolution in libheif/libheif/image-items/grid.cc:{ImageGrid::parse,ImageItem_Grid::read_grid_spec},
+    // with coded tile payload extraction reusing the same iloc/idat data flow as
+    // libheif/libheif/box.cc:{Box_iloc::read_data,Box_idat::read_data}.
+    let (meta, resolved) = resolve_primary_heic_item_graph(input)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ExtractHeicItemDataError::MissingPrimaryItemType { item_id })?;
+
+    if item_type.as_bytes() == HVC1_ITEM_TYPE || item_type.as_bytes() == HEV1_ITEM_TYPE {
+        let (construction_method, payload) = extract_heic_item_payload_from_location(
+            input,
+            &meta,
+            &resolved.primary_item.location,
+            item_id,
+        )?;
+        return Ok(HeicPrimaryItemDataWithGrid::Coded(HeicPrimaryItemData {
+            item_id,
+            construction_method,
+            payload,
+        }));
+    }
+
+    if item_type.as_bytes() != GRID_ITEM_TYPE {
+        return Err(ExtractHeicItemDataError::UnexpectedPrimaryItemType {
+            item_id,
+            actual: item_type,
+        });
+    }
+
+    let (construction_method, grid_payload) = extract_heic_item_payload_from_location(
+        input,
+        &meta,
+        &resolved.primary_item.location,
+        item_id,
+    )?;
+    let descriptor = parse_heic_grid_descriptor(item_id, &grid_payload)?;
+
+    let tile_item_ids: Vec<u32> = resolved
+        .primary_item
+        .references
+        .iter()
+        .filter(|reference| reference.reference_type.as_bytes() == DIMG_REFERENCE_TYPE)
+        .flat_map(|reference| reference.to_item_ids.iter().copied())
+        .collect();
+    if tile_item_ids.is_empty() {
+        return Err(ExtractHeicItemDataError::MissingGridTileReferences { item_id });
+    }
+
+    let expected_tiles_u64 = u64::from(descriptor.rows) * u64::from(descriptor.columns);
+    let expected_tiles = usize::try_from(expected_tiles_u64).map_err(|_| {
+        ExtractHeicItemDataError::PayloadTooLarge {
+            item_id,
+            length: expected_tiles_u64,
+        }
+    })?;
+    if tile_item_ids.len() != expected_tiles {
+        return Err(ExtractHeicItemDataError::GridTileCountMismatch {
+            item_id,
+            rows: descriptor.rows,
+            columns: descriptor.columns,
+            expected: expected_tiles,
+            actual: tile_item_ids.len(),
+        });
+    }
+
+    let mut tiles = Vec::with_capacity(tile_item_ids.len());
+    for &tile_item_id in &tile_item_ids {
+        let tile_item_info = resolved
+            .iinf
+            .entries
+            .iter()
+            .find(|entry| entry.item_id == tile_item_id)
+            .ok_or(ExtractHeicItemDataError::MissingGridTileItemInfo {
+                item_id,
+                tile_item_id,
+            })?;
+        let tile_item_type =
+            tile_item_info
+                .item_type
+                .ok_or(ExtractHeicItemDataError::MissingGridTileItemType {
+                    item_id,
+                    tile_item_id,
+                })?;
+        if tile_item_type.as_bytes() != HVC1_ITEM_TYPE
+            && tile_item_type.as_bytes() != HEV1_ITEM_TYPE
+        {
+            return Err(ExtractHeicItemDataError::UnexpectedGridTileItemType {
+                item_id,
+                tile_item_id,
+                actual: tile_item_type,
+            });
+        }
+
+        let tile_location = resolved
+            .iloc
+            .items
+            .iter()
+            .find(|item| item.item_id == tile_item_id)
+            .ok_or(ExtractHeicItemDataError::MissingGridTileLocation {
+                item_id,
+                tile_item_id,
+            })?;
+        let (tile_construction_method, payload) =
+            extract_heic_item_payload_from_location(input, &meta, tile_location, tile_item_id)?;
+        tiles.push(HeicGridTileItemData {
+            item_id: tile_item_id,
+            construction_method: tile_construction_method,
+            payload,
+        });
+    }
+
+    Ok(HeicPrimaryItemDataWithGrid::Grid(HeicGridPrimaryItemData {
+        item_id,
+        construction_method,
+        descriptor,
+        tile_item_ids,
+        tiles,
+    }))
+}
+
+fn resolve_primary_heic_item_graph<'a>(
+    input: &'a [u8],
+) -> Result<(MetaBox<'a>, ResolvedPrimaryItemGraph<'a>), ExtractHeicItemDataError> {
+    let top_level = parse_boxes(input).map_err(ExtractHeicItemDataError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ExtractHeicItemDataError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ExtractHeicItemDataError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ExtractHeicItemDataError::ResolvePrimaryItem)?;
+    Ok((meta, resolved))
+}
+
+fn extract_heic_item_payload_from_location(
+    input: &[u8],
+    meta: &MetaBox<'_>,
+    location: &ItemLocationItem,
+    item_id: u32,
+) -> Result<(u8, Vec<u8>), ExtractHeicItemDataError> {
     if location.data_reference_index != 0 {
         return Err(ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
             item_id,
@@ -3127,10 +3412,71 @@ pub fn extract_primary_heic_item_data(
         }
     }
 
-    Ok(HeicPrimaryItemData {
-        item_id,
-        construction_method: location.construction_method,
-        payload,
+    Ok((location.construction_method, payload))
+}
+
+fn parse_heic_grid_descriptor(
+    item_id: u32,
+    payload: &[u8],
+) -> Result<HeicGridDescriptor, ExtractHeicItemDataError> {
+    const GRID_MINIMUM_SIZE: usize = 8;
+    if payload.len() < GRID_MINIMUM_SIZE {
+        return Err(ExtractHeicItemDataError::GridDescriptorTooSmall {
+            item_id,
+            available: payload.len(),
+            required: GRID_MINIMUM_SIZE,
+        });
+    }
+
+    let version = payload[0];
+    if version != 0 {
+        return Err(ExtractHeicItemDataError::UnsupportedGridDescriptorVersion {
+            item_id,
+            version,
+        });
+    }
+
+    let flags = payload[1];
+    let field_uses_32_bits = (flags & 0x01) != 0;
+    let rows = u16::from(payload[2]) + 1;
+    let columns = u16::from(payload[3]) + 1;
+    let (required, output_width, output_height) = if field_uses_32_bits {
+        let required = 12;
+        if payload.len() < required {
+            return Err(ExtractHeicItemDataError::GridDescriptorTooSmall {
+                item_id,
+                available: payload.len(),
+                required,
+            });
+        }
+
+        (
+            required,
+            read_u32_be(&payload[4..8]),
+            read_u32_be(&payload[8..12]),
+        )
+    } else {
+        (
+            GRID_MINIMUM_SIZE,
+            u32::from(read_u16_be(&payload[4..6])),
+            u32::from(read_u16_be(&payload[6..8])),
+        )
+    };
+
+    if payload.len() < required {
+        return Err(ExtractHeicItemDataError::GridDescriptorTooSmall {
+            item_id,
+            available: payload.len(),
+            required,
+        });
+    }
+
+    Ok(HeicGridDescriptor {
+        version,
+        rows,
+        columns,
+        output_width,
+        output_height,
     })
 }
 
@@ -4786,10 +5132,11 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
-        parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
-        parse_primary_heic_item_properties, parse_primary_item_transform_properties, BoxIter,
-        ColorInformation, ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc,
+        extract_primary_avif_item_data, extract_primary_heic_item_data,
+        extract_primary_heic_item_data_with_grid, parse_boxes, parse_primary_avif_item_properties,
+        parse_primary_heic_item_preflight_properties, parse_primary_heic_item_properties,
+        parse_primary_item_transform_properties, BoxIter, ColorInformation,
+        ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc, HeicPrimaryItemDataWithGrid,
         IccColorProfile, ImageCleanApertureProperty, ImageMirrorDirection, ImageMirrorProperty,
         ImageRotationProperty, ItemLocationField, NclxColorProfile,
         ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseColorInformationPropertyError,
@@ -6574,6 +6921,146 @@ mod tests {
     }
 
     #[test]
+    fn extracts_primary_heic_grid_descriptor_and_tile_payloads() {
+        let grid_descriptor = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0x02];
+        let tile_a = vec![0xaa, 0xbb];
+        let tile_b = vec![0xcc, 0xdd, 0xee];
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&grid_descriptor);
+        mdat_payload.extend_from_slice(&tile_a);
+        mdat_payload.extend_from_slice(&tile_b);
+        let mdat = make_basic_box(*b"mdat", &mdat_payload);
+
+        let base_offset = BASIC_HEADER_SIZE as u32;
+        let iloc = make_iloc_v0_single_extent_items(&[
+            (1_u16, base_offset, 0_u32, grid_descriptor.len() as u32),
+            (
+                2_u16,
+                base_offset,
+                grid_descriptor.len() as u32,
+                tile_a.len() as u32,
+            ),
+            (
+                3_u16,
+                base_offset,
+                (grid_descriptor.len() + tile_a.len()) as u32,
+                tile_b.len() as u32,
+            ),
+        ]);
+        let iinf = make_iinf_with_entries(&[
+            (1_u16, *b"grid", b"primary-grid"),
+            (2_u16, *b"hvc1", b"tile-0"),
+            (3_u16, *b"hev1", b"tile-1"),
+        ]);
+        let iref = make_iref_dimg_v0(1_u16, &[2_u16, 3_u16]);
+        let meta = make_primary_grid_heic_meta(iloc, iinf, Some(iref), &[]);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let extracted = extract_primary_heic_item_data_with_grid(&file)
+            .expect("grid primary extraction should succeed");
+        assert_eq!(
+            extracted,
+            HeicPrimaryItemDataWithGrid::Grid(super::HeicGridPrimaryItemData {
+                item_id: 1,
+                construction_method: 0,
+                descriptor: super::HeicGridDescriptor {
+                    version: 0,
+                    rows: 1,
+                    columns: 2,
+                    output_width: 4,
+                    output_height: 2,
+                },
+                tile_item_ids: vec![2, 3],
+                tiles: vec![
+                    super::HeicGridTileItemData {
+                        item_id: 2,
+                        construction_method: 0,
+                        payload: tile_a,
+                    },
+                    super::HeicGridTileItemData {
+                        item_id: 3,
+                        construction_method: 0,
+                        payload: tile_b,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_primary_heic_grid_extraction_when_dimg_references_are_missing() {
+        let grid_descriptor = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02];
+        let mdat = make_basic_box(*b"mdat", &grid_descriptor);
+        let base_offset = BASIC_HEADER_SIZE as u32;
+        let iloc = make_iloc_v0_single_extent_items(&[(
+            1_u16,
+            base_offset,
+            0_u32,
+            grid_descriptor.len() as u32,
+        )]);
+        let iinf = make_iinf_with_entries(&[(1_u16, *b"grid", b"primary-grid")]);
+        let meta = make_primary_grid_heic_meta(iloc, iinf, None, &[]);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("missing dimg references must fail");
+        assert_eq!(
+            err,
+            ExtractHeicItemDataError::MissingGridTileReferences { item_id: 1 }
+        );
+    }
+
+    #[test]
+    fn rejects_primary_heic_grid_extraction_when_tile_count_mismatches_descriptor() {
+        let grid_descriptor = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0x02];
+        let tile_a = vec![0xaa, 0xbb];
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&grid_descriptor);
+        mdat_payload.extend_from_slice(&tile_a);
+        let mdat = make_basic_box(*b"mdat", &mdat_payload);
+
+        let base_offset = BASIC_HEADER_SIZE as u32;
+        let iloc = make_iloc_v0_single_extent_items(&[
+            (1_u16, base_offset, 0_u32, grid_descriptor.len() as u32),
+            (
+                2_u16,
+                base_offset,
+                grid_descriptor.len() as u32,
+                tile_a.len() as u32,
+            ),
+        ]);
+        let iinf = make_iinf_with_entries(&[
+            (1_u16, *b"grid", b"primary-grid"),
+            (2_u16, *b"hvc1", b"tile-0"),
+        ]);
+        let iref = make_iref_dimg_v0(1_u16, &[2_u16]);
+        let meta = make_primary_grid_heic_meta(iloc, iinf, Some(iref), &[]);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("grid tile count mismatch must fail");
+        assert_eq!(
+            err,
+            ExtractHeicItemDataError::GridTileCountMismatch {
+                item_id: 1,
+                rows: 1,
+                columns: 2,
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
     fn parses_primary_avif_properties_from_item_graph() {
         let mut iloc_payload = Vec::new();
         iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
@@ -7210,6 +7697,101 @@ mod tests {
             make_pixi_property(0, &[8, 8, 8]),
         ];
         make_primary_item_meta_with_properties(item_type, iloc, &properties, additional_children)
+    }
+
+    fn make_primary_grid_heic_meta(
+        iloc: Vec<u8>,
+        iinf: Vec<u8>,
+        iref: Option<Vec<u8>>,
+        additional_children: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let iprp = make_iprp_without_associations();
+
+        let mut children = vec![pitm, iloc, iinf, iprp];
+        if let Some(iref) = iref {
+            children.push(iref);
+        }
+        children.extend_from_slice(additional_children);
+        make_meta_box(&children)
+    }
+
+    fn make_iinf_with_entries(entries: &[(u16, [u8; 4], &[u8])]) -> Vec<u8> {
+        assert!(
+            entries.len() <= u16::MAX as usize,
+            "too many entries for test iinf"
+        );
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&(entries.len() as u16).to_be_bytes()); // item_count
+        for (item_id, item_type, item_name) in entries {
+            let mut infe_payload = Vec::new();
+            infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+            infe_payload.extend_from_slice(&item_id.to_be_bytes());
+            infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+            infe_payload.extend_from_slice(item_type);
+            infe_payload.extend_from_slice(item_name);
+            infe_payload.push(0); // C-string terminator
+            iinf_payload.extend_from_slice(&make_basic_box(*b"infe", &infe_payload));
+        }
+
+        make_basic_box(*b"iinf", &iinf_payload)
+    }
+
+    fn make_iloc_v0_single_extent_items(items: &[(u16, u32, u32, u32)]) -> Vec<u8> {
+        assert!(
+            items.len() <= u16::MAX as usize,
+            "too many entries for test iloc"
+        );
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        iloc_payload.extend_from_slice(&(items.len() as u16).to_be_bytes()); // item_count
+        for (item_id, base_offset, extent_offset, extent_length) in items {
+            iloc_payload.extend_from_slice(&item_id.to_be_bytes());
+            iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            iloc_payload.extend_from_slice(&base_offset.to_be_bytes());
+            iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+            iloc_payload.extend_from_slice(&extent_offset.to_be_bytes());
+            iloc_payload.extend_from_slice(&extent_length.to_be_bytes());
+        }
+
+        make_basic_box(*b"iloc", &iloc_payload)
+    }
+
+    fn make_iref_dimg_v0(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
+        assert!(
+            to_item_ids.len() <= u16::MAX as usize,
+            "too many test dimg references"
+        );
+
+        let mut dimg_payload = Vec::new();
+        dimg_payload.extend_from_slice(&from_item_id.to_be_bytes());
+        dimg_payload.extend_from_slice(&(to_item_ids.len() as u16).to_be_bytes());
+        for to_item_id in to_item_ids {
+            dimg_payload.extend_from_slice(&to_item_id.to_be_bytes());
+        }
+
+        let dimg = make_basic_box(*b"dimg", &dimg_payload);
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iref_payload.extend_from_slice(&dimg);
+        make_basic_box(*b"iref", &iref_payload)
+    }
+
+    fn make_iprp_without_associations() -> Vec<u8> {
+        let ipco = make_basic_box(*b"ipco", &[]);
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&0_u32.to_be_bytes()); // entry_count
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        make_basic_box(*b"iprp", &iprp_payload)
     }
 
     fn make_primary_item_meta_with_properties(
