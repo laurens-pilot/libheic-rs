@@ -24,6 +24,17 @@ use std::ptr::{self, NonNull};
 
 pub mod isobmff;
 
+/// Stable high-level decoder error categories for callers and tooling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeErrorCategory {
+    Io,
+    Parse,
+    MalformedInput,
+    UnsupportedFeature,
+    DecoderBackend,
+    OutputEncoding,
+}
+
 /// Errors returned by the decoder entry points.
 #[derive(Debug)]
 pub enum DecodeError {
@@ -32,6 +43,19 @@ pub enum DecodeError {
     HeicDecode(DecodeHeicError),
     PngEncoding(png::EncodingError),
     Unsupported(String),
+}
+
+impl DecodeError {
+    /// Return the stable high-level category for this decode failure.
+    pub fn category(&self) -> DecodeErrorCategory {
+        match self {
+            DecodeError::Io(_) => DecodeErrorCategory::Io,
+            DecodeError::AvifDecode(err) => err.category(),
+            DecodeError::HeicDecode(err) => err.category(),
+            DecodeError::PngEncoding(_) => DecodeErrorCategory::OutputEncoding,
+            DecodeError::Unsupported(_) => DecodeErrorCategory::UnsupportedFeature,
+        }
+    }
 }
 
 impl Display for DecodeError {
@@ -300,6 +324,36 @@ pub enum DecodeAvifError {
     },
 }
 
+impl DecodeAvifError {
+    /// Return the stable high-level category for this AVIF decode failure.
+    pub fn category(&self) -> DecodeErrorCategory {
+        match self {
+            DecodeAvifError::ParsePrimaryProperties(_)
+            | DecodeAvifError::ParsePrimaryTransforms(_)
+            | DecodeAvifError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
+            DecodeAvifError::DecoderAllocationFailed { .. }
+            | DecodeAvifError::DecoderApi { .. }
+            | DecodeAvifError::DecoderNoFrameOutput => DecodeErrorCategory::DecoderBackend,
+            DecodeAvifError::UnsupportedBitDepth { .. }
+            | DecodeAvifError::UnsupportedPixelLayout { .. }
+            | DecodeAvifError::UnsupportedMatrixCoefficients { .. } => {
+                DecodeErrorCategory::UnsupportedFeature
+            }
+            DecodeAvifError::InvalidImageGeometry { .. }
+            | DecodeAvifError::MissingPlane { .. }
+            | DecodeAvifError::PlaneStrideOverflow { .. }
+            | DecodeAvifError::PlaneStrideTooSmall { .. }
+            | DecodeAvifError::PlaneSizeOverflow { .. }
+            | DecodeAvifError::DecodedGeometryMismatch { .. }
+            | DecodeAvifError::PlaneSampleTypeMismatch { .. }
+            | DecodeAvifError::PlaneDimensionsMismatch { .. }
+            | DecodeAvifError::PlaneSampleCountMismatch { .. } => {
+                DecodeErrorCategory::MalformedInput
+            }
+        }
+    }
+}
+
 impl Display for DecodeAvifError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -487,6 +541,36 @@ pub enum DecodeHeicError {
     UnsupportedMatrixCoefficients {
         matrix_coefficients: u16,
     },
+}
+
+impl DecodeHeicError {
+    /// Return the stable high-level category for this HEIC decode failure.
+    pub fn category(&self) -> DecodeErrorCategory {
+        match self {
+            DecodeHeicError::ParsePrimaryProperties(_)
+            | DecodeHeicError::ParsePrimaryTransforms(_)
+            | DecodeHeicError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
+            DecodeHeicError::BackendDecodeFailed { .. } => DecodeErrorCategory::DecoderBackend,
+            DecodeHeicError::UnsupportedMatrixCoefficients { .. } => {
+                DecodeErrorCategory::UnsupportedFeature
+            }
+            DecodeHeicError::InvalidDecodedFrame { .. }
+            | DecodeHeicError::InvalidNalLengthSize { .. }
+            | DecodeHeicError::TruncatedNalLengthField { .. }
+            | DecodeHeicError::TruncatedNalUnit { .. }
+            | DecodeHeicError::NalUnitTooLarge { .. }
+            | DecodeHeicError::TruncatedLengthPrefixedStreamLength { .. }
+            | DecodeHeicError::TruncatedLengthPrefixedStreamNalUnit { .. }
+            | DecodeHeicError::MissingSpsNalUnit
+            | DecodeHeicError::SpsParseFailed { .. }
+            | DecodeHeicError::InvalidSpsGeometry { .. }
+            | DecodeHeicError::UnsupportedSpsChromaArrayType { .. }
+            | DecodeHeicError::MissingVclNalUnit
+            | DecodeHeicError::DecodedGeometryMismatch { .. }
+            | DecodeHeicError::DecodedBitDepthMismatch { .. }
+            | DecodeHeicError::DecodedLayoutMismatch { .. } => DecodeErrorCategory::MalformedInput,
+        }
+    }
 }
 
 impl Display for DecodeHeicError {
@@ -3283,9 +3367,9 @@ mod tests {
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
         validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifPixelLayout, AvifPlane,
-        AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeHeicError, DecodedAvifImage,
-        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
-        YCbCrMatrixCoefficients, YCbCrRange,
+        AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
+        DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane,
+        HevcNalClass, YCbCrMatrixCoefficients, YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -3535,6 +3619,65 @@ mod tests {
             }
             other => panic!("unexpected error kind for invalid clap crop: {other}"),
         }
+    }
+
+    #[test]
+    fn classifies_avif_decode_errors_into_stable_categories() {
+        let backend = DecodeAvifError::DecoderNoFrameOutput;
+        assert_eq!(backend.category(), DecodeErrorCategory::DecoderBackend);
+
+        let unsupported = DecodeAvifError::UnsupportedMatrixCoefficients {
+            matrix_coefficients: 8,
+        };
+        assert_eq!(
+            unsupported.category(),
+            DecodeErrorCategory::UnsupportedFeature
+        );
+
+        let malformed = DecodeAvifError::PlaneSizeOverflow {
+            plane: "Y",
+            width: u32::MAX,
+            height: 2,
+        };
+        assert_eq!(malformed.category(), DecodeErrorCategory::MalformedInput);
+    }
+
+    #[test]
+    fn classifies_heic_decode_errors_into_stable_categories() {
+        let backend = DecodeHeicError::BackendDecodeFailed {
+            detail: "decoder failed".to_string(),
+        };
+        assert_eq!(backend.category(), DecodeErrorCategory::DecoderBackend);
+
+        let unsupported = DecodeHeicError::UnsupportedMatrixCoefficients {
+            matrix_coefficients: 8,
+        };
+        assert_eq!(
+            unsupported.category(),
+            DecodeErrorCategory::UnsupportedFeature
+        );
+
+        let malformed = DecodeHeicError::TruncatedNalUnit {
+            offset: 4,
+            declared: 12,
+            available: 2,
+        };
+        assert_eq!(malformed.category(), DecodeErrorCategory::MalformedInput);
+    }
+
+    #[test]
+    fn classifies_top_level_decode_errors_into_stable_categories() {
+        let io_error = DecodeError::Io(std::io::Error::other("disk read failed"));
+        assert_eq!(io_error.category(), DecodeErrorCategory::Io);
+
+        let nested = DecodeError::HeicDecode(DecodeHeicError::MissingSpsNalUnit);
+        assert_eq!(nested.category(), DecodeErrorCategory::MalformedInput);
+
+        let unsupported = DecodeError::Unsupported("unsupported extension".to_string());
+        assert_eq!(
+            unsupported.category(),
+            DecodeErrorCategory::UnsupportedFeature
+        );
     }
 
     #[test]
