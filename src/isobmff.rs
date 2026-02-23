@@ -12,6 +12,9 @@ const PITM_BOX_TYPE: [u8; 4] = *b"pitm";
 const ILOC_BOX_TYPE: [u8; 4] = *b"iloc";
 const IINF_BOX_TYPE: [u8; 4] = *b"iinf";
 const INFE_BOX_TYPE: [u8; 4] = *b"infe";
+const IPRP_BOX_TYPE: [u8; 4] = *b"iprp";
+const IPCO_BOX_TYPE: [u8; 4] = *b"ipco";
+const IPMA_BOX_TYPE: [u8; 4] = *b"ipma";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
 const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
@@ -177,6 +180,46 @@ impl<'a> ParsedBox<'a> {
 
         parse_iinf_payload(self.payload, self.payload_offset())
     }
+
+    /// Parse this box payload as an `ipco` box.
+    pub fn parse_ipco(
+        &self,
+    ) -> Result<ItemPropertyContainerBox<'a>, ParseItemPropertyContainerBoxError> {
+        if self.header.box_type.as_bytes() != IPCO_BOX_TYPE {
+            return Err(ParseItemPropertyContainerBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_ipco_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `ipma` box.
+    pub fn parse_ipma(
+        &self,
+    ) -> Result<ItemPropertyAssociationBox, ParseItemPropertyAssociationBoxError> {
+        if self.header.box_type.as_bytes() != IPMA_BOX_TYPE {
+            return Err(ParseItemPropertyAssociationBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_ipma_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `iprp` box.
+    pub fn parse_iprp(&self) -> Result<ItemPropertiesBox<'a>, ParseItemPropertiesBoxError> {
+        if self.header.box_type.as_bytes() != IPRP_BOX_TYPE {
+            return Err(ParseItemPropertiesBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_iprp_payload(self.payload, self.payload_offset())
+    }
 }
 
 /// Parsed `ftyp` box payload fields.
@@ -250,6 +293,41 @@ pub struct ItemInfoBox {
     pub full_box: FullBoxHeader,
     pub item_count: u32,
     pub entries: Vec<ItemInfoEntryBox>,
+}
+
+/// Parsed `ipma` property association entry fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItemPropertyAssociation {
+    pub essential: bool,
+    pub property_index: u16,
+}
+
+/// Parsed `ipma` item association entry fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemPropertyAssociationEntry {
+    pub item_id: u32,
+    pub associations: Vec<ItemPropertyAssociation>,
+}
+
+/// Parsed `ipma` (item property association) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemPropertyAssociationBox {
+    pub full_box: FullBoxHeader,
+    pub entry_count: u32,
+    pub entries: Vec<ItemPropertyAssociationEntry>,
+}
+
+/// Parsed `ipco` (item property container) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemPropertyContainerBox<'a> {
+    pub properties: Vec<ParsedBox<'a>>,
+}
+
+/// Parsed `iprp` (item properties) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemPropertiesBox<'a> {
+    pub property_containers: Vec<ItemPropertyContainerBox<'a>>,
+    pub associations: Vec<ItemPropertyAssociationBox>,
 }
 
 /// Parsed `meta` payload fields.
@@ -666,6 +744,163 @@ impl From<ParseBoxError> for ParseItemInfoBoxError {
 impl From<ParseItemInfoEntryBoxError> for ParseItemInfoBoxError {
     fn from(value: ParseItemInfoEntryBoxError) -> Self {
         Self::Entry(value)
+    }
+}
+
+/// Errors returned when parsing an `ipco` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemPropertyContainerBoxError {
+    UnexpectedBoxType { offset: u64, actual: FourCc },
+    ChildBox(ParseBoxError),
+}
+
+impl Display for ParseItemPropertyContainerBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemPropertyContainerBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected ipco box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemPropertyContainerBoxError::ChildBox(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for ParseItemPropertyContainerBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemPropertyContainerBoxError::ChildBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseBoxError> for ParseItemPropertyContainerBoxError {
+    fn from(value: ParseBoxError) -> Self {
+        Self::ChildBox(value)
+    }
+}
+
+/// Errors returned when parsing an `ipma` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemPropertyAssociationBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    EntryCountTooLarge {
+        offset: u64,
+        entry_count: u32,
+    },
+}
+
+impl Display for ParseItemPropertyAssociationBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemPropertyAssociationBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected ipma box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemPropertyAssociationBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseItemPropertyAssociationBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "ipma box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParseItemPropertyAssociationBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "ipma payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
+                offset,
+                entry_count,
+            } => write!(
+                f,
+                "ipma entry_count {entry_count} cannot be represented at offset {offset}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseItemPropertyAssociationBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemPropertyAssociationBoxError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseItemPropertyAssociationBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing an `iprp` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemPropertiesBoxError {
+    UnexpectedBoxType { offset: u64, actual: FourCc },
+    ChildBox(ParseBoxError),
+    PropertyContainer(ParseItemPropertyContainerBoxError),
+    PropertyAssociation(ParseItemPropertyAssociationBoxError),
+}
+
+impl Display for ParseItemPropertiesBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemPropertiesBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected iprp box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemPropertiesBoxError::ChildBox(err) => write!(f, "{err}"),
+            ParseItemPropertiesBoxError::PropertyContainer(err) => write!(f, "{err}"),
+            ParseItemPropertiesBoxError::PropertyAssociation(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for ParseItemPropertiesBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemPropertiesBoxError::ChildBox(err) => Some(err),
+            ParseItemPropertiesBoxError::PropertyContainer(err) => Some(err),
+            ParseItemPropertiesBoxError::PropertyAssociation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseBoxError> for ParseItemPropertiesBoxError {
+    fn from(value: ParseBoxError) -> Self {
+        Self::ChildBox(value)
+    }
+}
+
+impl From<ParseItemPropertyContainerBoxError> for ParseItemPropertiesBoxError {
+    fn from(value: ParseItemPropertyContainerBoxError) -> Self {
+        Self::PropertyContainer(value)
+    }
+}
+
+impl From<ParseItemPropertyAssociationBoxError> for ParseItemPropertiesBoxError {
+    fn from(value: ParseItemPropertyAssociationBoxError) -> Self {
+        Self::PropertyAssociation(value)
     }
 }
 
@@ -1182,6 +1417,136 @@ fn parse_iinf_payload(
     })
 }
 
+fn parse_ipco_payload<'a>(
+    payload: &'a [u8],
+    payload_offset: u64,
+) -> Result<ItemPropertyContainerBox<'a>, ParseItemPropertyContainerBoxError> {
+    // Provenance: mirrors libheif `ipco` handling in
+    // libheif/libheif/box.cc:Box_ipco::parse, which parses all child property
+    // boxes under ipco.
+    let properties =
+        BoxIter::with_offset(payload, payload_offset).collect::<Result<Vec<_>, ParseBoxError>>()?;
+
+    Ok(ItemPropertyContainerBox { properties })
+}
+
+fn parse_ipma_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ItemPropertyAssociationBox, ParseItemPropertyAssociationBoxError> {
+    // Provenance: mirrors libheif `ipma` entry parsing in
+    // libheif/libheif/box.cc:Box_ipma::parse, including version checks (0/1),
+    // item_ID width selection (v0=16-bit, v1=32-bit), and association entry
+    // decoding controlled by flags bit 0 (8-bit or 16-bit indices).
+    let (full_box, ipma_payload, ipma_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version > 1 {
+        return Err(ParseItemPropertyAssociationBoxError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    let mut cursor = 0_usize;
+    let entry_count = read_u32_cursor_ipma(
+        ipma_payload,
+        &mut cursor,
+        ipma_payload_offset,
+        "entry_count",
+    )?;
+    let entry_capacity = usize::try_from(entry_count).map_err(|_| {
+        ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
+            offset: ipma_payload_offset,
+            entry_count,
+        }
+    })?;
+
+    let mut entries = Vec::with_capacity(entry_capacity);
+    for _ in 0..entry_count {
+        let item_id = if full_box.version == 0 {
+            u32::from(read_u16_cursor_ipma(
+                ipma_payload,
+                &mut cursor,
+                ipma_payload_offset,
+                "item_ID",
+            )?)
+        } else {
+            read_u32_cursor_ipma(ipma_payload, &mut cursor, ipma_payload_offset, "item_ID")?
+        };
+        let association_count = read_u8_cursor_ipma(
+            ipma_payload,
+            &mut cursor,
+            ipma_payload_offset,
+            "association_count",
+        )?;
+        let mut associations = Vec::with_capacity(usize::from(association_count));
+        for _ in 0..association_count {
+            let association = if (full_box.flags & 0x1) != 0 {
+                let value = read_u16_cursor_ipma(
+                    ipma_payload,
+                    &mut cursor,
+                    ipma_payload_offset,
+                    "association",
+                )?;
+                ItemPropertyAssociation {
+                    essential: (value & 0x8000) != 0,
+                    property_index: value & 0x7FFF,
+                }
+            } else {
+                let value = read_u8_cursor_ipma(
+                    ipma_payload,
+                    &mut cursor,
+                    ipma_payload_offset,
+                    "association",
+                )?;
+                ItemPropertyAssociation {
+                    essential: (value & 0x80) != 0,
+                    property_index: u16::from(value & 0x7F),
+                }
+            };
+            associations.push(association);
+        }
+
+        entries.push(ItemPropertyAssociationEntry {
+            item_id,
+            associations,
+        });
+    }
+
+    Ok(ItemPropertyAssociationBox {
+        full_box,
+        entry_count,
+        entries,
+    })
+}
+
+fn parse_iprp_payload<'a>(
+    payload: &'a [u8],
+    payload_offset: u64,
+) -> Result<ItemPropertiesBox<'a>, ParseItemPropertiesBoxError> {
+    // Provenance: mirrors libheif `iprp` handling in
+    // libheif/libheif/box.cc:Box_iprp::parse, where all child boxes are read
+    // and `ipco`/`ipma` children are interpreted by downstream consumers.
+    let children =
+        BoxIter::with_offset(payload, payload_offset).collect::<Result<Vec<_>, ParseBoxError>>()?;
+
+    let mut property_containers = Vec::new();
+    let mut associations = Vec::new();
+    for child in children {
+        let child_type = child.header.box_type.as_bytes();
+        if child_type == IPCO_BOX_TYPE {
+            property_containers.push(parse_ipco_payload(child.payload, child.payload_offset())?);
+        } else if child_type == IPMA_BOX_TYPE {
+            associations.push(parse_ipma_payload(child.payload, child.payload_offset())?);
+        }
+    }
+
+    Ok(ItemPropertiesBox {
+        property_containers,
+        associations,
+    })
+}
+
 fn validate_iloc_size_field(
     offset: u64,
     field: ItemLocationField,
@@ -1229,6 +1594,59 @@ fn iloc_field_context(field: ItemLocationField) -> &'static str {
         ItemLocationField::BaseOffset => "base_offset",
         ItemLocationField::Index => "extent_index",
     }
+}
+
+fn read_u8_cursor_ipma(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u8, ParseItemPropertyAssociationBoxError> {
+    let bytes = take_cursor_bytes_ipma(payload, cursor, size_of::<u8>(), payload_offset, context)?;
+    Ok(bytes[0])
+}
+
+fn read_u16_cursor_ipma(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseItemPropertyAssociationBoxError> {
+    let bytes = take_cursor_bytes_ipma(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_ipma(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseItemPropertyAssociationBoxError> {
+    let bytes = take_cursor_bytes_ipma(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn take_cursor_bytes_ipma<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseItemPropertyAssociationBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseItemPropertyAssociationBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
 }
 
 fn read_u16_cursor_infe(
@@ -1515,8 +1933,10 @@ mod tests {
     use super::{
         parse_boxes, BoxIter, FourCc, ItemLocationField, ParseBoxError, ParseFileTypeBoxError,
         ParseFullBoxError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
-        ParseItemLocationBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE,
-        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
+        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
+        ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
+        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -2449,6 +2869,263 @@ mod tests {
                 available: 2,
                 required: 4,
             }
+        );
+    }
+
+    #[test]
+    fn parses_ipco_child_property_boxes() {
+        let prop_a = make_basic_box(*b"ispe", &[0x01, 0x02, 0x03, 0x04]);
+        let prop_b = make_basic_box(*b"pixi", &[0x08, 0x08, 0x08]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&prop_a);
+        payload.extend_from_slice(&prop_b);
+        let bytes = make_basic_box(*b"ipco", &payload);
+        let top_level = parse_boxes(&bytes).expect("ipco box should parse");
+
+        let ipco = top_level[0]
+            .parse_ipco()
+            .expect("ipco payload should parse");
+        assert_eq!(ipco.properties.len(), 2);
+        assert_eq!(ipco.properties[0].header.box_type.as_bytes(), *b"ispe");
+        assert_eq!(ipco.properties[1].header.box_type.as_bytes(), *b"pixi");
+        assert_eq!(ipco.properties[0].offset, BASIC_HEADER_SIZE as u64);
+        assert_eq!(
+            ipco.properties[1].offset,
+            BASIC_HEADER_SIZE as u64 + prop_a.len() as u64
+        );
+    }
+
+    #[test]
+    fn rejects_ipco_parse_for_non_ipco_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_ipco()
+            .expect_err("parsing non-ipco as ipco must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertyContainerBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ipma_version_zero_with_compact_associations() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        payload.extend_from_slice(&0x1234_u16.to_be_bytes()); // item_ID
+        payload.push(2); // association_count
+        payload.push(0x81); // essential=true, property_index=1
+        payload.push(0x05); // essential=false, property_index=5
+        let bytes = make_basic_box(*b"ipma", &payload);
+        let top_level = parse_boxes(&bytes).expect("ipma box should parse");
+
+        let ipma = top_level[0]
+            .parse_ipma()
+            .expect("ipma v0 payload should parse");
+        assert_eq!(ipma.full_box.version, 0);
+        assert_eq!(ipma.full_box.flags, 0);
+        assert_eq!(ipma.entry_count, 1);
+        assert_eq!(ipma.entries.len(), 1);
+        assert_eq!(ipma.entries[0].item_id, 0x1234);
+        assert_eq!(ipma.entries[0].associations.len(), 2);
+        assert_eq!(ipma.entries[0].associations[0].property_index, 1);
+        assert!(ipma.entries[0].associations[0].essential);
+        assert_eq!(ipma.entries[0].associations[1].property_index, 5);
+        assert!(!ipma.entries[0].associations[1].essential);
+    }
+
+    #[test]
+    fn parses_ipma_version_one_with_extended_associations() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x01]); // version=1, flags=1
+        payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        payload.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // item_ID
+        payload.push(2); // association_count
+        payload.extend_from_slice(&0x8002_u16.to_be_bytes()); // essential=true, property_index=2
+        payload.extend_from_slice(&0x00ff_u16.to_be_bytes()); // essential=false, property_index=255
+        let bytes = make_basic_box(*b"ipma", &payload);
+        let top_level = parse_boxes(&bytes).expect("ipma box should parse");
+
+        let ipma = top_level[0]
+            .parse_ipma()
+            .expect("ipma v1 payload should parse");
+        assert_eq!(ipma.full_box.version, 1);
+        assert_eq!(ipma.full_box.flags, 1);
+        assert_eq!(ipma.entry_count, 1);
+        assert_eq!(ipma.entries.len(), 1);
+        assert_eq!(ipma.entries[0].item_id, 0x1122_3344);
+        assert_eq!(ipma.entries[0].associations.len(), 2);
+        assert_eq!(ipma.entries[0].associations[0].property_index, 2);
+        assert!(ipma.entries[0].associations[0].essential);
+        assert_eq!(ipma.entries[0].associations[1].property_index, 255);
+        assert!(!ipma.entries[0].associations[1].essential);
+    }
+
+    #[test]
+    fn rejects_ipma_parse_for_non_ipma_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_ipma()
+            .expect_err("parsing non-ipma as ipma must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertyAssociationBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ipma_parse_for_unsupported_version() {
+        let bytes = make_basic_box(*b"ipma", &[0x02, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("ipma box should parse");
+
+        let err = top_level[0]
+            .parse_ipma()
+            .expect_err("unsupported ipma version must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertyAssociationBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ipma_parse_when_entry_count_field_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&[0xaa, 0xbb]); // truncated entry_count
+        let bytes = make_basic_box(*b"ipma", &payload);
+        let top_level = parse_boxes(&bytes).expect("ipma box should parse");
+
+        let err = top_level[0]
+            .parse_ipma()
+            .expect_err("truncated ipma entry_count must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertyAssociationBoxError::PayloadTooSmall {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                context: "entry_count",
+                available: 2,
+                required: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ipma_parse_when_association_field_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x01]); // version=1, flags=1
+        payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        payload.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // item_ID
+        payload.push(1); // association_count
+        payload.push(0x80); // truncated 16-bit association
+        let bytes = make_basic_box(*b"ipma", &payload);
+        let top_level = parse_boxes(&bytes).expect("ipma box should parse");
+
+        let err = top_level[0]
+            .parse_ipma()
+            .expect_err("truncated ipma association must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertyAssociationBoxError::PayloadTooSmall {
+                offset: 21,
+                context: "association",
+                available: 1,
+                required: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_iprp_with_ipco_and_ipma_children() {
+        let property = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
+        let ipco = make_basic_box(*b"ipco", &property);
+
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        ipma_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // item_ID
+        ipma_payload.push(1); // association_count
+        ipma_payload.push(0x01); // property_index=1
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+
+        let unknown = make_basic_box(*b"free", &[0x01, 0x02, 0x03, 0x04]);
+
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&unknown);
+        iprp_payload.extend_from_slice(&ipma);
+        let bytes = make_basic_box(*b"iprp", &iprp_payload);
+        let top_level = parse_boxes(&bytes).expect("iprp box should parse");
+
+        let iprp = top_level[0]
+            .parse_iprp()
+            .expect("iprp payload should parse");
+        assert_eq!(iprp.property_containers.len(), 1);
+        assert_eq!(iprp.associations.len(), 1);
+        assert_eq!(iprp.property_containers[0].properties.len(), 1);
+        assert_eq!(
+            iprp.property_containers[0].properties[0]
+                .header
+                .box_type
+                .as_bytes(),
+            *b"ispe"
+        );
+        assert_eq!(iprp.associations[0].entries.len(), 1);
+        assert_eq!(iprp.associations[0].entries[0].item_id, 1);
+        assert_eq!(
+            iprp.associations[0].entries[0].associations[0].property_index,
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_iprp_parse_for_non_iprp_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_iprp()
+            .expect_err("parsing non-iprp as iprp must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertiesBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iprp_parse_when_child_box_is_out_of_bounds() {
+        let mut invalid_child = Vec::new();
+        invalid_child.extend_from_slice(&16_u32.to_be_bytes());
+        invalid_child.extend_from_slice(b"ipco");
+        invalid_child.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let bytes = make_basic_box(*b"iprp", &invalid_child);
+        let top_level = parse_boxes(&bytes).expect("iprp box should parse");
+
+        let err = top_level[0]
+            .parse_iprp()
+            .expect_err("invalid iprp child bounds must fail");
+        assert_eq!(
+            err,
+            ParseItemPropertiesBoxError::ChildBox(ParseBoxError::BoxOutOfBounds {
+                offset: BASIC_HEADER_SIZE as u64,
+                box_size: 16,
+                available: 12,
+            })
         );
     }
 
