@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+pub mod isobmff;
+
 /// Errors returned by the decoder entry points.
 #[derive(Debug)]
 pub enum DecodeError {
