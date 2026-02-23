@@ -3839,6 +3839,7 @@ mod tests {
 
         let err = apply_primary_item_transforms_rgba(2, 2, pixels, &transforms)
             .expect_err("empty clap crop should fail deterministically");
+        assert_eq!(err.category(), DecodeErrorCategory::MalformedInput);
         match err {
             DecodeError::TransformGuard(TransformGuardError::InvalidCleanApertureBounds {
                 width,
@@ -3922,6 +3923,20 @@ mod tests {
             unsupported.category(),
             DecodeErrorCategory::UnsupportedFeature
         );
+    }
+
+    #[test]
+    fn rejects_rgba_transform_input_when_sample_count_overflows() {
+        let err = apply_primary_item_transforms_rgba::<u8>(u32::MAX, u32::MAX, Vec::new(), &[])
+            .expect_err("RGBA sample-count overflow should fail deterministically");
+        assert_eq!(err.category(), DecodeErrorCategory::MalformedInput);
+        assert!(matches!(
+            err,
+            DecodeError::TransformGuard(TransformGuardError::SampleCountOverflow {
+                width,
+                height,
+            }) if width == u32::MAX && height == u32::MAX
+        ));
     }
 
     #[test]
@@ -4176,6 +4191,7 @@ mod tests {
         let stream = vec![0x00, 0x00, 0x00];
         let err = parse_length_prefixed_hevc_nal_units(&stream)
             .expect_err("stream with short length prefix must fail");
+        assert_eq!(err.category(), DecodeErrorCategory::MalformedInput);
         assert!(matches!(
             err,
             DecodeHeicError::TruncatedLengthPrefixedStreamLength {
