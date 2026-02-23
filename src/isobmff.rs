@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::mem::size_of;
 
 const BASIC_HEADER_SIZE: usize = 8;
 const LARGE_SIZE_FIELD_SIZE: usize = 8;
@@ -7,6 +8,7 @@ const UUID_EXTENDED_TYPE_SIZE: usize = 16;
 const UUID_BOX_TYPE: [u8; 4] = *b"uuid";
 const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
 const META_BOX_TYPE: [u8; 4] = *b"meta";
+const PITM_BOX_TYPE: [u8; 4] = *b"pitm";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -122,6 +124,18 @@ impl<'a> ParsedBox<'a> {
             payload_offset: meta_payload_offset,
         })
     }
+
+    /// Parse this box payload as a `pitm` box.
+    pub fn parse_pitm(&self) -> Result<PrimaryItemBox, ParsePrimaryItemBoxError> {
+        if self.header.box_type.as_bytes() != PITM_BOX_TYPE {
+            return Err(ParsePrimaryItemBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_pitm_payload(self.payload, self.payload_offset())
+    }
 }
 
 /// Parsed `ftyp` box payload fields.
@@ -137,6 +151,13 @@ pub struct FileTypeBox {
 pub struct FullBoxHeader {
     pub version: u8,
     pub flags: u32,
+}
+
+/// Parsed `pitm` (primary item) payload fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrimaryItemBox {
+    pub full_box: FullBoxHeader,
+    pub item_id: u32,
 }
 
 /// Parsed `meta` payload fields.
@@ -239,6 +260,66 @@ impl Error for ParseMetaBoxError {
 }
 
 impl From<ParseFullBoxError> for ParseMetaBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing a `pitm` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePrimaryItemBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    PayloadTooSmallForItemId {
+        offset: u64,
+        version: u8,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParsePrimaryItemBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePrimaryItemBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected pitm box at offset {offset}, got box type {actual}"
+            ),
+            ParsePrimaryItemBoxError::FullBox(err) => write!(f, "{err}"),
+            ParsePrimaryItemBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "pitm box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParsePrimaryItemBoxError::PayloadTooSmallForItemId {
+                offset,
+                version,
+                available,
+                required,
+            } => write!(
+                f,
+                "pitm version {version} item_ID field too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParsePrimaryItemBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePrimaryItemBoxError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParsePrimaryItemBoxError {
     fn from(value: ParseFullBoxError) -> Self {
         Self::FullBox(value)
     }
@@ -419,6 +500,51 @@ fn parse_full_box_payload(
     ))
 }
 
+fn parse_pitm_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<PrimaryItemBox, ParsePrimaryItemBoxError> {
+    // Provenance: mirrors libheif pitm parsing in
+    // libheif/libheif/box.cc:Box_pitm::parse, where version 0 uses a 16-bit
+    // item_ID, version 1 uses a 32-bit item_ID, and versions >1 are rejected.
+    let (full_box, pitm_payload, pitm_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    let item_id = match full_box.version {
+        0 => {
+            let required = size_of::<u16>();
+            if pitm_payload.len() < required {
+                return Err(ParsePrimaryItemBoxError::PayloadTooSmallForItemId {
+                    offset: pitm_payload_offset,
+                    version: full_box.version,
+                    available: pitm_payload.len(),
+                    required,
+                });
+            }
+            u32::from(read_u16_be(&pitm_payload[..required]))
+        }
+        1 => {
+            let required = size_of::<u32>();
+            if pitm_payload.len() < required {
+                return Err(ParsePrimaryItemBoxError::PayloadTooSmallForItemId {
+                    offset: pitm_payload_offset,
+                    version: full_box.version,
+                    available: pitm_payload.len(),
+                    required,
+                });
+            }
+            read_u32_be(&pitm_payload[..required])
+        }
+        version => {
+            return Err(ParsePrimaryItemBoxError::UnsupportedVersion {
+                offset: payload_offset,
+                version,
+            });
+        }
+    };
+
+    Ok(PrimaryItemBox { full_box, item_id })
+}
+
 fn parse_next_box(input: &[u8], offset: u64) -> Result<(ParsedBox<'_>, usize), ParseBoxError> {
     let available = input.len() as u64;
     let (header, header_len) = parse_header(input, offset, available)?;
@@ -518,6 +644,10 @@ fn read_u32_be(input: &[u8]) -> u32 {
     u32::from_be_bytes([input[0], input[1], input[2], input[3]])
 }
 
+fn read_u16_be(input: &[u8]) -> u16 {
+    u16::from_be_bytes([input[0], input[1]])
+}
+
 fn read_fourcc(input: &[u8]) -> FourCc {
     FourCc::new([input[0], input[1], input[2], input[3]])
 }
@@ -532,8 +662,8 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         parse_boxes, BoxIter, FourCc, ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
-        ParseMetaBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE,
-        UUID_EXTENDED_TYPE_SIZE,
+        ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
+        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -901,6 +1031,114 @@ mod tests {
         assert_eq!(
             err,
             ParseMetaBoxError::FullBox(ParseFullBoxError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 3
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pitm_version_zero_item_id() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&0x1234_u16.to_be_bytes());
+        let bytes = make_basic_box(*b"pitm", &payload);
+        let top_level = parse_boxes(&bytes).expect("pitm box should parse");
+
+        let pitm = top_level[0]
+            .parse_pitm()
+            .expect("pitm v0 payload should parse");
+        assert_eq!(pitm.full_box.version, 0);
+        assert_eq!(pitm.full_box.flags, 0);
+        assert_eq!(pitm.item_id, 0x1234);
+    }
+
+    #[test]
+    fn parses_pitm_version_one_item_id() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x01]); // version=1, flags=1
+        payload.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        let bytes = make_basic_box(*b"pitm", &payload);
+        let top_level = parse_boxes(&bytes).expect("pitm box should parse");
+
+        let pitm = top_level[0]
+            .parse_pitm()
+            .expect("pitm v1 payload should parse");
+        assert_eq!(pitm.full_box.version, 1);
+        assert_eq!(pitm.full_box.flags, 1);
+        assert_eq!(pitm.item_id, 0x1234_5678);
+    }
+
+    #[test]
+    fn rejects_pitm_parse_for_non_pitm_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_pitm()
+            .expect_err("parsing non-pitm as pitm must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryItemBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free")
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_pitm_parse_for_unsupported_full_box_version() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        payload.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        let bytes = make_basic_box(*b"pitm", &payload);
+        let top_level = parse_boxes(&bytes).expect("pitm box should parse");
+
+        let err = top_level[0]
+            .parse_pitm()
+            .expect_err("unsupported pitm version must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryItemBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 2
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_pitm_parse_when_item_id_field_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        payload.extend_from_slice(&[0xaa, 0xbb, 0xcc]); // one byte short
+        let bytes = make_basic_box(*b"pitm", &payload);
+        let top_level = parse_boxes(&bytes).expect("pitm box should parse");
+
+        let err = top_level[0]
+            .parse_pitm()
+            .expect_err("truncated pitm item_ID must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryItemBoxError::PayloadTooSmallForItemId {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                version: 1,
+                available: 3,
+                required: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_pitm_parse_when_full_box_header_is_truncated() {
+        let bytes = make_basic_box(*b"pitm", &[0x01, 0x02, 0x03]);
+        let top_level = parse_boxes(&bytes).expect("pitm box should parse");
+
+        let err = top_level[0]
+            .parse_pitm()
+            .expect_err("pitm with short full box header must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryItemBoxError::FullBox(ParseFullBoxError::PayloadTooSmall {
                 offset: BASIC_HEADER_SIZE as u64,
                 available: 3
             })
