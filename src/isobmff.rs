@@ -6,8 +6,10 @@ const LARGE_SIZE_FIELD_SIZE: usize = 8;
 const UUID_EXTENDED_TYPE_SIZE: usize = 16;
 const UUID_BOX_TYPE: [u8; 4] = *b"uuid";
 const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
+const META_BOX_TYPE: [u8; 4] = *b"meta";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
+const FULL_BOX_HEADER_SIZE: usize = 4;
 
 /// Four-character box type code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -87,6 +89,39 @@ impl<'a> ParsedBox<'a> {
 
         parse_ftyp_payload(self.payload, self.payload_offset())
     }
+
+    /// Parse this box payload as a FullBox header.
+    pub fn parse_full_box_header(&self) -> Result<FullBoxHeader, ParseFullBoxError> {
+        parse_full_box_payload(self.payload, self.payload_offset()).map(|(full_box, _, _)| full_box)
+    }
+
+    /// Parse this box payload as a `meta` box.
+    pub fn parse_meta(&self) -> Result<MetaBox<'a>, ParseMetaBoxError> {
+        if self.header.box_type.as_bytes() != META_BOX_TYPE {
+            return Err(ParseMetaBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        // Provenance: mirrors libheif's FullBox + meta parse sequence in
+        // libheif/libheif/box.cc:FullBox::parse_full_box_header and
+        // libheif/libheif/box.cc:Box_meta::parse.
+        let (full_box, meta_payload, meta_payload_offset) =
+            parse_full_box_payload(self.payload, self.payload_offset())?;
+        if full_box.version != 0 {
+            return Err(ParseMetaBoxError::UnsupportedVersion {
+                offset: self.payload_offset(),
+                version: full_box.version,
+            });
+        }
+
+        Ok(MetaBox {
+            full_box,
+            payload: meta_payload,
+            payload_offset: meta_payload_offset,
+        })
+    }
 }
 
 /// Parsed `ftyp` box payload fields.
@@ -95,6 +130,31 @@ pub struct FileTypeBox {
     pub major_brand: FourCc,
     pub minor_version: u32,
     pub compatible_brands: Vec<FourCc>,
+}
+
+/// Parsed FullBox header fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FullBoxHeader {
+    pub version: u8,
+    pub flags: u32,
+}
+
+/// Parsed `meta` payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaBox<'a> {
+    pub full_box: FullBoxHeader,
+    pub payload: &'a [u8],
+    pub payload_offset: u64,
+}
+
+impl<'a> MetaBox<'a> {
+    pub fn children(&self) -> BoxIter<'a> {
+        BoxIter::with_offset(self.payload, self.payload_offset)
+    }
+
+    pub fn parse_children(&self) -> Result<Vec<ParsedBox<'a>>, ParseBoxError> {
+        self.children().collect()
+    }
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -125,6 +185,64 @@ impl Display for ParseFileTypeBoxError {
 }
 
 impl Error for ParseFileTypeBoxError {}
+
+/// Errors returned when parsing a FullBox header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseFullBoxError {
+    PayloadTooSmall { offset: u64, available: usize },
+}
+
+impl Display for ParseFullBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseFullBoxError::PayloadTooSmall { offset, available } => write!(
+                f,
+                "full box payload too small at offset {offset} (available: {available} bytes)"
+            ),
+        }
+    }
+}
+
+impl Error for ParseFullBoxError {}
+
+/// Errors returned when parsing a `meta` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseMetaBoxError {
+    UnexpectedBoxType { offset: u64, actual: FourCc },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion { offset: u64, version: u8 },
+}
+
+impl Display for ParseMetaBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseMetaBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected meta box at offset {offset}, got box type {actual}"
+            ),
+            ParseMetaBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseMetaBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "meta box at offset {offset} has unsupported full box version {version}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseMetaBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseMetaBoxError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseMetaBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
 
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +395,30 @@ fn parse_ftyp_payload(
     })
 }
 
+fn parse_full_box_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<(FullBoxHeader, &[u8], u64), ParseFullBoxError> {
+    if payload.len() < FULL_BOX_HEADER_SIZE {
+        return Err(ParseFullBoxError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+        });
+    }
+
+    let data = read_u32_be(&payload[0..FULL_BOX_HEADER_SIZE]);
+    let full_box = FullBoxHeader {
+        version: (data >> 24) as u8,
+        flags: data & 0x00FF_FFFF,
+    };
+
+    Ok((
+        full_box,
+        &payload[FULL_BOX_HEADER_SIZE..],
+        payload_offset + FULL_BOX_HEADER_SIZE as u64,
+    ))
+}
+
 fn parse_next_box(input: &[u8], offset: u64) -> Result<(ParsedBox<'_>, usize), ParseBoxError> {
     let available = input.len() as u64;
     let (header, header_len) = parse_header(input, offset, available)?;
@@ -389,8 +531,9 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boxes, BoxIter, FourCc, ParseBoxError, ParseFileTypeBoxError, BASIC_HEADER_SIZE,
-        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        parse_boxes, BoxIter, FourCc, ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseMetaBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE,
+        UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -649,6 +792,118 @@ mod tests {
                 offset: 0,
                 actual: FourCc::new(*b"free")
             }
+        );
+    }
+
+    #[test]
+    fn parses_full_box_header_fields() {
+        let payload = [0x01, 0x02, 0x03, 0x04, 0xaa];
+        let bytes = make_basic_box(*b"meta", &payload);
+        let top_level = parse_boxes(&bytes).expect("meta box should parse");
+
+        let full_box = top_level[0]
+            .parse_full_box_header()
+            .expect("full box header should parse");
+        assert_eq!(full_box.version, 1);
+        assert_eq!(full_box.flags, 0x0002_0304);
+    }
+
+    #[test]
+    fn rejects_full_box_header_when_payload_too_small() {
+        let bytes = make_basic_box(*b"meta", &[0x01, 0x02, 0x03]);
+        let top_level = parse_boxes(&bytes).expect("meta box should parse");
+
+        let err = top_level[0]
+            .parse_full_box_header()
+            .expect_err("short full box payload must fail");
+        assert_eq!(
+            err,
+            ParseFullBoxError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parses_meta_full_box_and_children() {
+        let child = make_basic_box(*b"hdlr", &[0x00, 0x00, 0x00, 0x00]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&child);
+        let bytes = make_basic_box(*b"meta", &payload);
+
+        let top_level = parse_boxes(&bytes).expect("meta box should parse");
+        let meta = top_level[0]
+            .parse_meta()
+            .expect("meta payload should parse");
+        assert_eq!(meta.full_box.version, 0);
+        assert_eq!(meta.full_box.flags, 0);
+        assert_eq!(
+            meta.payload_offset,
+            (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64
+        );
+
+        let children = meta.parse_children().expect("meta children should parse");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].header.box_type.as_bytes(), *b"hdlr");
+        assert_eq!(
+            children[0].offset,
+            (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64
+        );
+    }
+
+    #[test]
+    fn rejects_meta_parse_for_non_meta_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_meta()
+            .expect_err("parsing non-meta as meta must fail");
+        assert_eq!(
+            err,
+            ParseMetaBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free")
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_meta_parse_for_unsupported_full_box_version() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        payload.extend_from_slice(&make_basic_box(*b"hdlr", &[0x00, 0x00, 0x00, 0x00]));
+        let bytes = make_basic_box(*b"meta", &payload);
+        let top_level = parse_boxes(&bytes).expect("meta box should parse");
+
+        let err = top_level[0]
+            .parse_meta()
+            .expect_err("unsupported meta version must fail");
+        assert_eq!(
+            err,
+            ParseMetaBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_meta_parse_when_full_box_header_is_truncated() {
+        let bytes = make_basic_box(*b"meta", &[0x01, 0x02, 0x03]);
+        let top_level = parse_boxes(&bytes).expect("meta box should parse");
+
+        let err = top_level[0]
+            .parse_meta()
+            .expect_err("meta with short full box header must fail");
+        assert_eq!(
+            err,
+            ParseMetaBoxError::FullBox(ParseFullBoxError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 3
+            })
         );
     }
 
