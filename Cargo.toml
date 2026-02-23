@@ -1,0 +1,17 @@
+[package]
+name = "libheic-rs"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+description = "Pure Rust HEIF/HEIC/AVIF decoder (work in progress)"
+readme = "README.md"
+
+[dependencies]
+
+[lib]
+name = "libheic_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "heif-decode"
+path = "src/bin/heif-decode.rs"
