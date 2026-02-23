@@ -42,7 +42,176 @@ pub enum DecodeError {
     AvifDecode(DecodeAvifError),
     HeicDecode(DecodeHeicError),
     PngEncoding(png::EncodingError),
+    TransformGuard(TransformGuardError),
+    OutputBufferOverflow {
+        buffer_name: &'static str,
+        element_count: usize,
+        element_size_bytes: usize,
+    },
     Unsupported(String),
+}
+
+/// Structured transform/input validation failures in the RGBA output path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransformGuardError {
+    RgbaSampleCountMismatch {
+        stage: &'static str,
+        actual: usize,
+        expected: usize,
+        width: u32,
+        height: u32,
+    },
+    PixelCountOverflow {
+        width: u32,
+        height: u32,
+    },
+    SampleCountOverflow {
+        width: u32,
+        height: u32,
+    },
+    SampleCountExceedsAddressSpace {
+        width: u32,
+        height: u32,
+    },
+    UnsupportedRotation {
+        rotation_ccw_degrees: u16,
+    },
+    DimensionTooLargeForPlatform {
+        stage: &'static str,
+        dimension: &'static str,
+        value: u64,
+    },
+    PixelIndexOverflow {
+        stage: &'static str,
+        x: usize,
+        y: usize,
+        width: u32,
+        height: u32,
+    },
+    EmptyImageGeometry {
+        width: u32,
+        height: u32,
+    },
+    InvalidCleanApertureBounds {
+        width: u32,
+        height: u32,
+        left: i128,
+        right: i128,
+        top: i128,
+        bottom: i128,
+    },
+    CleanApertureCropDimensionOutOfRange {
+        dimension: &'static str,
+        value: i128,
+    },
+    CleanApertureBoundOutOfRange {
+        bound: &'static str,
+        value: i128,
+    },
+    CleanApertureRowOffsetOverflow {
+        stage: &'static str,
+        y: usize,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl TransformGuardError {
+    fn category(&self) -> DecodeErrorCategory {
+        match self {
+            TransformGuardError::UnsupportedRotation { .. } => {
+                DecodeErrorCategory::UnsupportedFeature
+            }
+            _ => DecodeErrorCategory::MalformedInput,
+        }
+    }
+}
+
+impl Display for TransformGuardError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage,
+                actual,
+                expected,
+                width,
+                height,
+            } => write!(
+                f,
+                "RGBA sample count mismatch for {stage}: got {actual}, expected {expected} for {width}x{height}"
+            ),
+            TransformGuardError::PixelCountOverflow { width, height } => write!(
+                f,
+                "RGBA pixel count overflow for dimensions {width}x{height}"
+            ),
+            TransformGuardError::SampleCountOverflow { width, height } => write!(
+                f,
+                "RGBA sample count overflow for dimensions {width}x{height}"
+            ),
+            TransformGuardError::SampleCountExceedsAddressSpace { width, height } => write!(
+                f,
+                "RGBA sample count does not fit in memory on this platform for dimensions {width}x{height}"
+            ),
+            TransformGuardError::UnsupportedRotation {
+                rotation_ccw_degrees,
+            } => write!(
+                f,
+                "unsupported irot rotation angle {rotation_ccw_degrees} degrees"
+            ),
+            TransformGuardError::DimensionTooLargeForPlatform {
+                stage,
+                dimension,
+                value,
+            } => write!(
+                f,
+                "{stage} {dimension} does not fit in usize ({value}) while applying transform"
+            ),
+            TransformGuardError::PixelIndexOverflow {
+                stage,
+                x,
+                y,
+                width,
+                height,
+            } => write!(
+                f,
+                "{stage} pixel index overflow at ({x}, {y}) for {width}x{height} image"
+            ),
+            TransformGuardError::EmptyImageGeometry { width, height } => write!(
+                f,
+                "cannot apply clean aperture to empty image geometry {width}x{height}"
+            ),
+            TransformGuardError::InvalidCleanApertureBounds {
+                width,
+                height,
+                left,
+                right,
+                top,
+                bottom,
+            } => write!(
+                f,
+                "invalid clean aperture crop bounds after clamping for {width}x{height} image: left={left}, right={right}, top={top}, bottom={bottom}"
+            ),
+            TransformGuardError::CleanApertureCropDimensionOutOfRange { dimension, value } => {
+                write!(
+                    f,
+                    "clean aperture crop {dimension} does not fit in u32 ({value})"
+                )
+            }
+            TransformGuardError::CleanApertureBoundOutOfRange { bound, value } => write!(
+                f,
+                "clean aperture {bound} bound does not fit in usize ({value})"
+            ),
+            TransformGuardError::CleanApertureRowOffsetOverflow {
+                stage,
+                y,
+                width,
+                height,
+            } => write!(
+                f,
+                "clean aperture {stage} overflow at y={y} for {width}x{height} image"
+            ),
+        }
+    }
 }
 
 impl DecodeError {
@@ -53,6 +222,8 @@ impl DecodeError {
             DecodeError::AvifDecode(err) => err.category(),
             DecodeError::HeicDecode(err) => err.category(),
             DecodeError::PngEncoding(_) => DecodeErrorCategory::OutputEncoding,
+            DecodeError::TransformGuard(err) => err.category(),
+            DecodeError::OutputBufferOverflow { .. } => DecodeErrorCategory::OutputEncoding,
             DecodeError::Unsupported(_) => DecodeErrorCategory::UnsupportedFeature,
         }
     }
@@ -65,6 +236,15 @@ impl Display for DecodeError {
             DecodeError::AvifDecode(err) => write!(f, "{err}"),
             DecodeError::HeicDecode(err) => write!(f, "{err}"),
             DecodeError::PngEncoding(err) => write!(f, "PNG encode error: {err}"),
+            DecodeError::TransformGuard(err) => write!(f, "{err}"),
+            DecodeError::OutputBufferOverflow {
+                buffer_name,
+                element_count,
+                element_size_bytes,
+            } => write!(
+                f,
+                "output buffer size overflow for {buffer_name}: {element_count} elements x {element_size_bytes} bytes"
+            ),
             DecodeError::Unsupported(msg) => write!(f, "{msg}"),
         }
     }
@@ -77,6 +257,8 @@ impl Error for DecodeError {
             DecodeError::AvifDecode(err) => Some(err),
             DecodeError::HeicDecode(err) => Some(err),
             DecodeError::PngEncoding(err) => Some(err),
+            DecodeError::TransformGuard(_) => None,
+            DecodeError::OutputBufferOverflow { .. } => None,
             DecodeError::Unsupported(_) => None,
         }
     }
@@ -1558,12 +1740,15 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
 ) -> Result<(u32, u32, Vec<T>), DecodeError> {
     let expected = checked_rgba_sample_count(width, height)?;
     if pixels.len() != expected {
-        return Err(DecodeError::Unsupported(format!(
-            "RGBA sample count mismatch for transform input: got {}, expected {expected} for {}x{}",
-            pixels.len(),
-            width,
-            height
-        )));
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage: "transform input",
+                actual: pixels.len(),
+                expected,
+                width,
+                height,
+            },
+        ));
     }
 
     let mut current_width = width;
@@ -1609,25 +1794,17 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
 }
 
 fn checked_rgba_sample_count(width: u32, height: u32) -> Result<usize, DecodeError> {
-    let pixel_count = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or_else(|| {
-            DecodeError::Unsupported(format!(
-                "RGBA pixel count overflow for dimensions {}x{}",
-                width, height
-            ))
-        })?;
-    let sample_count = pixel_count.checked_mul(4).ok_or_else(|| {
-        DecodeError::Unsupported(format!(
-            "RGBA sample count overflow for dimensions {}x{}",
-            width, height
-        ))
+    let pixel_count = u64::from(width).checked_mul(u64::from(height)).ok_or({
+        DecodeError::TransformGuard(TransformGuardError::PixelCountOverflow { width, height })
+    })?;
+    let sample_count = pixel_count.checked_mul(4).ok_or({
+        DecodeError::TransformGuard(TransformGuardError::SampleCountOverflow { width, height })
     })?;
     usize::try_from(sample_count).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "RGBA sample count does not fit in memory on this platform for dimensions {}x{}",
-            width, height
-        ))
+        DecodeError::TransformGuard(TransformGuardError::SampleCountExceedsAddressSpace {
+            width,
+            height,
+        })
     })
 }
 
@@ -1646,26 +1823,34 @@ fn rotate_rgba_ccw<T: Copy + Default>(
         90 | 270 => (height, width),
         180 => (width, height),
         _ => {
-            return Err(DecodeError::Unsupported(format!(
-                "unsupported irot rotation angle {rotation_ccw_degrees} degrees"
-            )));
+            return Err(DecodeError::TransformGuard(
+                TransformGuardError::UnsupportedRotation {
+                    rotation_ccw_degrees,
+                },
+            ));
         }
     };
 
     let src_width = usize::try_from(width).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "source width does not fit in usize ({width}) while applying rotation"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "rotation",
+            dimension: "source width",
+            value: u64::from(width),
+        })
     })?;
     let src_height = usize::try_from(height).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "source height does not fit in usize ({height}) while applying rotation"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "rotation",
+            dimension: "source height",
+            value: u64::from(height),
+        })
     })?;
     let dst_width_usize = usize::try_from(dst_width).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "destination width does not fit in usize ({dst_width}) while applying rotation"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "rotation",
+            dimension: "destination width",
+            value: u64::from(dst_width),
+        })
     })?;
     let output_len = checked_rgba_sample_count(dst_width, dst_height)?;
     let mut out = vec![T::default(); output_len];
@@ -1683,21 +1868,27 @@ fn rotate_rgba_ccw<T: Copy + Default>(
                 .checked_mul(src_width)
                 .and_then(|row| row.checked_add(x))
                 .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| {
-                    DecodeError::Unsupported(format!(
-                        "source pixel index overflow at ({x}, {y}) while rotating {}x{}",
-                        width, height
-                    ))
+                .ok_or({
+                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                        stage: "rotation source",
+                        x,
+                        y,
+                        width,
+                        height,
+                    })
                 })?;
             let dst_index = dst_y
                 .checked_mul(dst_width_usize)
                 .and_then(|row| row.checked_add(dst_x))
                 .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| {
-                    DecodeError::Unsupported(format!(
-                        "destination pixel index overflow at ({dst_x}, {dst_y}) while rotating to {}x{}",
-                        dst_width, dst_height
-                    ))
+                .ok_or({
+                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                        stage: "rotation destination",
+                        x: dst_x,
+                        y: dst_y,
+                        width: dst_width,
+                        height: dst_height,
+                    })
                 })?;
 
             out[dst_index..dst_index + 4].copy_from_slice(&pixels[src_index..src_index + 4]);
@@ -1714,14 +1905,18 @@ fn mirror_rgba<T: Copy + Default>(
     direction: isobmff::ImageMirrorDirection,
 ) -> Result<Vec<T>, DecodeError> {
     let src_width = usize::try_from(width).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "source width does not fit in usize ({width}) while applying mirror"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "mirror",
+            dimension: "source width",
+            value: u64::from(width),
+        })
     })?;
     let src_height = usize::try_from(height).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "source height does not fit in usize ({height}) while applying mirror"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "mirror",
+            dimension: "source height",
+            value: u64::from(height),
+        })
     })?;
     let output_len = checked_rgba_sample_count(width, height)?;
     let mut out = vec![T::default(); output_len];
@@ -1737,21 +1932,27 @@ fn mirror_rgba<T: Copy + Default>(
                 .checked_mul(src_width)
                 .and_then(|row| row.checked_add(x))
                 .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| {
-                    DecodeError::Unsupported(format!(
-                        "source pixel index overflow at ({x}, {y}) while mirroring {}x{}",
-                        width, height
-                    ))
+                .ok_or({
+                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                        stage: "mirror source",
+                        x,
+                        y,
+                        width,
+                        height,
+                    })
                 })?;
             let dst_index = dst_y
                 .checked_mul(src_width)
                 .and_then(|row| row.checked_add(dst_x))
                 .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| {
-                    DecodeError::Unsupported(format!(
-                        "destination pixel index overflow at ({dst_x}, {dst_y}) while mirroring {}x{}",
-                        width, height
-                    ))
+                .ok_or({
+                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
+                        stage: "mirror destination",
+                        x: dst_x,
+                        y: dst_y,
+                        width,
+                        height,
+                    })
                 })?;
 
             out[dst_index..dst_index + 4].copy_from_slice(&pixels[src_index..src_index + 4]);
@@ -1768,20 +1969,22 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
     clean_aperture: isobmff::ImageCleanApertureProperty,
 ) -> Result<(u32, u32, Vec<T>), DecodeError> {
     if width == 0 || height == 0 {
-        return Err(DecodeError::Unsupported(format!(
-            "cannot apply clean aperture to empty image geometry {}x{}",
-            width, height
-        )));
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::EmptyImageGeometry { width, height },
+        ));
     }
 
     let expected = checked_rgba_sample_count(width, height)?;
     if pixels.len() != expected {
-        return Err(DecodeError::Unsupported(format!(
-            "RGBA sample count mismatch for clean-aperture input: got {}, expected {expected} for {}x{}",
-            pixels.len(),
-            width,
-            height
-        )));
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage: "clean-aperture input",
+                actual: pixels.len(),
+                expected,
+                width,
+                height,
+            },
+        ));
     }
 
     // Provenance: crop rounding/clamp order mirrors libheif's primary decode
@@ -1801,49 +2004,63 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
     bottom = bottom.min(max_y);
 
     if left > right || top > bottom {
-        return Err(DecodeError::Unsupported(format!(
-            "invalid clean aperture crop bounds after clamping for {}x{} image: left={left}, right={right}, top={top}, bottom={bottom}",
-            width, height
-        )));
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::InvalidCleanApertureBounds {
+                width,
+                height,
+                left,
+                right,
+                top,
+                bottom,
+            },
+        ));
     }
 
     let crop_width_i128 = right - left + 1;
     let crop_height_i128 = bottom - top + 1;
     let crop_width = u32::try_from(crop_width_i128).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture crop width does not fit in u32 ({crop_width_i128})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureCropDimensionOutOfRange {
+            dimension: "width",
+            value: crop_width_i128,
+        })
     })?;
     let crop_height = u32::try_from(crop_height_i128).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture crop height does not fit in u32 ({crop_height_i128})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureCropDimensionOutOfRange {
+            dimension: "height",
+            value: crop_height_i128,
+        })
     })?;
 
     let src_width = usize::try_from(width).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "source width does not fit in usize ({width}) while applying clean aperture"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
+            stage: "clean aperture",
+            dimension: "source width",
+            value: u64::from(width),
+        })
     })?;
     let left_usize = usize::try_from(left).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture left bound does not fit in usize ({left})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
+            bound: "left",
+            value: left,
+        })
     })?;
     let right_usize = usize::try_from(right).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture right bound does not fit in usize ({right})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
+            bound: "right",
+            value: right,
+        })
     })?;
     let top_usize = usize::try_from(top).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture top bound does not fit in usize ({top})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
+            bound: "top",
+            value: top,
+        })
     })?;
     let bottom_usize = usize::try_from(bottom).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "clean aperture bottom bound does not fit in usize ({bottom})"
-        ))
+        DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
+            bound: "bottom",
+            value: bottom,
+        })
     })?;
 
     let out_len = checked_rgba_sample_count(crop_width, crop_height)?;
@@ -1852,33 +2069,41 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
         let row_pixel_start = y
             .checked_mul(src_width)
             .and_then(|row| row.checked_add(left_usize))
-            .ok_or_else(|| {
-                DecodeError::Unsupported(format!(
-                    "clean aperture source row start overflow at y={y} for {}x{} image",
-                    width, height
-                ))
+            .ok_or({
+                DecodeError::TransformGuard(TransformGuardError::CleanApertureRowOffsetOverflow {
+                    stage: "source row start",
+                    y,
+                    width,
+                    height,
+                })
             })?;
         let row_pixel_end = y
             .checked_mul(src_width)
             .and_then(|row| row.checked_add(right_usize))
             .and_then(|pixel| pixel.checked_add(1))
-            .ok_or_else(|| {
-                DecodeError::Unsupported(format!(
-                    "clean aperture source row end overflow at y={y} for {}x{} image",
-                    width, height
-                ))
+            .ok_or({
+                DecodeError::TransformGuard(TransformGuardError::CleanApertureRowOffsetOverflow {
+                    stage: "source row end",
+                    y,
+                    width,
+                    height,
+                })
             })?;
-        let row_sample_start = row_pixel_start.checked_mul(4).ok_or_else(|| {
-            DecodeError::Unsupported(format!(
-                "clean aperture source row sample start overflow at y={y} for {}x{} image",
-                width, height
-            ))
+        let row_sample_start = row_pixel_start.checked_mul(4).ok_or({
+            DecodeError::TransformGuard(TransformGuardError::CleanApertureRowOffsetOverflow {
+                stage: "source row sample start",
+                y,
+                width,
+                height,
+            })
         })?;
-        let row_sample_end = row_pixel_end.checked_mul(4).ok_or_else(|| {
-            DecodeError::Unsupported(format!(
-                "clean aperture source row sample end overflow at y={y} for {}x{} image",
-                width, height
-            ))
+        let row_sample_end = row_pixel_end.checked_mul(4).ok_or({
+            DecodeError::TransformGuard(TransformGuardError::CleanApertureRowOffsetOverflow {
+                stage: "source row sample end",
+                y,
+                width,
+                height,
+            })
         })?;
 
         out.extend_from_slice(&pixels[row_sample_start..row_sample_end]);
@@ -2121,7 +2346,11 @@ fn write_rgba16_png(
     let byte_len = pixels
         .len()
         .checked_mul(2)
-        .ok_or_else(|| DecodeError::Unsupported("RGBA16 byte buffer size overflow".to_string()))?;
+        .ok_or(DecodeError::OutputBufferOverflow {
+            buffer_name: "RGBA16 PNG byte buffer",
+            element_count: pixels.len(),
+            element_size_bytes: 2,
+        })?;
     let mut bytes = Vec::with_capacity(byte_len);
     for sample in pixels {
         bytes.extend_from_slice(&sample.to_be_bytes());
@@ -3369,7 +3598,7 @@ mod tests {
         validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifPixelLayout, AvifPlane,
         AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
         DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane,
-        HevcNalClass, YCbCrMatrixCoefficients, YCbCrRange,
+        HevcNalClass, TransformGuardError, YCbCrMatrixCoefficients, YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -3611,11 +3840,13 @@ mod tests {
         let err = apply_primary_item_transforms_rgba(2, 2, pixels, &transforms)
             .expect_err("empty clap crop should fail deterministically");
         match err {
-            DecodeError::Unsupported(message) => {
-                assert!(
-                    message.contains("invalid clean aperture crop bounds after clamping"),
-                    "unexpected clap error message: {message}"
-                );
+            DecodeError::TransformGuard(TransformGuardError::InvalidCleanApertureBounds {
+                width,
+                height,
+                ..
+            }) => {
+                assert_eq!(width, 2);
+                assert_eq!(height, 2);
             }
             other => panic!("unexpected error kind for invalid clap crop: {other}"),
         }
@@ -3672,6 +3903,19 @@ mod tests {
 
         let nested = DecodeError::HeicDecode(DecodeHeicError::MissingSpsNalUnit);
         assert_eq!(nested.category(), DecodeErrorCategory::MalformedInput);
+
+        let transform = DecodeError::TransformGuard(TransformGuardError::EmptyImageGeometry {
+            width: 0,
+            height: 16,
+        });
+        assert_eq!(transform.category(), DecodeErrorCategory::MalformedInput);
+
+        let output = DecodeError::OutputBufferOverflow {
+            buffer_name: "RGBA16 PNG byte buffer",
+            element_count: usize::MAX,
+            element_size_bytes: 2,
+        };
+        assert_eq!(output.category(), DecodeErrorCategory::OutputEncoding);
 
         let unsupported = DecodeError::Unsupported("unsupported extension".to_string());
         assert_eq!(
