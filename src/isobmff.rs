@@ -16,8 +16,10 @@ const IREF_BOX_TYPE: [u8; 4] = *b"iref";
 const IPRP_BOX_TYPE: [u8; 4] = *b"iprp";
 const IPCO_BOX_TYPE: [u8; 4] = *b"ipco";
 const IPMA_BOX_TYPE: [u8; 4] = *b"ipma";
+const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
 const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
+const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -538,6 +540,14 @@ pub struct ResolvedPrimaryItemGraph<'a> {
     pub iprp: ItemPropertiesBox<'a>,
     pub iref: Option<ItemReferenceBox>,
     pub primary_item: ResolvedPrimaryItem<'a>,
+}
+
+/// Extracted primary AVIF item payload ready for AV1 decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvifPrimaryItemData {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub payload: Vec<u8>,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -1292,6 +1302,126 @@ impl From<ParseItemReferenceBoxError> for ResolvePrimaryItemGraphError {
     }
 }
 
+/// Errors returned when extracting the primary AVIF payload from BMFF boxes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtractAvifItemDataError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    UnsupportedDataReferenceIndex {
+        item_id: u32,
+        data_reference_index: u16,
+    },
+    UnsupportedConstructionMethod {
+        item_id: u32,
+        construction_method: u8,
+    },
+    MissingIdatBox {
+        item_id: u32,
+    },
+    MetaChildBoxes(ParseBoxError),
+    ExtentOffsetOverflow {
+        item_id: u32,
+        base_offset: u64,
+        extent_offset: u64,
+        extent_length: u64,
+    },
+    ExtentOutOfBounds {
+        item_id: u32,
+        construction_method: u8,
+        start: u64,
+        length: u64,
+        available: u64,
+    },
+    PayloadTooLarge {
+        item_id: u32,
+        length: u64,
+    },
+}
+
+impl Display for ExtractAvifItemDataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractAvifItemDataError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ExtractAvifItemDataError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ExtractAvifItemDataError::Meta(err) => write!(f, "{err}"),
+            ExtractAvifItemDataError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ExtractAvifItemDataError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected av01"
+            ),
+            ExtractAvifItemDataError::UnexpectedPrimaryItemType { item_id, actual } => write!(
+                f,
+                "primary item_ID {item_id} has infe item_type {actual}, expected av01"
+            ),
+            ExtractAvifItemDataError::UnsupportedDataReferenceIndex {
+                item_id,
+                data_reference_index,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc data_reference_index {data_reference_index}"
+            ),
+            ExtractAvifItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc construction_method {construction_method}"
+            ),
+            ExtractAvifItemDataError::MissingIdatBox { item_id } => write!(
+                f,
+                "primary item_ID {item_id} references idat-backed iloc extents but no idat box exists in meta"
+            ),
+            ExtractAvifItemDataError::MetaChildBoxes(err) => write!(f, "{err}"),
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset,
+                extent_offset,
+                extent_length,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent offset overflow (base_offset={base_offset}, extent_offset={extent_offset}, extent_length={extent_length})"
+            ),
+            ExtractAvifItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length,
+                available,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent (construction_method={construction_method}, start={start}, length={length}) exceeds available bytes {available}"
+            ),
+            ExtractAvifItemDataError::PayloadTooLarge { item_id, length } => write!(
+                f,
+                "primary item_ID {item_id} payload length {length} cannot be represented on this platform"
+            ),
+        }
+    }
+}
+
+impl Error for ExtractAvifItemDataError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ExtractAvifItemDataError::TopLevelBoxes(err) => Some(err),
+            ExtractAvifItemDataError::Meta(err) => Some(err),
+            ExtractAvifItemDataError::ResolvePrimaryItem(err) => Some(err),
+            ExtractAvifItemDataError::MetaChildBoxes(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseBoxError {
@@ -1405,6 +1535,136 @@ impl<'a> Iterator for BoxIter<'a> {
 /// Parse all top-level boxes from an input slice.
 pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
+}
+
+/// Extract the primary AVIF (`av01`) coded payload from `iloc` extents.
+pub fn extract_primary_avif_item_data(
+    input: &[u8],
+) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
+    // Provenance: mirrors the primary-item selection and extent read flow from
+    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::set_decoder_input_data
+    // and libheif/libheif/box.cc:Box_iloc::read_data.
+    let top_level = parse_boxes(input).map_err(ExtractAvifItemDataError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ExtractAvifItemDataError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ExtractAvifItemDataError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ExtractAvifItemDataError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ExtractAvifItemDataError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != AV01_ITEM_TYPE {
+        return Err(ExtractAvifItemDataError::UnexpectedPrimaryItemType {
+            item_id,
+            actual: item_type,
+        });
+    }
+
+    let location = &resolved.primary_item.location;
+    if location.data_reference_index != 0 {
+        return Err(ExtractAvifItemDataError::UnsupportedDataReferenceIndex {
+            item_id,
+            data_reference_index: location.data_reference_index,
+        });
+    }
+
+    let total_length = location
+        .extents
+        .iter()
+        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
+        .ok_or(ExtractAvifItemDataError::PayloadTooLarge {
+            item_id,
+            length: u64::MAX,
+        })?;
+    let payload_capacity =
+        usize::try_from(total_length).map_err(|_| ExtractAvifItemDataError::PayloadTooLarge {
+            item_id,
+            length: total_length,
+        })?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+
+    match location.construction_method {
+        0 => append_iloc_extents_to_payload(input, location, item_id, 0, &mut payload)?,
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractAvifItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractAvifItemDataError::MissingIdatBox { item_id })?;
+            append_iloc_extents_to_payload(idat_box.payload, location, item_id, 1, &mut payload)?;
+        }
+        construction_method => {
+            return Err(ExtractAvifItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            });
+        }
+    }
+
+    Ok(AvifPrimaryItemData {
+        item_id,
+        construction_method: location.construction_method,
+        payload,
+    })
+}
+
+fn append_iloc_extents_to_payload(
+    source: &[u8],
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractAvifItemDataError> {
+    let available = source.len() as u64;
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        if end > available {
+            return Err(ExtractAvifItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+
+        let start =
+            usize::try_from(start).map_err(|_| ExtractAvifItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            })?;
+        let end = usize::try_from(end).map_err(|_| ExtractAvifItemDataError::PayloadTooLarge {
+            item_id,
+            length: end,
+        })?;
+        output.extend_from_slice(&source[start..end]);
+    }
+
+    Ok(())
 }
 
 fn find_first_child_box<'a, 'b>(
@@ -2457,13 +2717,13 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boxes, BoxIter, FourCc, ItemLocationField, ParseBoxError, ParseFileTypeBoxError,
-        ParseFullBoxError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
-        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
-        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
-        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError,
-        ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
-        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        extract_primary_avif_item_data, parse_boxes, BoxIter, ExtractAvifItemDataError, FourCc,
+        ItemLocationField, ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
+        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
+        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
+        ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
+        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -4033,6 +4293,140 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn extracts_primary_avif_payload_from_mdat_backed_iloc_extents() {
+        let mdat = make_basic_box(*b"mdat", &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&(BASIC_HEADER_SIZE as u32).to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&2_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // extent_offset[0]
+        iloc_payload.extend_from_slice(&2_u32.to_be_bytes()); // extent_length[0]
+        iloc_payload.extend_from_slice(&4_u32.to_be_bytes()); // extent_offset[1]
+        iloc_payload.extend_from_slice(&2_u32.to_be_bytes()); // extent_length[1]
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_avif_meta(iloc, &[]);
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let extracted =
+            extract_primary_avif_item_data(&file).expect("AVIF mdat-backed payload must extract");
+        assert_eq!(extracted.item_id, 1);
+        assert_eq!(extracted.construction_method, 0);
+        assert_eq!(extracted.payload, vec![0xaa, 0xbb, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn extracts_primary_avif_payload_from_idat_backed_iloc_extents() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4, index=0
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // construction_method=1
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&1_u32.to_be_bytes()); // extent_offset
+        iloc_payload.extend_from_slice(&3_u32.to_be_bytes()); // extent_length
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let idat = make_basic_box(*b"idat", &[0x10, 0x11, 0x12, 0x13, 0x14]);
+        let meta = make_primary_avif_meta(iloc, &[idat]);
+
+        let extracted =
+            extract_primary_avif_item_data(&meta).expect("AVIF idat-backed payload must extract");
+        assert_eq!(extracted.item_id, 1);
+        assert_eq!(extracted.construction_method, 1);
+        assert_eq!(extracted.payload, vec![0x11, 0x12, 0x13]);
+    }
+
+    #[test]
+    fn rejects_primary_avif_extraction_when_idat_is_missing() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4, index=0
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // construction_method=1
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_avif_meta(iloc, &[]);
+        let err = extract_primary_avif_item_data(&meta).expect_err("missing idat must fail");
+        assert_eq!(err, ExtractAvifItemDataError::MissingIdatBox { item_id: 1 });
+    }
+
+    #[test]
+    fn rejects_primary_avif_extraction_for_external_data_reference_index() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // size fields all zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_avif_meta(iloc, &[]);
+        let err =
+            extract_primary_avif_item_data(&meta).expect_err("external data reference must fail");
+        assert_eq!(
+            err,
+            ExtractAvifItemDataError::UnsupportedDataReferenceIndex {
+                item_id: 1,
+                data_reference_index: 1,
+            }
+        );
+    }
+
+    fn make_primary_avif_meta(iloc: Vec<u8>, additional_children: &[Vec<u8>]) -> Vec<u8> {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(b"primary\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let iinf = make_basic_box(*b"iinf", &iinf_payload);
+
+        let ispe = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
+        let ipco = make_basic_box(*b"ipco", &ispe);
+
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        ipma_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        ipma_payload.push(1); // association_count
+        ipma_payload.push(0x01); // property_index=1
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        let iprp = make_basic_box(*b"iprp", &iprp_payload);
+
+        let mut children = vec![pitm, iloc, iinf, iprp];
+        children.extend_from_slice(additional_children);
+        make_meta_box(&children)
     }
 
     fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {
