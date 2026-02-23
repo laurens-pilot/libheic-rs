@@ -1030,23 +1030,26 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         )));
     }
 
-    if matches!(
-        input_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("avif")),
-        Some(true)
-    ) {
+    let extension = input_path.extension().and_then(|ext| ext.to_str());
+    if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("avif")) {
         let input = std::fs::read(input_path)?;
         let decoded = decode_primary_avif_to_image(&input)?;
         write_decoded_avif_to_png(&decoded, output_path)?;
         return Ok(());
     }
 
-    let _ = output_path;
-    Err(DecodeError::Unsupported(
-        "Decoder not implemented yet.".to_string(),
-    ))
+    if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"))
+    {
+        let input = std::fs::read(input_path)?;
+        let decoded = decode_primary_heic_to_image(&input)?;
+        write_decoded_heic_to_png(&decoded, output_path)?;
+        return Ok(());
+    }
+
+    Err(DecodeError::Unsupported(format!(
+        "Unsupported file extension for input: {}",
+        input_path.display()
+    )))
 }
 
 // Provenance: conversion constants/mapping align with libheif's full-range
@@ -1068,6 +1071,19 @@ fn write_decoded_avif_to_png(
     }
 
     let pixels = convert_avif_to_rgba16(decoded)?;
+    write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
+}
+
+fn write_decoded_heic_to_png(
+    decoded: &DecodedHeicImage,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    if decoded.bit_depth_luma <= 8 {
+        let pixels = convert_heic_to_rgba8(decoded)?;
+        return write_rgba8_png(decoded.width, decoded.height, &pixels, output_path);
+    }
+
+    let pixels = convert_heic_to_rgba16(decoded)?;
     write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
 }
 
@@ -1345,6 +1361,329 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
     }
 
     Ok(out)
+}
+
+fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHeicError> {
+    let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
+
+    validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
+    let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
+    if decoded.y_plane.samples.len() != expected_y_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "Y plane has {} samples, expected {expected_y_samples}",
+                decoded.y_plane.samples.len()
+            ),
+        });
+    }
+
+    let width =
+        usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC width does not fit in usize ({})", decoded.width),
+        })?;
+    let height =
+        usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC height does not fit in usize ({})", decoded.height),
+        })?;
+    let output_len =
+        expected_y_samples
+            .checked_mul(4)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "RGBA output sample count overflow for {}x{}",
+                    decoded.width, decoded.height
+                ),
+            })?;
+    let mut out = Vec::with_capacity(output_len);
+
+    let chroma = prepare_heic_chroma(decoded)?;
+    let half_range = chroma_half_range(bit_depth);
+
+    for y in 0..height {
+        let row_start =
+            y.checked_mul(width)
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!(
+                        "row offset overflow while converting HEIC at row {y} (width={width})"
+                    ),
+                })?;
+
+        for x in 0..width {
+            let y_index =
+                row_start
+                    .checked_add(x)
+                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                        detail: format!("luma index overflow while converting HEIC at ({x}, {y})"),
+                    })?;
+            let y_sample = i32::from(decoded.y_plane.samples[y_index]);
+
+            let (cb_centered, cr_centered) = match &chroma {
+                HeicChromaPlanes::Monochrome => (0, 0),
+                HeicChromaPlanes::Color {
+                    u_samples,
+                    v_samples,
+                    chroma_width,
+                    layout,
+                } => {
+                    let chroma_index = heic_chroma_sample_index(x, y, *chroma_width, *layout);
+                    (
+                        i32::from(u_samples[chroma_index]) - half_range,
+                        i32::from(v_samples[chroma_index]) - half_range,
+                    )
+                }
+            };
+
+            let (r, g, b) = ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, bit_depth);
+            out.push(scale_sample_to_u8(r, bit_depth));
+            out.push(scale_sample_to_u8(g, bit_depth));
+            out.push(scale_sample_to_u8(b, bit_depth));
+            out.push(u8::MAX);
+        }
+    }
+
+    Ok(out)
+}
+
+fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, DecodeHeicError> {
+    let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
+
+    validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
+    let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
+    if decoded.y_plane.samples.len() != expected_y_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "Y plane has {} samples, expected {expected_y_samples}",
+                decoded.y_plane.samples.len()
+            ),
+        });
+    }
+
+    let width =
+        usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC width does not fit in usize ({})", decoded.width),
+        })?;
+    let height =
+        usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC height does not fit in usize ({})", decoded.height),
+        })?;
+    let output_len =
+        expected_y_samples
+            .checked_mul(4)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "RGBA output sample count overflow for {}x{}",
+                    decoded.width, decoded.height
+                ),
+            })?;
+    let mut out = Vec::with_capacity(output_len);
+
+    let chroma = prepare_heic_chroma(decoded)?;
+    let half_range = chroma_half_range(bit_depth);
+
+    for y in 0..height {
+        let row_start =
+            y.checked_mul(width)
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!(
+                        "row offset overflow while converting HEIC at row {y} (width={width})"
+                    ),
+                })?;
+
+        for x in 0..width {
+            let y_index =
+                row_start
+                    .checked_add(x)
+                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                        detail: format!("luma index overflow while converting HEIC at ({x}, {y})"),
+                    })?;
+            let y_sample = i32::from(decoded.y_plane.samples[y_index]);
+
+            let (cb_centered, cr_centered) = match &chroma {
+                HeicChromaPlanes::Monochrome => (0, 0),
+                HeicChromaPlanes::Color {
+                    u_samples,
+                    v_samples,
+                    chroma_width,
+                    layout,
+                } => {
+                    let chroma_index = heic_chroma_sample_index(x, y, *chroma_width, *layout);
+                    (
+                        i32::from(u_samples[chroma_index]) - half_range,
+                        i32::from(v_samples[chroma_index]) - half_range,
+                    )
+                }
+            };
+
+            let (r, g, b) = ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, bit_depth);
+            out.push(scale_sample_to_u16(r, bit_depth));
+            out.push(scale_sample_to_u16(g, bit_depth));
+            out.push(scale_sample_to_u16(b, bit_depth));
+            out.push(u16::MAX);
+        }
+    }
+
+    Ok(out)
+}
+
+enum HeicChromaPlanes<'a> {
+    Monochrome,
+    Color {
+        u_samples: &'a [u16],
+        v_samples: &'a [u16],
+        chroma_width: usize,
+        layout: HeicPixelLayout,
+    },
+}
+
+fn heic_bit_depth_for_png_conversion(decoded: &DecodedHeicImage) -> Result<u8, DecodeHeicError> {
+    if decoded.bit_depth_luma != decoded.bit_depth_chroma {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "HEIC luma/chroma bit-depth mismatch during PNG conversion: {}/{}",
+                decoded.bit_depth_luma, decoded.bit_depth_chroma
+            ),
+        });
+    }
+
+    if decoded.bit_depth_luma == 0 || decoded.bit_depth_luma > 16 {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "HEIC bit depth {} is outside supported PNG conversion range 1..=16",
+                decoded.bit_depth_luma
+            ),
+        });
+    }
+
+    Ok(decoded.bit_depth_luma)
+}
+
+fn prepare_heic_chroma(
+    decoded: &DecodedHeicImage,
+) -> Result<HeicChromaPlanes<'_>, DecodeHeicError> {
+    if decoded.layout == HeicPixelLayout::Yuv400 {
+        return Ok(HeicChromaPlanes::Monochrome);
+    }
+
+    let (u_plane, v_plane, expected_width, expected_height) = require_heic_chroma_planes(decoded)?;
+    validate_heic_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
+    validate_heic_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
+
+    let expected_samples = heic_sample_count(expected_width, expected_height, "U/V")?;
+    if u_plane.samples.len() != expected_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "U plane has {} samples, expected {expected_samples}",
+                u_plane.samples.len()
+            ),
+        });
+    }
+    if v_plane.samples.len() != expected_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "V plane has {} samples, expected {expected_samples}",
+                v_plane.samples.len()
+            ),
+        });
+    }
+
+    let chroma_width =
+        usize::try_from(expected_width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC chroma width does not fit in usize ({expected_width})"),
+        })?;
+    Ok(HeicChromaPlanes::Color {
+        u_samples: &u_plane.samples,
+        v_samples: &v_plane.samples,
+        chroma_width,
+        layout: decoded.layout,
+    })
+}
+
+fn require_heic_chroma_planes(
+    decoded: &DecodedHeicImage,
+) -> Result<(&HeicPlane, &HeicPlane, u32, u32), DecodeHeicError> {
+    let (expected_width, expected_height) =
+        heic_chroma_dimensions(decoded.width, decoded.height, decoded.layout);
+    let u_plane = decoded
+        .u_plane
+        .as_ref()
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "decoded HEIC frame is missing U plane for {:?}",
+                decoded.layout
+            ),
+        })?;
+    let v_plane = decoded
+        .v_plane
+        .as_ref()
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "decoded HEIC frame is missing V plane for {:?}",
+                decoded.layout
+            ),
+        })?;
+    Ok((u_plane, v_plane, expected_width, expected_height))
+}
+
+fn validate_heic_plane_dimensions(
+    plane: &HeicPlane,
+    expected_width: u32,
+    expected_height: u32,
+    plane_name: &'static str,
+) -> Result<(), DecodeHeicError> {
+    if plane.width != expected_width || plane.height != expected_height {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane_name} plane has dimensions {}x{}, expected {expected_width}x{expected_height}",
+                plane.width, plane.height
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn heic_sample_count(
+    width: u32,
+    height: u32,
+    plane_name: &'static str,
+) -> Result<usize, DecodeHeicError> {
+    let width_usize = usize::try_from(width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!("{plane_name} plane width does not fit in usize ({width})"),
+    })?;
+    let height_usize =
+        usize::try_from(height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane_name} plane height does not fit in usize ({height})"),
+        })?;
+    width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{plane_name} plane sample count overflow for {width_usize}x{height_usize}"
+            ),
+        })
+}
+
+fn heic_chroma_dimensions(width: u32, height: u32, layout: HeicPixelLayout) -> (u32, u32) {
+    if layout == HeicPixelLayout::Yuv400 {
+        return (0, 0);
+    }
+
+    let (subsample_x, subsample_y) = heic_chroma_subsampling(layout);
+    (width.div_ceil(subsample_x), height.div_ceil(subsample_y))
+}
+
+fn heic_chroma_sample_index(
+    x: usize,
+    y: usize,
+    chroma_width: usize,
+    layout: HeicPixelLayout,
+) -> usize {
+    match layout {
+        HeicPixelLayout::Yuv400 => 0,
+        HeicPixelLayout::Yuv420 => (y / 2) * chroma_width + (x / 2),
+        HeicPixelLayout::Yuv422 => y * chroma_width + (x / 2),
+        HeicPixelLayout::Yuv444 => y * chroma_width + x,
+    }
 }
 
 enum ChromaPlanesU8<'a> {
@@ -2008,6 +2347,40 @@ mod tests {
             frame_info.bit_depth,
             png::BitDepth::Eight | png::BitDepth::Sixteen
         ));
+    }
+
+    #[test]
+    fn decodes_example_heic_to_png() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("example.heic fixture must be readable");
+        let decoded =
+            decode_primary_heic_to_image(&input).expect("example HEIC should decode into planes");
+
+        let output = test_output_png_path("example-heic");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output).expect("HEIC decode should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        let expected_bit_depth = if decoded.bit_depth_luma <= 8 {
+            png::BitDepth::Eight
+        } else {
+            png::BitDepth::Sixteen
+        };
+        assert_eq!(frame_info.bit_depth, expected_bit_depth);
     }
 
     #[test]
