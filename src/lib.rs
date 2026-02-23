@@ -35,6 +35,26 @@ pub enum DecodeErrorCategory {
     OutputEncoding,
 }
 
+impl DecodeErrorCategory {
+    /// Stable machine-readable label for CLI/script integration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecodeErrorCategory::Io => "io",
+            DecodeErrorCategory::Parse => "parse",
+            DecodeErrorCategory::MalformedInput => "malformed-input",
+            DecodeErrorCategory::UnsupportedFeature => "unsupported-feature",
+            DecodeErrorCategory::DecoderBackend => "decoder-backend",
+            DecodeErrorCategory::OutputEncoding => "output-encoding",
+        }
+    }
+}
+
+impl Display for DecodeErrorCategory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Errors returned by the decoder entry points.
 #[derive(Debug)]
 pub enum DecodeError {
@@ -3922,6 +3942,32 @@ mod tests {
         assert_eq!(
             unsupported.category(),
             DecodeErrorCategory::UnsupportedFeature
+        );
+    }
+
+    #[test]
+    fn exposes_stable_decode_error_category_labels() {
+        assert_eq!(DecodeErrorCategory::Io.as_str(), "io");
+        assert_eq!(DecodeErrorCategory::Parse.as_str(), "parse");
+        assert_eq!(
+            DecodeErrorCategory::MalformedInput.as_str(),
+            "malformed-input"
+        );
+        assert_eq!(
+            DecodeErrorCategory::UnsupportedFeature.as_str(),
+            "unsupported-feature"
+        );
+        assert_eq!(
+            DecodeErrorCategory::DecoderBackend.as_str(),
+            "decoder-backend"
+        );
+        assert_eq!(
+            DecodeErrorCategory::OutputEncoding.as_str(),
+            "output-encoding"
+        );
+        assert_eq!(
+            DecodeErrorCategory::MalformedInput.to_string(),
+            "malformed-input"
         );
     }
 
