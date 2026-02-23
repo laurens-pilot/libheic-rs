@@ -18,6 +18,7 @@ const IPCO_BOX_TYPE: [u8; 4] = *b"ipco";
 const IPMA_BOX_TYPE: [u8; 4] = *b"ipma";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
 const AV1C_BOX_TYPE: [u8; 4] = *b"av1C";
+const HVCC_BOX_TYPE: [u8; 4] = *b"hvcC";
 const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
 const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
@@ -253,6 +254,20 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_av1c_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `hvcC` box.
+    pub fn parse_hvcc(
+        &self,
+    ) -> Result<HevcDecoderConfigurationBox, ParseHevcDecoderConfigurationBoxError> {
+        if self.header.box_type.as_bytes() != HVCC_BOX_TYPE {
+            return Err(ParseHevcDecoderConfigurationBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_hvcc_payload(self.payload, self.payload_offset())
     }
 
     /// Parse this box payload as an `ispe` property.
@@ -624,6 +639,37 @@ pub struct Av1CodecConfigurationBox {
     pub config_obus: Vec<u8>,
 }
 
+/// Parsed `hvcC` NAL array fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HevcNalArray {
+    pub array_completeness: bool,
+    pub nal_unit_type: u8,
+    pub nal_units: Vec<Vec<u8>>,
+}
+
+/// Parsed `hvcC` decoder configuration fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HevcDecoderConfigurationBox {
+    pub configuration_version: u8,
+    pub general_profile_space: u8,
+    pub general_tier_flag: bool,
+    pub general_profile_idc: u8,
+    pub general_profile_compatibility_flags: u32,
+    pub general_constraint_indicator_flags: [u8; 6],
+    pub general_level_idc: u8,
+    pub min_spatial_segmentation_idc: u16,
+    pub parallelism_type: u8,
+    pub chroma_format: u8,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub avg_frame_rate: u16,
+    pub constant_frame_rate: u8,
+    pub num_temporal_layers: u8,
+    pub temporal_id_nested: bool,
+    pub nal_length_size: u8,
+    pub nal_arrays: Vec<HevcNalArray>,
+}
+
 /// Parsed `ispe` property fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageSpatialExtentsProperty {
@@ -644,6 +690,15 @@ pub struct PixelInformationProperty {
 pub struct AvifPrimaryItemProperties {
     pub item_id: u32,
     pub av1c: Av1CodecConfigurationBox,
+    pub ispe: ImageSpatialExtentsProperty,
+    pub pixi: PixelInformationProperty,
+}
+
+/// Parsed primary HEIC properties needed before decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicPrimaryItemProperties {
+    pub item_id: u32,
+    pub hvcc: HevcDecoderConfigurationBox,
     pub ispe: ImageSpatialExtentsProperty,
     pub pixi: PixelInformationProperty,
 }
@@ -1443,6 +1498,54 @@ impl Display for ParseAv1CodecConfigurationBoxError {
 
 impl Error for ParseAv1CodecConfigurationBoxError {}
 
+/// Errors returned when parsing an `hvcC` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseHevcDecoderConfigurationBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    UnsupportedConfigurationVersion {
+        offset: u64,
+        version: u8,
+    },
+}
+
+impl Display for ParseHevcDecoderConfigurationBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseHevcDecoderConfigurationBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected hvcC box at offset {offset}, got box type {actual}"
+            ),
+            ParseHevcDecoderConfigurationBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "hvcC payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseHevcDecoderConfigurationBoxError::UnsupportedConfigurationVersion {
+                offset,
+                version,
+            } => write!(
+                f,
+                "hvcC box at offset {offset} has unsupported configurationVersion {version}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseHevcDecoderConfigurationBoxError {}
+
 /// Errors returned when parsing an `ispe` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseImageSpatialExtentsPropertyError {
@@ -1672,6 +1775,122 @@ impl Error for ParsePrimaryAvifPropertiesError {
             ParsePrimaryAvifPropertiesError::Av1Codec(err) => Some(err),
             ParsePrimaryAvifPropertiesError::ImageSpatialExtents(err) => Some(err),
             ParsePrimaryAvifPropertiesError::PixelInformation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// Errors returned when parsing/validating primary HEIC properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePrimaryHeicPropertiesError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    MissingRequiredProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    DuplicateProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    HevcCodec(ParseHevcDecoderConfigurationBoxError),
+    ImageSpatialExtents(ParseImageSpatialExtentsPropertyError),
+    PixelInformation(ParsePixelInformationPropertyError),
+    InvalidImageExtent {
+        item_id: u32,
+        width: u32,
+        height: u32,
+    },
+    InvalidPixiChannelCount {
+        item_id: u32,
+        channel_count: usize,
+    },
+    InvalidPixiBitsPerChannel {
+        item_id: u32,
+        channel_index: usize,
+    },
+}
+
+impl Display for ParsePrimaryHeicPropertiesError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePrimaryHeicPropertiesError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ParsePrimaryHeicPropertiesError::Meta(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected hvc1 or hev1"
+            ),
+            ParsePrimaryHeicPropertiesError::UnexpectedPrimaryItemType { item_id, actual } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} has infe item_type {actual}, expected hvc1 or hev1"
+                )
+            }
+            ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} is missing required HEIC property {property_type}"
+            ),
+            ParsePrimaryHeicPropertiesError::DuplicateProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has multiple {property_type} properties"
+            ),
+            ParsePrimaryHeicPropertiesError::HevcCodec(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::ImageSpatialExtents(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::PixelInformation(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::InvalidImageExtent {
+                item_id,
+                width,
+                height,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid ispe dimensions ({width}x{height})"
+            ),
+            ParsePrimaryHeicPropertiesError::InvalidPixiChannelCount {
+                item_id,
+                channel_count,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid pixi channel count {channel_count}"
+            ),
+            ParsePrimaryHeicPropertiesError::InvalidPixiBitsPerChannel {
+                item_id,
+                channel_index,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid pixi bits_per_channel for channel index {channel_index}"
+            ),
+        }
+    }
+}
+
+impl Error for ParsePrimaryHeicPropertiesError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePrimaryHeicPropertiesError::TopLevelBoxes(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::Meta(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::ResolvePrimaryItem(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::HevcCodec(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::ImageSpatialExtents(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::PixelInformation(err) => Some(err),
             _ => None,
         }
     }
@@ -2157,6 +2376,131 @@ pub fn parse_primary_avif_item_properties(
     })
 }
 
+/// Parse and validate primary HEIC properties needed before decode.
+pub fn parse_primary_heic_item_properties(
+    input: &[u8],
+) -> Result<HeicPrimaryItemProperties, ParsePrimaryHeicPropertiesError> {
+    // Provenance: mirrors libheif HEIC property preconditions and hvcC/ispe/pixi
+    // parse semantics from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::initialize_decoder,
+    // libheif/libheif/context.cc (hvcC presence checks), libheif/libheif/codecs/hevc_boxes.cc:HEVCDecoderConfigurationRecord::parse,
+    // libheif/libheif/box.cc:Box_ispe::parse, and libheif/libheif/box.cc:Box_pixi::parse.
+    let top_level = parse_boxes(input).map_err(ParsePrimaryHeicPropertiesError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ParsePrimaryHeicPropertiesError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ParsePrimaryHeicPropertiesError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ParsePrimaryHeicPropertiesError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ParsePrimaryHeicPropertiesError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != HVC1_ITEM_TYPE && item_type.as_bytes() != HEV1_ITEM_TYPE {
+        return Err(ParsePrimaryHeicPropertiesError::UnexpectedPrimaryItemType {
+            item_id,
+            actual: item_type,
+        });
+    }
+
+    let mut hvcc = None;
+    let mut ispe = None;
+    let mut pixi = None;
+
+    for property in &resolved.primary_item.properties {
+        let property_type = property.property.header.box_type;
+        if property_type.as_bytes() == HVCC_BOX_TYPE {
+            if hvcc.is_some() {
+                return Err(ParsePrimaryHeicPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            hvcc = Some(
+                property
+                    .property
+                    .parse_hvcc()
+                    .map_err(ParsePrimaryHeicPropertiesError::HevcCodec)?,
+            );
+        } else if property_type.as_bytes() == ISPE_BOX_TYPE {
+            if ispe.is_some() {
+                return Err(ParsePrimaryHeicPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            ispe = Some(
+                property
+                    .property
+                    .parse_ispe()
+                    .map_err(ParsePrimaryHeicPropertiesError::ImageSpatialExtents)?,
+            );
+        } else if property_type.as_bytes() == PIXI_BOX_TYPE {
+            if pixi.is_some() {
+                return Err(ParsePrimaryHeicPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            pixi = Some(
+                property
+                    .property
+                    .parse_pixi()
+                    .map_err(ParsePrimaryHeicPropertiesError::PixelInformation)?,
+            );
+        }
+    }
+
+    let hvcc = hvcc.ok_or(ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(HVCC_BOX_TYPE),
+    })?;
+    let ispe = ispe.ok_or(ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(ISPE_BOX_TYPE),
+    })?;
+    let pixi = pixi.ok_or(ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+        item_id,
+        property_type: FourCc::new(PIXI_BOX_TYPE),
+    })?;
+
+    if ispe.width == 0 || ispe.height == 0 {
+        return Err(ParsePrimaryHeicPropertiesError::InvalidImageExtent {
+            item_id,
+            width: ispe.width,
+            height: ispe.height,
+        });
+    }
+    if pixi.bits_per_channel.is_empty() {
+        return Err(ParsePrimaryHeicPropertiesError::InvalidPixiChannelCount {
+            item_id,
+            channel_count: 0,
+        });
+    }
+    if let Some((channel_index, _)) = pixi
+        .bits_per_channel
+        .iter()
+        .enumerate()
+        .find(|(_, bits)| **bits == 0)
+    {
+        return Err(ParsePrimaryHeicPropertiesError::InvalidPixiBitsPerChannel {
+            item_id,
+            channel_index,
+        });
+    }
+
+    Ok(HeicPrimaryItemProperties {
+        item_id,
+        hvcc,
+        ispe,
+        pixi,
+    })
+}
+
 /// Extract the primary AVIF (`av01`) coded payload from `iloc` extents.
 pub fn extract_primary_avif_item_data(
     input: &[u8],
@@ -2474,6 +2818,140 @@ fn parse_av1c_payload(
         initial_presentation_delay_minus_one: initial_presentation_delay_present
             .then_some(byte3 & 0x0F),
         config_obus: payload[4..].to_vec(),
+    })
+}
+
+fn parse_hvcc_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<HevcDecoderConfigurationBox, ParseHevcDecoderConfigurationBoxError> {
+    // Provenance: mirrors HEVCDecoderConfigurationRecord::parse from
+    // libheif/libheif/codecs/hevc_boxes.cc (field extraction order, masking,
+    // nal-array iteration, and tolerance for trailing bytes).
+    let mut cursor = 0_usize;
+    let configuration_version =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "configurationVersion")?;
+    if configuration_version != 1 {
+        return Err(
+            ParseHevcDecoderConfigurationBoxError::UnsupportedConfigurationVersion {
+                offset: payload_offset,
+                version: configuration_version,
+            },
+        );
+    }
+
+    let profile_byte =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "general_profile")?;
+    let general_profile_space = (profile_byte >> 6) & 0x03;
+    let general_tier_flag = (profile_byte & 0x20) != 0;
+    let general_profile_idc = profile_byte & 0x1F;
+    let general_profile_compatibility_flags = read_u32_cursor_hvcc(
+        payload,
+        &mut cursor,
+        payload_offset,
+        "general_profile_compatibility_flags",
+    )?;
+    let constraint_bytes = take_cursor_bytes_hvcc(
+        payload,
+        &mut cursor,
+        6,
+        payload_offset,
+        "general_constraint_indicator_flags",
+    )?;
+    let mut general_constraint_indicator_flags = [0_u8; 6];
+    general_constraint_indicator_flags.copy_from_slice(constraint_bytes);
+
+    let general_level_idc =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "general_level_idc")?;
+    let min_spatial_segmentation_idc = read_u16_cursor_hvcc(
+        payload,
+        &mut cursor,
+        payload_offset,
+        "min_spatial_segmentation_idc",
+    )? & 0x0FFF;
+    let parallelism_type =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "parallelism_type")? & 0x03;
+    let chroma_format =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "chroma_format")? & 0x03;
+    let bit_depth_luma =
+        (read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "bit_depth_luma")? & 0x07) + 8;
+    let bit_depth_chroma =
+        (read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "bit_depth_chroma")? & 0x07) + 8;
+    let avg_frame_rate =
+        read_u16_cursor_hvcc(payload, &mut cursor, payload_offset, "avg_frame_rate")?;
+    let temporal_byte =
+        read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "temporal_layer_flags")?;
+    let constant_frame_rate = (temporal_byte >> 6) & 0x03;
+    let num_temporal_layers = (temporal_byte >> 3) & 0x07;
+    let temporal_id_nested = (temporal_byte & 0x04) != 0;
+    let nal_length_size = (temporal_byte & 0x03) + 1;
+
+    let nal_array_count = usize::from(read_u8_cursor_hvcc(
+        payload,
+        &mut cursor,
+        payload_offset,
+        "num_of_arrays",
+    )?);
+    let mut nal_arrays = Vec::with_capacity(nal_array_count);
+    for _ in 0..nal_array_count {
+        let array_header =
+            read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "nal_array_header")?;
+        let array_completeness = (array_header & 0x40) != 0;
+        let nal_unit_type = array_header & 0x3F;
+        let nal_unit_count = usize::from(read_u16_cursor_hvcc(
+            payload,
+            &mut cursor,
+            payload_offset,
+            "nal_unit_count",
+        )?);
+        let mut nal_units = Vec::with_capacity(nal_unit_count);
+        for _ in 0..nal_unit_count {
+            let nal_unit_length = usize::from(read_u16_cursor_hvcc(
+                payload,
+                &mut cursor,
+                payload_offset,
+                "nal_unit_length",
+            )?);
+            if nal_unit_length == 0 {
+                continue;
+            }
+            let nal_unit = take_cursor_bytes_hvcc(
+                payload,
+                &mut cursor,
+                nal_unit_length,
+                payload_offset,
+                "nal_unit_data",
+            )?
+            .to_vec();
+            nal_units.push(nal_unit);
+        }
+
+        nal_arrays.push(HevcNalArray {
+            array_completeness,
+            nal_unit_type,
+            nal_units,
+        });
+    }
+
+    Ok(HevcDecoderConfigurationBox {
+        configuration_version,
+        general_profile_space,
+        general_tier_flag,
+        general_profile_idc,
+        general_profile_compatibility_flags,
+        general_constraint_indicator_flags,
+        general_level_idc,
+        min_spatial_segmentation_idc,
+        parallelism_type,
+        chroma_format,
+        bit_depth_luma,
+        bit_depth_chroma,
+        avg_frame_rate,
+        constant_frame_rate,
+        num_temporal_layers,
+        temporal_id_nested,
+        nal_length_size,
+        nal_arrays,
     })
 }
 
@@ -3255,6 +3733,59 @@ fn take_cursor_bytes_iref<'a>(
     Ok(&payload[start..end])
 }
 
+fn read_u8_cursor_hvcc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u8, ParseHevcDecoderConfigurationBoxError> {
+    let bytes = take_cursor_bytes_hvcc(payload, cursor, size_of::<u8>(), payload_offset, context)?;
+    Ok(bytes[0])
+}
+
+fn read_u16_cursor_hvcc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseHevcDecoderConfigurationBoxError> {
+    let bytes = take_cursor_bytes_hvcc(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_hvcc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseHevcDecoderConfigurationBoxError> {
+    let bytes = take_cursor_bytes_hvcc(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn take_cursor_bytes_hvcc<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseHevcDecoderConfigurationBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseHevcDecoderConfigurationBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
 fn read_u8_cursor_ipma(
     payload: &[u8],
     cursor: &mut usize,
@@ -3591,15 +4122,17 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
-        parse_primary_avif_item_properties, BoxIter, ExtractAvifItemDataError,
-        ExtractHeicItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
-        ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
+        parse_primary_avif_item_properties, parse_primary_heic_item_properties, BoxIter,
+        ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc, ItemLocationField,
+        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseFileTypeBoxError,
+        ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
         ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
         ParseItemLocationBoxError, ParseItemPropertiesBoxError,
         ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
         ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
-        ParsePrimaryAvifPropertiesError, ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError,
-        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParsePrimaryAvifPropertiesError, ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
+        ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
+        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -5462,6 +5995,96 @@ mod tests {
     }
 
     #[test]
+    fn parses_primary_heic_properties_from_item_graph() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_heic_meta(iloc, &[]);
+        let properties = parse_primary_heic_item_properties(&meta)
+            .expect("primary HEIC property parse should succeed");
+
+        assert_eq!(properties.item_id, 1);
+        assert_eq!(properties.hvcc.configuration_version, 1);
+        assert_eq!(properties.hvcc.general_profile_space, 0);
+        assert!(!properties.hvcc.general_tier_flag);
+        assert_eq!(properties.hvcc.general_profile_idc, 1);
+        assert_eq!(properties.hvcc.bit_depth_luma, 8);
+        assert_eq!(properties.hvcc.bit_depth_chroma, 8);
+        assert_eq!(properties.hvcc.nal_length_size, 4);
+        assert_eq!(properties.hvcc.nal_arrays.len(), 1);
+        assert_eq!(properties.hvcc.nal_arrays[0].nal_unit_type, 33);
+        assert_eq!(
+            properties.hvcc.nal_arrays[0].nal_units,
+            vec![vec![0x42, 0x01]]
+        );
+        assert_eq!(properties.ispe.width, 640);
+        assert_eq!(properties.ispe.height, 480);
+        assert_eq!(properties.pixi.bits_per_channel, vec![8, 8, 8]);
+    }
+
+    #[test]
+    fn rejects_primary_heic_property_parse_when_required_property_is_missing() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+        ];
+        let meta = make_primary_item_meta_with_properties(*b"hvc1", iloc, &properties, &[]);
+        let err =
+            parse_primary_heic_item_properties(&meta).expect_err("missing hvcC property must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+                item_id: 1,
+                property_type: FourCc::new(*b"hvcC"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_primary_heic_property_parse_when_property_is_duplicated() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![
+            make_hvcc_property(),
+            make_hvcc_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+        ];
+        let meta = make_primary_item_meta_with_properties(*b"hvc1", iloc, &properties, &[]);
+        let err = parse_primary_heic_item_properties(&meta)
+            .expect_err("duplicate hvcC property must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryHeicPropertiesError::DuplicateProperty {
+                item_id: 1,
+                property_type: FourCc::new(*b"hvcC"),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_av1c_parse_when_marker_bit_is_unset() {
         let av1c = make_basic_box(*b"av1C", &[0x01, 0x00, 0x00, 0x00]);
         let parsed = parse_boxes(&av1c).expect("av1C box should parse");
@@ -5474,6 +6097,23 @@ mod tests {
             ParseAv1CodecConfigurationBoxError::InvalidMarkerBit {
                 offset: BASIC_HEADER_SIZE as u64,
                 value: 0x01,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_hvcc_parse_for_unsupported_configuration_version() {
+        let hvcc = make_hvcc_property_with_configuration_version(2);
+        let parsed = parse_boxes(&hvcc).expect("hvcC box should parse");
+
+        let err = parsed[0]
+            .parse_hvcc()
+            .expect_err("unsupported hvcC configuration version must fail");
+        assert_eq!(
+            err,
+            ParseHevcDecoderConfigurationBoxError::UnsupportedConfigurationVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 2,
             }
         );
     }
@@ -5601,7 +6241,29 @@ mod tests {
     }
 
     fn make_hvcc_property() -> Vec<u8> {
-        make_basic_box(*b"hvcC", &[0x01])
+        make_hvcc_property_with_configuration_version(1)
+    }
+
+    fn make_hvcc_property_with_configuration_version(configuration_version: u8) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(configuration_version); // configurationVersion
+        payload.push(0x01); // profile_space=0, tier=0, profile_idc=1
+        payload.extend_from_slice(&0x6000_0000_u32.to_be_bytes()); // profile compatibility flags
+        payload.extend_from_slice(&[0x00; 6]); // constraint indicator flags
+        payload.push(120); // level_idc
+        payload.extend_from_slice(&0xF000_u16.to_be_bytes()); // min_spatial_segmentation_idc
+        payload.push(0xFC); // parallelism_type (masked to 0)
+        payload.push(0xFC); // chroma_format (masked to 0)
+        payload.push(0xF8); // bit_depth_luma_minus8 = 0
+        payload.push(0xF8); // bit_depth_chroma_minus8 = 0
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // avg_frame_rate
+        payload.push(0x03); // length_size_minus_one = 3 => 4-byte NAL lengths
+        payload.push(1); // numOfArrays
+        payload.push(33); // array_completeness=0, nal_unit_type=33 (SPS)
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // numNalus
+        payload.extend_from_slice(&2_u16.to_be_bytes()); // nalUnitLength
+        payload.extend_from_slice(&[0x42, 0x01]); // nalUnit bytes
+        make_basic_box(*b"hvcC", &payload)
     }
 
     fn make_av1c_property() -> Vec<u8> {
