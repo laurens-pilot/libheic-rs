@@ -5,6 +5,9 @@ const BASIC_HEADER_SIZE: usize = 8;
 const LARGE_SIZE_FIELD_SIZE: usize = 8;
 const UUID_EXTENDED_TYPE_SIZE: usize = 16;
 const UUID_BOX_TYPE: [u8; 4] = *b"uuid";
+const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
+const FTYP_FIXED_FIELDS_SIZE: usize = 8;
+const BRAND_FIELD_SIZE: usize = 4;
 
 /// Four-character box type code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -72,7 +75,56 @@ impl<'a> ParsedBox<'a> {
     pub fn parse_children(&self) -> Result<Vec<ParsedBox<'a>>, ParseBoxError> {
         self.children().collect()
     }
+
+    /// Parse this box payload as an `ftyp` box.
+    pub fn parse_ftyp(&self) -> Result<FileTypeBox, ParseFileTypeBoxError> {
+        if self.header.box_type.as_bytes() != FTYP_BOX_TYPE {
+            return Err(ParseFileTypeBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_ftyp_payload(self.payload, self.payload_offset())
+    }
 }
+
+/// Parsed `ftyp` box payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileTypeBox {
+    pub major_brand: FourCc,
+    pub minor_version: u32,
+    pub compatible_brands: Vec<FourCc>,
+}
+
+/// Errors returned when parsing an `ftyp` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseFileTypeBoxError {
+    UnexpectedBoxType { offset: u64, actual: FourCc },
+    PayloadTooSmall { offset: u64, available: usize },
+    IncompleteCompatibleBrand { offset: u64, bytes: usize },
+}
+
+impl Display for ParseFileTypeBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseFileTypeBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected ftyp box at offset {offset}, got box type {actual}"
+            ),
+            ParseFileTypeBoxError::PayloadTooSmall { offset, available } => write!(
+                f,
+                "ftyp payload too small at offset {offset} (available: {available} bytes)"
+            ),
+            ParseFileTypeBoxError::IncompleteCompatibleBrand { offset, bytes } => write!(
+                f,
+                "ftyp compatible brands field has trailing bytes at offset {offset} (remaining bytes: {bytes})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseFileTypeBoxError {}
 
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +241,42 @@ pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
 }
 
+fn parse_ftyp_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<FileTypeBox, ParseFileTypeBoxError> {
+    // Provenance: mirrors the ftyp field layout and brand iteration used in
+    // libheif/libheif/box.cc:Box_ftyp::parse.
+    if payload.len() < FTYP_FIXED_FIELDS_SIZE {
+        return Err(ParseFileTypeBoxError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+        });
+    }
+
+    let major_brand = read_fourcc(&payload[0..4]);
+    let minor_version = read_u32_be(&payload[4..8]);
+    let compatible_brand_bytes = &payload[8..];
+    let remainder = compatible_brand_bytes.len() % BRAND_FIELD_SIZE;
+    if remainder != 0 {
+        return Err(ParseFileTypeBoxError::IncompleteCompatibleBrand {
+            offset: payload_offset + FTYP_FIXED_FIELDS_SIZE as u64,
+            bytes: compatible_brand_bytes.len(),
+        });
+    }
+
+    let compatible_brands = compatible_brand_bytes
+        .chunks_exact(BRAND_FIELD_SIZE)
+        .map(read_fourcc)
+        .collect();
+
+    Ok(FileTypeBox {
+        major_brand,
+        minor_version,
+        compatible_brands,
+    })
+}
+
 fn parse_next_box(input: &[u8], offset: u64) -> Result<(ParsedBox<'_>, usize), ParseBoxError> {
     let available = input.len() as u64;
     let (header, header_len) = parse_header(input, offset, available)?;
@@ -288,6 +376,10 @@ fn read_u32_be(input: &[u8]) -> u32 {
     u32::from_be_bytes([input[0], input[1], input[2], input[3]])
 }
 
+fn read_fourcc(input: &[u8]) -> FourCc {
+    FourCc::new([input[0], input[1], input[2], input[3]])
+}
+
 fn read_u64_be(input: &[u8]) -> u64 {
     u64::from_be_bytes([
         input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
@@ -297,8 +389,8 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boxes, BoxIter, ParseBoxError, BASIC_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE,
-        UUID_EXTENDED_TYPE_SIZE,
+        parse_boxes, BoxIter, FourCc, ParseBoxError, ParseFileTypeBoxError, BASIC_HEADER_SIZE,
+        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -482,6 +574,82 @@ mod tests {
         assert_eq!(first.offset, 8);
         assert_eq!(first.payload, &meta_payload[8..]);
         assert!(children.next().is_none());
+    }
+
+    #[test]
+    fn parses_ftyp_payload_fields() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"mif1");
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(b"miaf");
+        payload.extend_from_slice(b"avif");
+        let bytes = make_basic_box(*b"ftyp", &payload);
+
+        let top_level = parse_boxes(&bytes).expect("ftyp box should parse");
+        let ftyp = top_level[0]
+            .parse_ftyp()
+            .expect("ftyp payload should parse");
+        assert_eq!(ftyp.major_brand.as_bytes(), *b"mif1");
+        assert_eq!(ftyp.minor_version, 0);
+        assert_eq!(
+            ftyp.compatible_brands,
+            vec![FourCc::new(*b"miaf"), FourCc::new(*b"avif")]
+        );
+    }
+
+    #[test]
+    fn rejects_ftyp_payload_smaller_than_fixed_fields() {
+        let bytes = make_basic_box(*b"ftyp", &[0, 1, 2, 3, 4, 5, 6]);
+        let top_level = parse_boxes(&bytes).expect("ftyp box should parse");
+
+        let err = top_level[0]
+            .parse_ftyp()
+            .expect_err("short ftyp payload must fail");
+        assert_eq!(
+            err,
+            ParseFileTypeBoxError::PayloadTooSmall {
+                offset: 8,
+                available: 7
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ftyp_payload_with_incomplete_compatible_brand() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"mif1");
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let bytes = make_basic_box(*b"ftyp", &payload);
+        let top_level = parse_boxes(&bytes).expect("ftyp box should parse");
+
+        let err = top_level[0]
+            .parse_ftyp()
+            .expect_err("incomplete compatible brand must fail");
+        assert_eq!(
+            err,
+            ParseFileTypeBoxError::IncompleteCompatibleBrand {
+                offset: 16,
+                bytes: 3
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ftyp_parse_for_non_ftyp_box() {
+        let bytes = make_basic_box(*b"free", &[0x01, 0x02, 0x03, 0x04]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_ftyp()
+            .expect_err("parsing non-ftyp as ftyp must fail");
+        assert_eq!(
+            err,
+            ParseFileTypeBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free")
+            }
+        );
     }
 
     fn make_basic_box(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
