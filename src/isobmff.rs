@@ -21,6 +21,11 @@ const AV1C_BOX_TYPE: [u8; 4] = *b"av1C";
 const HVCC_BOX_TYPE: [u8; 4] = *b"hvcC";
 const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
 const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
+const COLR_BOX_TYPE: [u8; 4] = *b"colr";
+const NCLX_COLOR_TYPE: [u8; 4] = *b"nclx";
+const NCLC_COLOR_TYPE: [u8; 4] = *b"nclc";
+const PROF_COLOR_TYPE: [u8; 4] = *b"prof";
+const RICC_COLOR_TYPE: [u8; 4] = *b"rICC";
 const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
 const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
@@ -296,6 +301,20 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_pixi_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as a `colr` property.
+    pub fn parse_colr(
+        &self,
+    ) -> Result<ColorInformationProperty, ParseColorInformationPropertyError> {
+        if self.header.box_type.as_bytes() != COLR_BOX_TYPE {
+            return Err(ParseColorInformationPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_colr_payload(self.payload, self.payload_offset())
     }
 }
 
@@ -685,6 +704,43 @@ pub struct PixelInformationProperty {
     pub bits_per_channel: Vec<u8>,
 }
 
+/// Parsed `colr` NCLX/NCLC color profile fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NclxColorProfile {
+    pub colour_primaries: u16,
+    pub transfer_characteristics: u16,
+    pub matrix_coefficients: u16,
+    pub full_range_flag: bool,
+}
+
+/// Parsed `colr` ICC profile payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IccColorProfile {
+    pub profile_type: FourCc,
+    pub profile: Vec<u8>,
+}
+
+/// Parsed `colr` payload variants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ColorInformation {
+    Nclx(NclxColorProfile),
+    Icc(IccColorProfile),
+}
+
+/// Parsed `colr` property fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColorInformationProperty {
+    pub colour_type: FourCc,
+    pub information: ColorInformation,
+}
+
+/// Aggregated primary-item color profiles from associated `colr` properties.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrimaryItemColorProperties {
+    pub nclx: Option<NclxColorProfile>,
+    pub icc: Option<IccColorProfile>,
+}
+
 /// Parsed primary AVIF properties needed before decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPrimaryItemProperties {
@@ -692,6 +748,7 @@ pub struct AvifPrimaryItemProperties {
     pub av1c: Av1CodecConfigurationBox,
     pub ispe: ImageSpatialExtentsProperty,
     pub pixi: PixelInformationProperty,
+    pub colr: PrimaryItemColorProperties,
 }
 
 /// Parsed primary HEIC properties needed before decode.
@@ -701,6 +758,7 @@ pub struct HeicPrimaryItemProperties {
     pub hvcc: HevcDecoderConfigurationBox,
     pub ispe: ImageSpatialExtentsProperty,
     pub pixi: PixelInformationProperty,
+    pub colr: PrimaryItemColorProperties,
 }
 
 /// Parsed primary HEIC properties needed for decoder preflight.
@@ -710,6 +768,7 @@ pub struct HeicPrimaryItemPreflightProperties {
     pub hvcc: HevcDecoderConfigurationBox,
     pub ispe: ImageSpatialExtentsProperty,
     pub pixi: Option<PixelInformationProperty>,
+    pub colr: PrimaryItemColorProperties,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -1673,6 +1732,54 @@ impl From<ParseFullBoxError> for ParsePixelInformationPropertyError {
     }
 }
 
+/// Errors returned when parsing a `colr` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseColorInformationPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    UnknownColourType {
+        offset: u64,
+        colour_type: FourCc,
+    },
+}
+
+impl Display for ParseColorInformationPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseColorInformationPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected colr box at offset {offset}, got box type {actual}"
+            ),
+            ParseColorInformationPropertyError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "colr payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseColorInformationPropertyError::UnknownColourType {
+                offset,
+                colour_type,
+            } => write!(
+                f,
+                "colr box at offset {offset} has unsupported colour type {colour_type}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseColorInformationPropertyError {}
+
 /// Errors returned when parsing/validating primary AVIF properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryAvifPropertiesError {
@@ -1698,6 +1805,7 @@ pub enum ParsePrimaryAvifPropertiesError {
     Av1Codec(ParseAv1CodecConfigurationBoxError),
     ImageSpatialExtents(ParseImageSpatialExtentsPropertyError),
     PixelInformation(ParsePixelInformationPropertyError),
+    ColorInformation(ParseColorInformationPropertyError),
     InvalidImageExtent {
         item_id: u32,
         width: u32,
@@ -1749,6 +1857,7 @@ impl Display for ParsePrimaryAvifPropertiesError {
             ParsePrimaryAvifPropertiesError::Av1Codec(err) => write!(f, "{err}"),
             ParsePrimaryAvifPropertiesError::ImageSpatialExtents(err) => write!(f, "{err}"),
             ParsePrimaryAvifPropertiesError::PixelInformation(err) => write!(f, "{err}"),
+            ParsePrimaryAvifPropertiesError::ColorInformation(err) => write!(f, "{err}"),
             ParsePrimaryAvifPropertiesError::InvalidImageExtent {
                 item_id,
                 width,
@@ -1784,6 +1893,7 @@ impl Error for ParsePrimaryAvifPropertiesError {
             ParsePrimaryAvifPropertiesError::Av1Codec(err) => Some(err),
             ParsePrimaryAvifPropertiesError::ImageSpatialExtents(err) => Some(err),
             ParsePrimaryAvifPropertiesError::PixelInformation(err) => Some(err),
+            ParsePrimaryAvifPropertiesError::ColorInformation(err) => Some(err),
             _ => None,
         }
     }
@@ -1814,6 +1924,7 @@ pub enum ParsePrimaryHeicPropertiesError {
     HevcCodec(ParseHevcDecoderConfigurationBoxError),
     ImageSpatialExtents(ParseImageSpatialExtentsPropertyError),
     PixelInformation(ParsePixelInformationPropertyError),
+    ColorInformation(ParseColorInformationPropertyError),
     InvalidImageExtent {
         item_id: u32,
         width: u32,
@@ -1865,6 +1976,7 @@ impl Display for ParsePrimaryHeicPropertiesError {
             ParsePrimaryHeicPropertiesError::HevcCodec(err) => write!(f, "{err}"),
             ParsePrimaryHeicPropertiesError::ImageSpatialExtents(err) => write!(f, "{err}"),
             ParsePrimaryHeicPropertiesError::PixelInformation(err) => write!(f, "{err}"),
+            ParsePrimaryHeicPropertiesError::ColorInformation(err) => write!(f, "{err}"),
             ParsePrimaryHeicPropertiesError::InvalidImageExtent {
                 item_id,
                 width,
@@ -1900,6 +2012,7 @@ impl Error for ParsePrimaryHeicPropertiesError {
             ParsePrimaryHeicPropertiesError::HevcCodec(err) => Some(err),
             ParsePrimaryHeicPropertiesError::ImageSpatialExtents(err) => Some(err),
             ParsePrimaryHeicPropertiesError::PixelInformation(err) => Some(err),
+            ParsePrimaryHeicPropertiesError::ColorInformation(err) => Some(err),
             _ => None,
         }
     }
@@ -2264,10 +2377,11 @@ pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
 pub fn parse_primary_avif_item_properties(
     input: &[u8],
 ) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
-    // Provenance: mirrors av1C/ispe/pixi parse semantics and AVIF decoder
+    // Provenance: mirrors av1C/ispe/pixi/colr parse semantics and AVIF decoder
     // preconditions from libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
     // libheif/libheif/box.cc:Box_ispe::parse, libheif/libheif/box.cc:Box_pixi::parse,
-    // and libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder.
+    // libheif/libheif/nclx.cc:Box_colr::parse, and
+    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder.
     let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
         .ok_or(ParsePrimaryAvifPropertiesError::MissingMetaBox)?;
@@ -2294,6 +2408,7 @@ pub fn parse_primary_avif_item_properties(
     let mut av1c = None;
     let mut ispe = None;
     let mut pixi = None;
+    let mut colr = PrimaryItemColorProperties::default();
 
     for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type;
@@ -2336,6 +2451,19 @@ pub fn parse_primary_avif_item_properties(
                     .parse_pixi()
                     .map_err(ParsePrimaryAvifPropertiesError::PixelInformation)?,
             );
+        } else if property_type.as_bytes() == COLR_BOX_TYPE {
+            let parsed_colr = property
+                .property
+                .parse_colr()
+                .map_err(ParsePrimaryAvifPropertiesError::ColorInformation)?;
+            match parsed_colr.information {
+                ColorInformation::Nclx(profile) => {
+                    colr.nclx = Some(profile);
+                }
+                ColorInformation::Icc(profile) => {
+                    colr.icc = Some(profile);
+                }
+            }
         }
     }
 
@@ -2382,6 +2510,7 @@ pub fn parse_primary_avif_item_properties(
         av1c,
         ispe,
         pixi,
+        colr,
     })
 }
 
@@ -2402,6 +2531,7 @@ pub fn parse_primary_heic_item_properties(
         hvcc: preflight.hvcc,
         ispe: preflight.ispe,
         pixi,
+        colr: preflight.colr,
     })
 }
 
@@ -2409,10 +2539,11 @@ pub fn parse_primary_heic_item_properties(
 pub fn parse_primary_heic_item_preflight_properties(
     input: &[u8],
 ) -> Result<HeicPrimaryItemPreflightProperties, ParsePrimaryHeicPropertiesError> {
-    // Provenance: mirrors libheif HEIC property preconditions and hvcC/ispe/pixi
+    // Provenance: mirrors libheif HEIC property preconditions and hvcC/ispe/pixi/colr
     // parse semantics from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::initialize_decoder,
     // libheif/libheif/context.cc (hvcC presence checks), libheif/libheif/codecs/hevc_boxes.cc:HEVCDecoderConfigurationRecord::parse,
-    // libheif/libheif/box.cc:Box_ispe::parse, and libheif/libheif/box.cc:Box_pixi::parse.
+    // libheif/libheif/box.cc:Box_ispe::parse, libheif/libheif/box.cc:Box_pixi::parse,
+    // and libheif/libheif/nclx.cc:Box_colr::parse.
     // HEIC preflight for decoder input accepts missing pixi when hvcC/ispe are
     // valid, matching libheif's hvcC-only decode bootstrap path.
     let top_level = parse_boxes(input).map_err(ParsePrimaryHeicPropertiesError::TopLevelBoxes)?;
@@ -2441,6 +2572,7 @@ pub fn parse_primary_heic_item_preflight_properties(
     let mut hvcc = None;
     let mut ispe = None;
     let mut pixi = None;
+    let mut colr = PrimaryItemColorProperties::default();
 
     for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type;
@@ -2483,6 +2615,19 @@ pub fn parse_primary_heic_item_preflight_properties(
                     .parse_pixi()
                     .map_err(ParsePrimaryHeicPropertiesError::PixelInformation)?,
             );
+        } else if property_type.as_bytes() == COLR_BOX_TYPE {
+            let parsed_colr = property
+                .property
+                .parse_colr()
+                .map_err(ParsePrimaryHeicPropertiesError::ColorInformation)?;
+            match parsed_colr.information {
+                ColorInformation::Nclx(profile) => {
+                    colr.nclx = Some(profile);
+                }
+                ColorInformation::Icc(profile) => {
+                    colr.icc = Some(profile);
+                }
+            }
         }
     }
 
@@ -2527,6 +2672,7 @@ pub fn parse_primary_heic_item_preflight_properties(
         hvcc,
         ispe,
         pixi,
+        colr,
     })
 }
 
@@ -3053,6 +3199,86 @@ fn parse_pixi_payload(
     Ok(PixelInformationProperty {
         full_box,
         bits_per_channel: pixi_payload[1..(1 + num_channels)].to_vec(),
+    })
+}
+
+fn parse_colr_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ColorInformationProperty, ParseColorInformationPropertyError> {
+    // Provenance: mirrors libheif/libheif/nclx.cc:Box_colr::parse handling for
+    // nclx/nclc and ICC (prof/rICC) colour profile payload variants.
+    if payload.len() < BRAND_FIELD_SIZE {
+        return Err(ParseColorInformationPropertyError::PayloadTooSmall {
+            offset: payload_offset,
+            context: "colour_type",
+            available: payload.len(),
+            required: BRAND_FIELD_SIZE,
+        });
+    }
+
+    let colour_type = read_fourcc(&payload[0..BRAND_FIELD_SIZE]);
+    let profile_payload = &payload[BRAND_FIELD_SIZE..];
+    let profile_payload_offset = payload_offset + BRAND_FIELD_SIZE as u64;
+
+    if colour_type.as_bytes() == NCLX_COLOR_TYPE {
+        let required = size_of::<u16>() * 3 + size_of::<u8>();
+        if profile_payload.len() < required {
+            return Err(ParseColorInformationPropertyError::PayloadTooSmall {
+                offset: profile_payload_offset,
+                context: "nclx_profile",
+                available: profile_payload.len(),
+                required,
+            });
+        }
+
+        return Ok(ColorInformationProperty {
+            colour_type,
+            information: ColorInformation::Nclx(NclxColorProfile {
+                colour_primaries: read_u16_be(&profile_payload[0..2]),
+                transfer_characteristics: read_u16_be(&profile_payload[2..4]),
+                matrix_coefficients: read_u16_be(&profile_payload[4..6]),
+                full_range_flag: (profile_payload[6] & 0x80) != 0,
+            }),
+        });
+    }
+
+    if colour_type.as_bytes() == NCLC_COLOR_TYPE {
+        let required = size_of::<u16>() * 3;
+        if profile_payload.len() < required {
+            return Err(ParseColorInformationPropertyError::PayloadTooSmall {
+                offset: profile_payload_offset,
+                context: "nclc_profile",
+                available: profile_payload.len(),
+                required,
+            });
+        }
+
+        let matrix_coefficients = read_u16_be(&profile_payload[4..6]);
+        return Ok(ColorInformationProperty {
+            colour_type,
+            information: ColorInformation::Nclx(NclxColorProfile {
+                colour_primaries: read_u16_be(&profile_payload[0..2]),
+                transfer_characteristics: read_u16_be(&profile_payload[2..4]),
+                matrix_coefficients,
+                full_range_flag: matrix_coefficients == 0,
+            }),
+        });
+    }
+
+    if colour_type.as_bytes() == PROF_COLOR_TYPE || colour_type.as_bytes() == RICC_COLOR_TYPE {
+        return Ok(ColorInformationProperty {
+            colour_type,
+            information: ColorInformation::Icc(IccColorProfile {
+                profile_type: colour_type,
+                profile: profile_payload.to_vec(),
+            }),
+        });
+    }
+
+    Err(ParseColorInformationPropertyError::UnknownColourType {
+        offset: payload_offset,
+        colour_type,
     })
 }
 
@@ -4152,16 +4378,17 @@ mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
         parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
-        parse_primary_heic_item_properties, BoxIter, ExtractAvifItemDataError,
-        ExtractHeicItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
-        ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
-        ParseHevcDecoderConfigurationBoxError, ParseImageSpatialExtentsPropertyError,
-        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
-        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
-        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
-        ParsePixelInformationPropertyError, ParsePrimaryAvifPropertiesError,
-        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError,
-        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        parse_primary_heic_item_properties, BoxIter, ColorInformation, ExtractAvifItemDataError,
+        ExtractHeicItemDataError, FourCc, IccColorProfile, ItemLocationField, NclxColorProfile,
+        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseColorInformationPropertyError,
+        ParseFileTypeBoxError, ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
+        ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
+        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
+        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
+        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
+        ParsePrimaryAvifPropertiesError, ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
+        PrimaryItemColorProperties, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
+        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -5968,6 +6195,7 @@ mod tests {
         assert_eq!(properties.ispe.width, 640);
         assert_eq!(properties.ispe.height, 480);
         assert_eq!(properties.pixi.bits_per_channel, vec![8, 8, 8]);
+        assert_eq!(properties.colr, PrimaryItemColorProperties::default());
     }
 
     #[test]
@@ -6055,6 +6283,7 @@ mod tests {
         assert_eq!(properties.ispe.width, 640);
         assert_eq!(properties.ispe.height, 480);
         assert_eq!(properties.pixi.bits_per_channel, vec![8, 8, 8]);
+        assert_eq!(properties.colr, PrimaryItemColorProperties::default());
     }
 
     #[test]
@@ -6078,6 +6307,77 @@ mod tests {
         assert_eq!(preflight.ispe.width, 640);
         assert_eq!(preflight.ispe.height, 480);
         assert!(preflight.pixi.is_none());
+        assert_eq!(preflight.colr, PrimaryItemColorProperties::default());
+    }
+
+    #[test]
+    fn parses_primary_item_colr_profiles_for_avif_and_heic() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let nclx = make_colr_nclx_property(1, 13, 6, false);
+        let ricc = make_colr_icc_property(*b"rICC", &[0x10, 0x20, 0x30]);
+
+        let avif_properties = vec![
+            make_av1c_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+            nclx.clone(),
+            ricc.clone(),
+        ];
+        let avif_meta = make_primary_avif_meta_with_properties(iloc.clone(), &avif_properties, &[]);
+        let avif = parse_primary_avif_item_properties(&avif_meta)
+            .expect("AVIF primary property parse should include colr profiles");
+        assert_eq!(
+            avif.colr.nclx,
+            Some(NclxColorProfile {
+                colour_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 6,
+                full_range_flag: false,
+            })
+        );
+        assert_eq!(
+            avif.colr.icc,
+            Some(IccColorProfile {
+                profile_type: FourCc::new(*b"rICC"),
+                profile: vec![0x10, 0x20, 0x30],
+            })
+        );
+
+        let heic_properties = vec![
+            make_hvcc_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+            nclx,
+            ricc,
+        ];
+        let heic_meta =
+            make_primary_item_meta_with_properties(*b"hvc1", iloc, &heic_properties, &[]);
+        let heic = parse_primary_heic_item_preflight_properties(&heic_meta)
+            .expect("HEIC primary preflight parse should include colr profiles");
+        assert_eq!(
+            heic.colr.nclx,
+            Some(NclxColorProfile {
+                colour_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 6,
+                full_range_flag: false,
+            })
+        );
+        assert_eq!(
+            heic.colr.icc,
+            Some(IccColorProfile {
+                profile_type: FourCc::new(*b"rICC"),
+                profile: vec![0x10, 0x20, 0x30],
+            })
+        );
     }
 
     #[test]
@@ -6202,6 +6502,74 @@ mod tests {
                 context: "bits_per_channel",
                 available: 2,
                 required: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_colr_nclx_and_nclc_profiles() {
+        let nclx = make_colr_nclx_property(1, 13, 6, true);
+        let parsed = parse_boxes(&nclx).expect("colr box should parse");
+        let nclx_property = parsed[0]
+            .parse_colr()
+            .expect("nclx colr property should parse");
+        assert_eq!(nclx_property.colour_type, FourCc::new(*b"nclx"));
+        assert_eq!(
+            nclx_property.information,
+            ColorInformation::Nclx(NclxColorProfile {
+                colour_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 6,
+                full_range_flag: true,
+            })
+        );
+
+        let nclc = make_colr_nclc_property(1, 13, 0);
+        let parsed = parse_boxes(&nclc).expect("colr box should parse");
+        let nclc_property = parsed[0]
+            .parse_colr()
+            .expect("nclc colr property should parse");
+        assert_eq!(nclc_property.colour_type, FourCc::new(*b"nclc"));
+        assert_eq!(
+            nclc_property.information,
+            ColorInformation::Nclx(NclxColorProfile {
+                colour_primaries: 1,
+                transfer_characteristics: 13,
+                matrix_coefficients: 0,
+                full_range_flag: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_colr_icc_payload_types() {
+        let prof = make_colr_icc_property(*b"prof", &[0xAA, 0xBB]);
+        let parsed = parse_boxes(&prof).expect("colr box should parse");
+        let property = parsed[0]
+            .parse_colr()
+            .expect("ICC colr property should parse");
+        assert_eq!(property.colour_type, FourCc::new(*b"prof"));
+        assert_eq!(
+            property.information,
+            ColorInformation::Icc(IccColorProfile {
+                profile_type: FourCc::new(*b"prof"),
+                profile: vec![0xAA, 0xBB],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_colr_parse_for_unknown_colour_type() {
+        let colr = make_basic_box(*b"colr", b"zzzz");
+        let parsed = parse_boxes(&colr).expect("colr box should parse");
+        let err = parsed[0]
+            .parse_colr()
+            .expect_err("unknown colour_type must fail");
+        assert_eq!(
+            err,
+            ParseColorInformationPropertyError::UnknownColourType {
+                offset: BASIC_HEADER_SIZE as u64,
+                colour_type: FourCc::new(*b"zzzz"),
             }
         );
     }
@@ -6347,6 +6715,41 @@ mod tests {
         payload.push(bits_per_channel.len() as u8);
         payload.extend_from_slice(bits_per_channel);
         make_basic_box(*b"pixi", &payload)
+    }
+
+    fn make_colr_nclx_property(
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+        full_range_flag: bool,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"nclx");
+        payload.extend_from_slice(&colour_primaries.to_be_bytes());
+        payload.extend_from_slice(&transfer_characteristics.to_be_bytes());
+        payload.extend_from_slice(&matrix_coefficients.to_be_bytes());
+        payload.push(if full_range_flag { 0x80 } else { 0x00 });
+        make_basic_box(*b"colr", &payload)
+    }
+
+    fn make_colr_nclc_property(
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"nclc");
+        payload.extend_from_slice(&colour_primaries.to_be_bytes());
+        payload.extend_from_slice(&transfer_characteristics.to_be_bytes());
+        payload.extend_from_slice(&matrix_coefficients.to_be_bytes());
+        make_basic_box(*b"colr", &payload)
+    }
+
+    fn make_colr_icc_property(profile_type: [u8; 4], profile: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&profile_type);
+        payload.extend_from_slice(profile);
+        make_basic_box(*b"colr", &payload)
     }
 
     fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {
