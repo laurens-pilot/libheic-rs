@@ -135,6 +135,49 @@ pub struct DecodedHeicImageMetadata {
     pub layout: HeicPixelLayout,
 }
 
+/// Classification of a parsed HEVC NAL unit for backend frame handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HevcNalClass {
+    Vcl,
+    ParameterSet,
+    AccessUnitDelimiter,
+    SupplementalEnhancementInfo,
+    Other,
+    Unknown,
+}
+
+/// One NAL unit parsed from an assembled 4-byte length-prefixed HEVC stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LengthPrefixedHevcNalUnit<'a> {
+    offset: usize,
+    bytes: &'a [u8],
+}
+
+impl<'a> LengthPrefixedHevcNalUnit<'a> {
+    fn nal_unit_type_value(self) -> Option<u8> {
+        if self.bytes.len() < 2 {
+            return None;
+        }
+
+        Some((self.bytes[0] >> 1) & 0x3f)
+    }
+
+    fn nal_unit_type(self) -> Option<NALUnitType> {
+        self.nal_unit_type_value().map(NALUnitType::from)
+    }
+
+    fn class(self) -> HevcNalClass {
+        match self.nal_unit_type_value() {
+            Some(0..=31) => HevcNalClass::Vcl,
+            Some(32..=34) => HevcNalClass::ParameterSet,
+            Some(35) => HevcNalClass::AccessUnitDelimiter,
+            Some(39 | 40) => HevcNalClass::SupplementalEnhancementInfo,
+            Some(_) => HevcNalClass::Other,
+            None => HevcNalClass::Unknown,
+        }
+    }
+}
+
 /// Errors from the AVIF decode path and internal image model conversion.
 #[derive(Debug)]
 pub enum DecodeAvifError {
@@ -544,13 +587,10 @@ fn assemble_heic_hevc_stream_from_components(
     Ok(stream)
 }
 
-fn decode_hevc_stream_metadata_from_sps(
+fn parse_length_prefixed_hevc_nal_units(
     stream: &[u8],
-) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    // Provenance: length-prefixed NAL iteration mirrors libheif's decoder
-    // plugin handoff loop in libheif/libheif/plugins/decoder_libde265.cc
-    // (libde265_v2_push_data/libde265_v1_push_data2), while SPS parsing is
-    // delegated to the pure-Rust scuffle-h265 backend.
+) -> Result<Vec<LengthPrefixedHevcNalUnit<'_>>, DecodeHeicError> {
+    let mut units = Vec::new();
     let mut cursor = 0usize;
     while cursor < stream.len() {
         let length_offset = cursor;
@@ -581,14 +621,33 @@ fn decode_hevc_stream_metadata_from_sps(
 
         let nal_offset = cursor;
         let nal_end = cursor + nal_size;
-        let nal_unit = &stream[nal_offset..nal_end];
+        units.push(LengthPrefixedHevcNalUnit {
+            offset: nal_offset,
+            bytes: &stream[nal_offset..nal_end],
+        });
         cursor = nal_end;
+    }
 
-        if !is_sps_nal_unit(nal_unit) {
+    Ok(units)
+}
+
+fn decode_hevc_stream_metadata_from_sps(
+    stream: &[u8],
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    // Provenance: length-prefixed NAL iteration mirrors libheif's decoder
+    // plugin handoff loop in libheif/libheif/plugins/decoder_libde265.cc
+    // (libde265_v2_push_data/libde265_v1_push_data2), while SPS parsing is
+    // delegated to the pure-Rust scuffle-h265 backend.
+    for nal_unit in parse_length_prefixed_hevc_nal_units(stream)? {
+        if nal_unit.class() != HevcNalClass::ParameterSet {
             continue;
         }
+        if nal_unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
+            continue;
+        }
+        let nal_offset = nal_unit.offset;
 
-        let sps_nal = SpsNALUnit::parse(std::io::Cursor::new(nal_unit)).map_err(|err| {
+        let sps_nal = SpsNALUnit::parse(std::io::Cursor::new(nal_unit.bytes)).map_err(|err| {
             DecodeHeicError::SpsParseFailed {
                 offset: nal_offset,
                 detail: err.to_string(),
@@ -624,15 +683,6 @@ fn decode_hevc_stream_metadata_from_sps(
     }
 
     Err(DecodeHeicError::MissingSpsNalUnit)
-}
-
-fn is_sps_nal_unit(nal_unit: &[u8]) -> bool {
-    if nal_unit.len() < 2 {
-        return false;
-    }
-
-    let nal_unit_type = NALUnitType::from((nal_unit[0] >> 1) & 0x3f);
-    nal_unit_type == NALUnitType::SpsNut
 }
 
 fn heic_layout_from_sps_chroma_array_type(
@@ -1560,9 +1610,11 @@ mod tests {
     use super::{
         append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
         convert_avif_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
-        decode_primary_avif_to_image, decode_primary_heic_to_metadata, AvifPixelLayout, AvifPlane,
-        AvifPlaneSamples, DecodeHeicError, DecodedAvifImage, HeicPixelLayout,
+        decode_primary_avif_to_image, decode_primary_heic_to_metadata,
+        parse_length_prefixed_hevc_nal_units, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
+        DecodeHeicError, DecodedAvifImage, HeicPixelLayout, HevcNalClass,
     };
+    use scuffle_h265::NALUnitType;
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1687,6 +1739,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_length_prefixed_hevc_nal_units_and_classifies_for_backend_handoff() {
+        let vps_nal = [0x40, 0x01, 0x01];
+        let sps_nal = [0x42, 0x01, 0x01];
+        let vcl_nal = [0x26, 0x01, 0x01];
+        let unknown_nal = [0x7E];
+        let mut stream = Vec::new();
+        for nal in [&vps_nal[..], &sps_nal[..], &vcl_nal[..], &unknown_nal[..]] {
+            stream.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            stream.extend_from_slice(nal);
+        }
+
+        let parsed = parse_length_prefixed_hevc_nal_units(&stream)
+            .expect("well-formed stream should parse into NAL units");
+        assert_eq!(parsed.len(), 4);
+
+        assert_eq!(parsed[0].offset, 4);
+        assert_eq!(parsed[0].nal_unit_type(), Some(NALUnitType::VpsNut));
+        assert_eq!(parsed[0].class(), HevcNalClass::ParameterSet);
+
+        assert_eq!(parsed[1].offset, 11);
+        assert_eq!(parsed[1].nal_unit_type(), Some(NALUnitType::SpsNut));
+        assert_eq!(parsed[1].class(), HevcNalClass::ParameterSet);
+
+        assert_eq!(parsed[2].offset, 18);
+        assert_eq!(parsed[2].class(), HevcNalClass::Vcl);
+
+        assert_eq!(parsed[3].offset, 25);
+        assert_eq!(parsed[3].nal_unit_type(), None);
+        assert_eq!(parsed[3].class(), HevcNalClass::Unknown);
+    }
+
+    #[test]
+    fn rejects_truncated_length_prefixed_hevc_stream_length_field_during_nal_parsing() {
+        let stream = vec![0x00, 0x00, 0x00];
+        let err = parse_length_prefixed_hevc_nal_units(&stream)
+            .expect_err("stream with short length prefix must fail");
+        assert!(matches!(
+            err,
+            DecodeHeicError::TruncatedLengthPrefixedStreamLength {
+                offset: 0,
+                available: 3,
+            }
+        ));
+    }
+
+    #[test]
     fn decodes_primary_heic_metadata_for_fixture_without_pixi_property() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
@@ -1717,6 +1815,21 @@ mod tests {
         let err = decode_hevc_stream_metadata_from_sps(&stream)
             .expect_err("stream without SPS NAL should fail metadata decode");
         assert!(matches!(err, DecodeHeicError::MissingSpsNalUnit));
+    }
+
+    #[test]
+    fn rejects_truncated_length_prefixed_hevc_stream_nal_unit_during_nal_parsing() {
+        let stream = vec![0x00, 0x00, 0x00, 0x03, 0x42, 0x01];
+        let err = parse_length_prefixed_hevc_nal_units(&stream)
+            .expect_err("stream with short NAL payload must fail");
+        assert!(matches!(
+            err,
+            DecodeHeicError::TruncatedLengthPrefixedStreamNalUnit {
+                offset: 4,
+                declared: 3,
+                available: 2,
+            }
+        ));
     }
 
     #[test]
