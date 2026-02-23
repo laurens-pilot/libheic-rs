@@ -374,6 +374,170 @@ impl<'a> MetaBox<'a> {
     pub fn parse_children(&self) -> Result<Vec<ParsedBox<'a>>, ParseBoxError> {
         self.children().collect()
     }
+
+    /// Resolve the primary image item graph from this `meta` payload.
+    pub fn resolve_primary_item(
+        &self,
+    ) -> Result<ResolvedPrimaryItemGraph<'a>, ResolvePrimaryItemGraphError> {
+        // Provenance: mirrors the mandatory image-structure checks and primary
+        // item/property lookups in libheif/libheif/file.cc:HeifFile::parse_heif_images
+        // and libheif/libheif/box.cc:Box_ipco::get_properties_for_item_ID.
+        let children = self.parse_children()?;
+
+        let pitm_box = find_first_child_box(&children, PITM_BOX_TYPE)
+            .cloned()
+            .ok_or(ResolvePrimaryItemGraphError::MissingRequiredBox {
+                offset: self.payload_offset,
+                box_type: FourCc::new(PITM_BOX_TYPE),
+            })?;
+        let pitm = pitm_box.parse_pitm()?;
+
+        let iloc_box = find_first_child_box(&children, ILOC_BOX_TYPE)
+            .cloned()
+            .ok_or(ResolvePrimaryItemGraphError::MissingRequiredBox {
+                offset: self.payload_offset,
+                box_type: FourCc::new(ILOC_BOX_TYPE),
+            })?;
+        let iloc = iloc_box.parse_iloc()?;
+
+        let iinf_box = find_first_child_box(&children, IINF_BOX_TYPE)
+            .cloned()
+            .ok_or(ResolvePrimaryItemGraphError::MissingRequiredBox {
+                offset: self.payload_offset,
+                box_type: FourCc::new(IINF_BOX_TYPE),
+            })?;
+        let iinf = iinf_box.parse_iinf()?;
+
+        let iprp_box = find_first_child_box(&children, IPRP_BOX_TYPE)
+            .cloned()
+            .ok_or(ResolvePrimaryItemGraphError::MissingRequiredBox {
+                offset: self.payload_offset,
+                box_type: FourCc::new(IPRP_BOX_TYPE),
+            })?;
+        let iprp = iprp_box.parse_iprp()?;
+
+        let iref = find_first_child_box(&children, IREF_BOX_TYPE)
+            .cloned()
+            .map(|child| child.parse_iref())
+            .transpose()?;
+
+        let item_id = pitm.item_id;
+        let item_info = iinf
+            .entries
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+            .cloned()
+            .ok_or(
+                ResolvePrimaryItemGraphError::PrimaryItemMissingFromItemInfo {
+                    offset: iinf_box.offset,
+                    item_id,
+                },
+            )?;
+
+        let location = iloc
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .cloned()
+            .ok_or(
+                ResolvePrimaryItemGraphError::PrimaryItemMissingFromLocations {
+                    offset: iloc_box.offset,
+                    item_id,
+                },
+            )?;
+
+        let references = iref
+            .as_ref()
+            .map(|parsed| {
+                parsed
+                    .references
+                    .iter()
+                    .filter(|reference| reference.from_item_id == item_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut flattened_properties = Vec::new();
+        for property_container in &iprp.property_containers {
+            flattened_properties.extend(property_container.properties.iter().cloned());
+        }
+
+        let mut properties = Vec::new();
+        for association_box in &iprp.associations {
+            for entry in &association_box.entries {
+                if entry.item_id != item_id {
+                    continue;
+                }
+
+                for association in &entry.associations {
+                    if association.property_index == 0 {
+                        continue;
+                    }
+
+                    let property_index = usize::from(association.property_index - 1);
+                    if property_index >= flattened_properties.len() {
+                        return Err(ResolvePrimaryItemGraphError::PropertyIndexOutOfRange {
+                            offset: iprp_box.offset,
+                            item_id,
+                            property_index: association.property_index,
+                            available: flattened_properties.len(),
+                        });
+                    }
+
+                    properties.push(ResolvedPrimaryItemProperty {
+                        essential: association.essential,
+                        property_index: association.property_index,
+                        property: flattened_properties[property_index].clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(ResolvedPrimaryItemGraph {
+            pitm,
+            iloc,
+            iinf,
+            iprp,
+            iref,
+            primary_item: ResolvedPrimaryItem {
+                item_id,
+                item_info,
+                location,
+                properties,
+                references,
+            },
+        })
+    }
+}
+
+/// Resolved primary-item property from the `meta` item-property graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedPrimaryItemProperty<'a> {
+    pub essential: bool,
+    pub property_index: u16,
+    pub property: ParsedBox<'a>,
+}
+
+/// Resolved primary image item from `meta`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedPrimaryItem<'a> {
+    pub item_id: u32,
+    pub item_info: ItemInfoEntryBox,
+    pub location: ItemLocationItem,
+    pub properties: Vec<ResolvedPrimaryItemProperty<'a>>,
+    pub references: Vec<ItemReferenceEntry>,
+}
+
+/// Resolved `meta` item/property/reference graph centered on the primary item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedPrimaryItemGraph<'a> {
+    pub pitm: PrimaryItemBox,
+    pub iloc: ItemLocationBox,
+    pub iinf: ItemInfoBox,
+    pub iprp: ItemPropertiesBox<'a>,
+    pub iref: Option<ItemReferenceBox>,
+    pub primary_item: ResolvedPrimaryItem<'a>,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -1012,6 +1176,122 @@ impl From<ParseItemPropertyAssociationBoxError> for ParseItemPropertiesBoxError 
     }
 }
 
+/// Errors returned when resolving the primary item from a parsed `meta` graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvePrimaryItemGraphError {
+    ChildBox(ParseBoxError),
+    MissingRequiredBox {
+        offset: u64,
+        box_type: FourCc,
+    },
+    PrimaryItem(ParsePrimaryItemBoxError),
+    ItemLocation(ParseItemLocationBoxError),
+    ItemInfo(ParseItemInfoBoxError),
+    ItemProperties(ParseItemPropertiesBoxError),
+    ItemReference(ParseItemReferenceBoxError),
+    PrimaryItemMissingFromItemInfo {
+        offset: u64,
+        item_id: u32,
+    },
+    PrimaryItemMissingFromLocations {
+        offset: u64,
+        item_id: u32,
+    },
+    PropertyIndexOutOfRange {
+        offset: u64,
+        item_id: u32,
+        property_index: u16,
+        available: usize,
+    },
+}
+
+impl Display for ResolvePrimaryItemGraphError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolvePrimaryItemGraphError::ChildBox(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::MissingRequiredBox { offset, box_type } => {
+                write!(f, "required meta child box {box_type} is missing at offset {offset}")
+            }
+            ResolvePrimaryItemGraphError::PrimaryItem(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::ItemLocation(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::ItemInfo(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::ItemProperties(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::ItemReference(err) => write!(f, "{err}"),
+            ResolvePrimaryItemGraphError::PrimaryItemMissingFromItemInfo { offset, item_id } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} from pitm is missing in iinf at offset {offset}"
+                )
+            }
+            ResolvePrimaryItemGraphError::PrimaryItemMissingFromLocations { offset, item_id } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} from pitm is missing in iloc at offset {offset}"
+                )
+            }
+            ResolvePrimaryItemGraphError::PropertyIndexOutOfRange {
+                offset,
+                item_id,
+                property_index,
+                available,
+            } => write!(
+                f,
+                "ipma property index {property_index} for item_ID {item_id} exceeds available ipco properties ({available}) at offset {offset}"
+            ),
+        }
+    }
+}
+
+impl Error for ResolvePrimaryItemGraphError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ResolvePrimaryItemGraphError::ChildBox(err) => Some(err),
+            ResolvePrimaryItemGraphError::PrimaryItem(err) => Some(err),
+            ResolvePrimaryItemGraphError::ItemLocation(err) => Some(err),
+            ResolvePrimaryItemGraphError::ItemInfo(err) => Some(err),
+            ResolvePrimaryItemGraphError::ItemProperties(err) => Some(err),
+            ResolvePrimaryItemGraphError::ItemReference(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParseBoxError) -> Self {
+        Self::ChildBox(value)
+    }
+}
+
+impl From<ParsePrimaryItemBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParsePrimaryItemBoxError) -> Self {
+        Self::PrimaryItem(value)
+    }
+}
+
+impl From<ParseItemLocationBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParseItemLocationBoxError) -> Self {
+        Self::ItemLocation(value)
+    }
+}
+
+impl From<ParseItemInfoBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParseItemInfoBoxError) -> Self {
+        Self::ItemInfo(value)
+    }
+}
+
+impl From<ParseItemPropertiesBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParseItemPropertiesBoxError) -> Self {
+        Self::ItemProperties(value)
+    }
+}
+
+impl From<ParseItemReferenceBoxError> for ResolvePrimaryItemGraphError {
+    fn from(value: ParseItemReferenceBoxError) -> Self {
+        Self::ItemReference(value)
+    }
+}
+
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseBoxError {
@@ -1125,6 +1405,15 @@ impl<'a> Iterator for BoxIter<'a> {
 /// Parse all top-level boxes from an input slice.
 pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
+}
+
+fn find_first_child_box<'a, 'b>(
+    children: &'b [ParsedBox<'a>],
+    box_type: [u8; 4],
+) -> Option<&'b ParsedBox<'a>> {
+    children
+        .iter()
+        .find(|child| child.header.box_type.as_bytes() == box_type)
 }
 
 fn parse_ftyp_payload(
@@ -2172,8 +2461,9 @@ mod tests {
         ParseFullBoxError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
         ParseItemLocationBoxError, ParseItemPropertiesBoxError,
         ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
-        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE,
-        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError,
+        ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
+        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -3509,6 +3799,249 @@ mod tests {
                 available: 12,
             })
         );
+    }
+
+    #[test]
+    fn resolves_meta_primary_item_graph() {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(b"primary\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let iinf = make_basic_box(*b"iinf", &iinf_payload);
+
+        let ispe = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
+        let pixi = make_basic_box(*b"pixi", &[0x08, 0x08, 0x08]);
+        let mut ipco_payload = Vec::new();
+        ipco_payload.extend_from_slice(&ispe);
+        ipco_payload.extend_from_slice(&pixi);
+        let ipco = make_basic_box(*b"ipco", &ipco_payload);
+
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        ipma_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        ipma_payload.push(2); // association_count
+        ipma_payload.push(0x81); // essential=true, property_index=1
+        ipma_payload.push(0x02); // essential=false, property_index=2
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        let iprp = make_basic_box(*b"iprp", &iprp_payload);
+
+        let mut dimg_payload = Vec::new();
+        dimg_payload.extend_from_slice(&1_u16.to_be_bytes()); // from_item_ID
+        dimg_payload.extend_from_slice(&1_u16.to_be_bytes()); // reference_count
+        dimg_payload.extend_from_slice(&2_u16.to_be_bytes()); // to_item_ID[0]
+        let dimg = make_basic_box(*b"dimg", &dimg_payload);
+
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iref_payload.extend_from_slice(&dimg);
+        let iref = make_basic_box(*b"iref", &iref_payload);
+
+        let meta = make_meta_box(&[pitm, iloc, iinf, iprp, iref]);
+        let top_level = parse_boxes(&meta).expect("meta box should parse");
+
+        let parsed_meta = top_level[0].parse_meta().expect("meta should parse");
+        let resolved = parsed_meta
+            .resolve_primary_item()
+            .expect("meta primary resolver should succeed");
+        assert_eq!(resolved.pitm.item_id, 1);
+        assert_eq!(resolved.primary_item.item_id, 1);
+        assert_eq!(
+            resolved.primary_item.item_info.item_type,
+            Some(FourCc::new(*b"av01"))
+        );
+        assert_eq!(resolved.primary_item.location.item_id, 1);
+        assert_eq!(resolved.primary_item.properties.len(), 2);
+        assert!(resolved.primary_item.properties[0].essential);
+        assert_eq!(resolved.primary_item.properties[0].property_index, 1);
+        assert_eq!(
+            resolved.primary_item.properties[0]
+                .property
+                .header
+                .box_type
+                .as_bytes(),
+            *b"ispe"
+        );
+        assert!(!resolved.primary_item.properties[1].essential);
+        assert_eq!(resolved.primary_item.properties[1].property_index, 2);
+        assert_eq!(
+            resolved.primary_item.properties[1]
+                .property
+                .header
+                .box_type
+                .as_bytes(),
+            *b"pixi"
+        );
+        assert_eq!(resolved.primary_item.references.len(), 1);
+        assert_eq!(
+            resolved.primary_item.references[0].reference_type,
+            FourCc::new(*b"dimg")
+        );
+        assert_eq!(resolved.primary_item.references[0].to_item_ids, vec![2]);
+    }
+
+    #[test]
+    fn rejects_meta_primary_resolution_when_required_box_is_missing() {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let meta = make_meta_box(&[pitm]);
+        let top_level = parse_boxes(&meta).expect("meta box should parse");
+        let parsed_meta = top_level[0].parse_meta().expect("meta should parse");
+
+        let err = parsed_meta
+            .resolve_primary_item()
+            .expect_err("missing iloc must fail");
+        assert_eq!(
+            err,
+            ResolvePrimaryItemGraphError::MissingRequiredBox {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                box_type: FourCc::new(*b"iloc"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_meta_primary_resolution_when_pitm_item_is_missing_from_iinf() {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&2_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID (different from pitm)
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(b"other\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let iinf = make_basic_box(*b"iinf", &iinf_payload);
+
+        let property = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
+        let ipco = make_basic_box(*b"ipco", &property);
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        ipma_payload.extend_from_slice(&2_u16.to_be_bytes()); // item_ID
+        ipma_payload.push(1); // association_count
+        ipma_payload.push(0x01); // property_index=1
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        let iprp = make_basic_box(*b"iprp", &iprp_payload);
+
+        let meta = make_meta_box(&[pitm, iloc, iinf, iprp]);
+        let top_level = parse_boxes(&meta).expect("meta box should parse");
+        let parsed_meta = top_level[0].parse_meta().expect("meta should parse");
+
+        let err = parsed_meta
+            .resolve_primary_item()
+            .expect_err("pitm item_ID missing from iinf must fail");
+        assert!(matches!(
+            err,
+            ResolvePrimaryItemGraphError::PrimaryItemMissingFromItemInfo { item_id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_meta_primary_resolution_when_property_index_is_out_of_range() {
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(b"primary\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let iinf = make_basic_box(*b"iinf", &iinf_payload);
+
+        let property = make_basic_box(*b"ispe", &[0x00, 0x00, 0x00, 0x00]);
+        let ipco = make_basic_box(*b"ipco", &property);
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&1_u32.to_be_bytes()); // entry_count
+        ipma_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        ipma_payload.push(1); // association_count
+        ipma_payload.push(0x02); // property_index=2 (out of range)
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        let iprp = make_basic_box(*b"iprp", &iprp_payload);
+
+        let meta = make_meta_box(&[pitm, iloc, iinf, iprp]);
+        let top_level = parse_boxes(&meta).expect("meta box should parse");
+        let parsed_meta = top_level[0].parse_meta().expect("meta should parse");
+
+        let err = parsed_meta
+            .resolve_primary_item()
+            .expect_err("invalid property index must fail");
+        assert!(matches!(
+            err,
+            ResolvePrimaryItemGraphError::PropertyIndexOutOfRange {
+                item_id: 1,
+                property_index: 2,
+                available: 1,
+                ..
+            }
+        ));
+    }
+
+    fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        for child in children {
+            payload.extend_from_slice(child);
+        }
+        make_basic_box(*b"meta", &payload)
     }
 
     fn make_basic_box(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
