@@ -12,6 +12,7 @@ const PITM_BOX_TYPE: [u8; 4] = *b"pitm";
 const ILOC_BOX_TYPE: [u8; 4] = *b"iloc";
 const IINF_BOX_TYPE: [u8; 4] = *b"iinf";
 const INFE_BOX_TYPE: [u8; 4] = *b"infe";
+const IREF_BOX_TYPE: [u8; 4] = *b"iref";
 const IPRP_BOX_TYPE: [u8; 4] = *b"iprp";
 const IPCO_BOX_TYPE: [u8; 4] = *b"ipco";
 const IPMA_BOX_TYPE: [u8; 4] = *b"ipma";
@@ -181,6 +182,18 @@ impl<'a> ParsedBox<'a> {
         parse_iinf_payload(self.payload, self.payload_offset())
     }
 
+    /// Parse this box payload as an `iref` box.
+    pub fn parse_iref(&self) -> Result<ItemReferenceBox, ParseItemReferenceBoxError> {
+        if self.header.box_type.as_bytes() != IREF_BOX_TYPE {
+            return Err(ParseItemReferenceBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_iref_payload(self.payload, self.payload_offset())
+    }
+
     /// Parse this box payload as an `ipco` box.
     pub fn parse_ipco(
         &self,
@@ -293,6 +306,21 @@ pub struct ItemInfoBox {
     pub full_box: FullBoxHeader,
     pub item_count: u32,
     pub entries: Vec<ItemInfoEntryBox>,
+}
+
+/// Parsed single `iref` typed edge fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemReferenceEntry {
+    pub reference_type: FourCc,
+    pub from_item_id: u32,
+    pub to_item_ids: Vec<u32>,
+}
+
+/// Parsed `iref` (item reference) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemReferenceBox {
+    pub full_box: FullBoxHeader,
+    pub references: Vec<ItemReferenceEntry>,
 }
 
 /// Parsed `ipma` property association entry fields.
@@ -744,6 +772,86 @@ impl From<ParseBoxError> for ParseItemInfoBoxError {
 impl From<ParseItemInfoEntryBoxError> for ParseItemInfoBoxError {
     fn from(value: ParseItemInfoEntryBoxError) -> Self {
         Self::Entry(value)
+    }
+}
+
+/// Errors returned when parsing an `iref` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemReferenceBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    ChildBox(ParseBoxError),
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    EmptyReferenceList {
+        offset: u64,
+        reference_type: FourCc,
+    },
+}
+
+impl Display for ParseItemReferenceBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemReferenceBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected iref box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemReferenceBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseItemReferenceBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "iref box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParseItemReferenceBoxError::ChildBox(err) => write!(f, "{err}"),
+            ParseItemReferenceBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "iref payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseItemReferenceBoxError::EmptyReferenceList {
+                offset,
+                reference_type,
+            } => write!(
+                f,
+                "iref typed reference box {reference_type} has zero references at offset {offset}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseItemReferenceBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemReferenceBoxError::FullBox(err) => Some(err),
+            ParseItemReferenceBoxError::ChildBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseItemReferenceBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+impl From<ParseBoxError> for ParseItemReferenceBoxError {
+    fn from(value: ParseBoxError) -> Self {
+        Self::ChildBox(value)
     }
 }
 
@@ -1417,6 +1525,73 @@ fn parse_iinf_payload(
     })
 }
 
+fn parse_iref_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ItemReferenceBox, ParseItemReferenceBoxError> {
+    // Provenance: mirrors iref parsing in libheif/libheif/box.cc:Box_iref::parse,
+    // where versions 0/1 are supported, each typed child box carries one
+    // from_item_ID, a 16-bit reference count, and that many to_item_ID values
+    // using ID width selected by the iref version.
+    let (full_box, iref_payload, iref_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version > 1 {
+        return Err(ParseItemReferenceBoxError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    let children =
+        BoxIter::with_offset(iref_payload, iref_payload_offset).collect::<Result<Vec<_>, _>>()?;
+
+    let mut references = Vec::with_capacity(children.len());
+    for child in children {
+        let mut cursor = 0_usize;
+        let from_item_id = read_item_id_cursor_iref(
+            child.payload,
+            &mut cursor,
+            child.payload_offset(),
+            full_box.version,
+            "from_item_ID",
+        )?;
+        let reference_count = read_u16_cursor_iref(
+            child.payload,
+            &mut cursor,
+            child.payload_offset(),
+            "reference_count",
+        )?;
+        if reference_count == 0 {
+            return Err(ParseItemReferenceBoxError::EmptyReferenceList {
+                offset: child.payload_offset() + cursor as u64 - size_of::<u16>() as u64,
+                reference_type: child.header.box_type,
+            });
+        }
+
+        let mut to_item_ids = Vec::with_capacity(usize::from(reference_count));
+        for _ in 0..reference_count {
+            to_item_ids.push(read_item_id_cursor_iref(
+                child.payload,
+                &mut cursor,
+                child.payload_offset(),
+                full_box.version,
+                "to_item_ID",
+            )?);
+        }
+
+        references.push(ItemReferenceEntry {
+            reference_type: child.header.box_type,
+            from_item_id,
+            to_item_ids,
+        });
+    }
+
+    Ok(ItemReferenceBox {
+        full_box,
+        references,
+    })
+}
+
 fn parse_ipco_payload<'a>(
     payload: &'a [u8],
     payload_offset: u64,
@@ -1594,6 +1769,68 @@ fn iloc_field_context(field: ItemLocationField) -> &'static str {
         ItemLocationField::BaseOffset => "base_offset",
         ItemLocationField::Index => "extent_index",
     }
+}
+
+fn read_item_id_cursor_iref(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    version: u8,
+    context: &'static str,
+) -> Result<u32, ParseItemReferenceBoxError> {
+    if version == 0 {
+        Ok(u32::from(read_u16_cursor_iref(
+            payload,
+            cursor,
+            payload_offset,
+            context,
+        )?))
+    } else {
+        read_u32_cursor_iref(payload, cursor, payload_offset, context)
+    }
+}
+
+fn read_u16_cursor_iref(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseItemReferenceBoxError> {
+    let bytes = take_cursor_bytes_iref(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_iref(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseItemReferenceBoxError> {
+    let bytes = take_cursor_bytes_iref(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn take_cursor_bytes_iref<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseItemReferenceBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseItemReferenceBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
 }
 
 fn read_u8_cursor_ipma(
@@ -1935,8 +2172,8 @@ mod tests {
         ParseFullBoxError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
         ParseItemLocationBoxError, ParseItemPropertiesBoxError,
         ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
-        ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
-        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE,
+        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -2868,6 +3105,151 @@ mod tests {
                 context: "item_count",
                 available: 2,
                 required: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_iref_version_zero_typed_references() {
+        let mut dimg_payload = Vec::new();
+        dimg_payload.extend_from_slice(&0x0002_u16.to_be_bytes()); // from_item_ID
+        dimg_payload.extend_from_slice(&2_u16.to_be_bytes()); // reference_count
+        dimg_payload.extend_from_slice(&0x0010_u16.to_be_bytes()); // to_item_ID[0]
+        dimg_payload.extend_from_slice(&0x0011_u16.to_be_bytes()); // to_item_ID[1]
+        let dimg = make_basic_box(*b"dimg", &dimg_payload);
+
+        let mut thmb_payload = Vec::new();
+        thmb_payload.extend_from_slice(&0x0002_u16.to_be_bytes()); // from_item_ID
+        thmb_payload.extend_from_slice(&1_u16.to_be_bytes()); // reference_count
+        thmb_payload.extend_from_slice(&0x0005_u16.to_be_bytes()); // to_item_ID[0]
+        let thmb = make_basic_box(*b"thmb", &thmb_payload);
+
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iref_payload.extend_from_slice(&dimg);
+        iref_payload.extend_from_slice(&thmb);
+        let bytes = make_basic_box(*b"iref", &iref_payload);
+        let top_level = parse_boxes(&bytes).expect("iref box should parse");
+
+        let iref = top_level[0]
+            .parse_iref()
+            .expect("iref v0 payload should parse");
+        assert_eq!(iref.full_box.version, 0);
+        assert_eq!(iref.references.len(), 2);
+        assert_eq!(iref.references[0].reference_type, FourCc::new(*b"dimg"));
+        assert_eq!(iref.references[0].from_item_id, 2);
+        assert_eq!(iref.references[0].to_item_ids, vec![16, 17]);
+        assert_eq!(iref.references[1].reference_type, FourCc::new(*b"thmb"));
+        assert_eq!(iref.references[1].from_item_id, 2);
+        assert_eq!(iref.references[1].to_item_ids, vec![5]);
+    }
+
+    #[test]
+    fn parses_iref_version_one_with_u32_item_ids() {
+        let mut auxl_payload = Vec::new();
+        auxl_payload.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // from_item_ID
+        auxl_payload.extend_from_slice(&1_u16.to_be_bytes()); // reference_count
+        auxl_payload.extend_from_slice(&0x5566_7788_u32.to_be_bytes()); // to_item_ID[0]
+        let auxl = make_basic_box(*b"auxl", &auxl_payload);
+
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        iref_payload.extend_from_slice(&auxl);
+        let bytes = make_basic_box(*b"iref", &iref_payload);
+        let top_level = parse_boxes(&bytes).expect("iref box should parse");
+
+        let iref = top_level[0]
+            .parse_iref()
+            .expect("iref v1 payload should parse");
+        assert_eq!(iref.full_box.version, 1);
+        assert_eq!(iref.references.len(), 1);
+        assert_eq!(iref.references[0].reference_type, FourCc::new(*b"auxl"));
+        assert_eq!(iref.references[0].from_item_id, 0x1122_3344);
+        assert_eq!(iref.references[0].to_item_ids, vec![0x5566_7788]);
+    }
+
+    #[test]
+    fn rejects_iref_parse_for_non_iref_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_iref()
+            .expect_err("parsing non-iref as iref must fail");
+        assert_eq!(
+            err,
+            ParseItemReferenceBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iref_parse_for_unsupported_version() {
+        let bytes = make_basic_box(*b"iref", &[0x02, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("iref box should parse");
+
+        let err = top_level[0]
+            .parse_iref()
+            .expect_err("unsupported iref version must fail");
+        assert_eq!(
+            err,
+            ParseItemReferenceBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iref_parse_when_reference_target_id_is_truncated() {
+        let mut dimg_payload = Vec::new();
+        dimg_payload.extend_from_slice(&0x0002_u16.to_be_bytes()); // from_item_ID
+        dimg_payload.extend_from_slice(&1_u16.to_be_bytes()); // reference_count
+        let dimg = make_basic_box(*b"dimg", &dimg_payload);
+
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iref_payload.extend_from_slice(&dimg);
+        let bytes = make_basic_box(*b"iref", &iref_payload);
+        let top_level = parse_boxes(&bytes).expect("iref box should parse");
+
+        let err = top_level[0]
+            .parse_iref()
+            .expect_err("truncated to_item_ID must fail");
+        assert_eq!(
+            err,
+            ParseItemReferenceBoxError::PayloadTooSmall {
+                offset: 24,
+                context: "to_item_ID",
+                available: 0,
+                required: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iref_parse_when_reference_count_is_zero() {
+        let mut dimg_payload = Vec::new();
+        dimg_payload.extend_from_slice(&0x0002_u16.to_be_bytes()); // from_item_ID
+        dimg_payload.extend_from_slice(&0_u16.to_be_bytes()); // reference_count (invalid)
+        let dimg = make_basic_box(*b"dimg", &dimg_payload);
+
+        let mut iref_payload = Vec::new();
+        iref_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iref_payload.extend_from_slice(&dimg);
+        let bytes = make_basic_box(*b"iref", &iref_payload);
+        let top_level = parse_boxes(&bytes).expect("iref box should parse");
+
+        let err = top_level[0]
+            .parse_iref()
+            .expect_err("zero reference_count must fail");
+        assert_eq!(
+            err,
+            ParseItemReferenceBoxError::EmptyReferenceList {
+                offset: 22,
+                reference_type: FourCc::new(*b"dimg"),
             }
         );
     }
