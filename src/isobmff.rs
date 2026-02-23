@@ -703,6 +703,15 @@ pub struct HeicPrimaryItemProperties {
     pub pixi: PixelInformationProperty,
 }
 
+/// Parsed primary HEIC properties needed for decoder preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeicPrimaryItemPreflightProperties {
+    pub item_id: u32,
+    pub hvcc: HevcDecoderConfigurationBox,
+    pub ispe: ImageSpatialExtentsProperty,
+    pub pixi: Option<PixelInformationProperty>,
+}
+
 /// Errors returned when parsing an `ftyp` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseFileTypeBoxError {
@@ -2380,10 +2389,32 @@ pub fn parse_primary_avif_item_properties(
 pub fn parse_primary_heic_item_properties(
     input: &[u8],
 ) -> Result<HeicPrimaryItemProperties, ParsePrimaryHeicPropertiesError> {
+    let preflight = parse_primary_heic_item_preflight_properties(input)?;
+    let pixi = preflight
+        .pixi
+        .ok_or(ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+            item_id: preflight.item_id,
+            property_type: FourCc::new(PIXI_BOX_TYPE),
+        })?;
+
+    Ok(HeicPrimaryItemProperties {
+        item_id: preflight.item_id,
+        hvcc: preflight.hvcc,
+        ispe: preflight.ispe,
+        pixi,
+    })
+}
+
+/// Parse and validate primary HEIC properties used by decode preflight.
+pub fn parse_primary_heic_item_preflight_properties(
+    input: &[u8],
+) -> Result<HeicPrimaryItemPreflightProperties, ParsePrimaryHeicPropertiesError> {
     // Provenance: mirrors libheif HEIC property preconditions and hvcC/ispe/pixi
     // parse semantics from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::initialize_decoder,
     // libheif/libheif/context.cc (hvcC presence checks), libheif/libheif/codecs/hevc_boxes.cc:HEVCDecoderConfigurationRecord::parse,
     // libheif/libheif/box.cc:Box_ispe::parse, and libheif/libheif/box.cc:Box_pixi::parse.
+    // HEIC preflight for decoder input accepts missing pixi when hvcC/ispe are
+    // valid, matching libheif's hvcC-only decode bootstrap path.
     let top_level = parse_boxes(input).map_err(ParsePrimaryHeicPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
         .ok_or(ParsePrimaryHeicPropertiesError::MissingMetaBox)?;
@@ -2463,10 +2494,6 @@ pub fn parse_primary_heic_item_properties(
         item_id,
         property_type: FourCc::new(ISPE_BOX_TYPE),
     })?;
-    let pixi = pixi.ok_or(ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
-        item_id,
-        property_type: FourCc::new(PIXI_BOX_TYPE),
-    })?;
 
     if ispe.width == 0 || ispe.height == 0 {
         return Err(ParsePrimaryHeicPropertiesError::InvalidImageExtent {
@@ -2475,25 +2502,27 @@ pub fn parse_primary_heic_item_properties(
             height: ispe.height,
         });
     }
-    if pixi.bits_per_channel.is_empty() {
-        return Err(ParsePrimaryHeicPropertiesError::InvalidPixiChannelCount {
-            item_id,
-            channel_count: 0,
-        });
-    }
-    if let Some((channel_index, _)) = pixi
-        .bits_per_channel
-        .iter()
-        .enumerate()
-        .find(|(_, bits)| **bits == 0)
-    {
-        return Err(ParsePrimaryHeicPropertiesError::InvalidPixiBitsPerChannel {
-            item_id,
-            channel_index,
-        });
+    if let Some(pixi) = &pixi {
+        if pixi.bits_per_channel.is_empty() {
+            return Err(ParsePrimaryHeicPropertiesError::InvalidPixiChannelCount {
+                item_id,
+                channel_count: 0,
+            });
+        }
+        if let Some((channel_index, _)) = pixi
+            .bits_per_channel
+            .iter()
+            .enumerate()
+            .find(|(_, bits)| **bits == 0)
+        {
+            return Err(ParsePrimaryHeicPropertiesError::InvalidPixiBitsPerChannel {
+                item_id,
+                channel_index,
+            });
+        }
     }
 
-    Ok(HeicPrimaryItemProperties {
+    Ok(HeicPrimaryItemPreflightProperties {
         item_id,
         hvcc,
         ispe,
@@ -4122,17 +4151,17 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
-        parse_primary_avif_item_properties, parse_primary_heic_item_properties, BoxIter,
-        ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc, ItemLocationField,
-        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseFileTypeBoxError,
-        ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
-        ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
-        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
-        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
-        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
-        ParsePrimaryAvifPropertiesError, ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
-        ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
-        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
+        parse_primary_heic_item_properties, BoxIter, ExtractAvifItemDataError,
+        ExtractHeicItemDataError, FourCc, ItemLocationField, ParseAv1CodecConfigurationBoxError,
+        ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseHevcDecoderConfigurationBoxError, ParseImageSpatialExtentsPropertyError,
+        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
+        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
+        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
+        ParsePixelInformationPropertyError, ParsePrimaryAvifPropertiesError,
+        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError, ResolvePrimaryItemGraphError,
+        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -6026,6 +6055,29 @@ mod tests {
         assert_eq!(properties.ispe.width, 640);
         assert_eq!(properties.ispe.height, 480);
         assert_eq!(properties.pixi.bits_per_channel, vec![8, 8, 8]);
+    }
+
+    #[test]
+    fn parses_primary_heic_preflight_properties_without_pixi() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![make_hvcc_property(), make_ispe_property(640, 480)];
+        let meta = make_primary_item_meta_with_properties(*b"hvc1", iloc, &properties, &[]);
+        let preflight = parse_primary_heic_item_preflight_properties(&meta)
+            .expect("missing pixi should still parse for HEIC decoder preflight");
+
+        assert_eq!(preflight.item_id, 1);
+        assert_eq!(preflight.hvcc.nal_length_size, 4);
+        assert_eq!(preflight.ispe.width, 640);
+        assert_eq!(preflight.ispe.height, 480);
+        assert!(preflight.pixi.is_none());
     }
 
     #[test]

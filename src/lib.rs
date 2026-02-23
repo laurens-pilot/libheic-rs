@@ -503,18 +503,18 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
     // libheif/libheif/codecs/hevc_dec.cc:Decoder_HEVC::read_bitstream_configuration_data,
     // with hvcC header NAL packing semantics from
     // libheif/libheif/codecs/hevc_boxes.cc:Box_hvcC::get_header_nals.
-    let properties = isobmff::parse_primary_heic_item_properties(input)?;
+    let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
-    assemble_heic_hevc_stream_from_components(&properties, &item_data.payload)
+    assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)
 }
 
 /// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    let properties = isobmff::parse_primary_heic_item_properties(input)?;
+    let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
-    let stream = assemble_heic_hevc_stream_from_components(&properties, &item_data.payload)?;
+    let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
     let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
 
     if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
@@ -530,16 +530,16 @@ pub fn decode_primary_heic_to_metadata(
 }
 
 fn assemble_heic_hevc_stream_from_components(
-    properties: &isobmff::HeicPrimaryItemProperties,
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
 ) -> Result<Vec<u8>, DecodeHeicError> {
-    let nal_length_size = properties.hvcc.nal_length_size;
+    let nal_length_size = hvcc.nal_length_size;
     if !(1..=4).contains(&nal_length_size) {
         return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
     }
 
     let mut stream = Vec::new();
-    append_hvcc_header_nals(&properties.hvcc.nal_arrays, &mut stream)?;
+    append_hvcc_header_nals(&hvcc.nal_arrays, &mut stream)?;
     append_normalized_hevc_payload_nals(payload, usize::from(nal_length_size), &mut stream)?;
     Ok(stream)
 }
@@ -1653,22 +1653,21 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_pixi_when_assembling_primary_heic_stream_for_fixture() {
+    fn assembles_primary_heic_stream_for_fixture_without_pixi_property() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../libheif/fuzzing/data/corpus/colors-no-alpha.heic");
         let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
 
-        let err = assemble_primary_heic_hevc_stream(&input)
-            .expect_err("fixture without pixi should currently fail HEIC preflight");
-        assert!(matches!(
-            err,
-            DecodeHeicError::ParsePrimaryProperties(
-                crate::isobmff::ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
-                    property_type,
-                    ..
-                }
-            ) if property_type.as_bytes() == *b"pixi"
-        ));
+        let stream = assemble_primary_heic_hevc_stream(&input)
+            .expect("fixture without pixi should still assemble a decoder stream");
+        assert!(
+            !stream.is_empty(),
+            "assembled HEIC stream should not be empty"
+        );
+        let metadata = decode_hevc_stream_metadata_from_sps(&stream)
+            .expect("assembled stream should expose SPS metadata");
+        assert!(metadata.width > 0);
+        assert!(metadata.height > 0);
     }
 
     #[test]
@@ -1688,22 +1687,23 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_pixi_when_decoding_primary_heic_metadata_for_fixture() {
+    fn decodes_primary_heic_metadata_for_fixture_without_pixi_property() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
         let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+        let preflight = crate::isobmff::parse_primary_heic_item_preflight_properties(&input)
+            .expect("HEIC preflight should parse fixture even without pixi");
+        assert!(
+            preflight.pixi.is_none(),
+            "fixture should exercise missing-pixi preflight path"
+        );
 
-        let err = decode_primary_heic_to_metadata(&input)
-            .expect_err("fixture without pixi should still fail strict HEIC preflight");
-        assert!(matches!(
-            err,
-            DecodeHeicError::ParsePrimaryProperties(
-                crate::isobmff::ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
-                    property_type,
-                    ..
-                }
-            ) if property_type.as_bytes() == *b"pixi"
-        ));
+        let metadata = decode_primary_heic_to_metadata(&input)
+            .expect("fixture without pixi should still decode HEIC SPS metadata");
+        assert_eq!(metadata.width, preflight.ispe.width);
+        assert_eq!(metadata.height, preflight.ispe.height);
+        assert!(metadata.bit_depth_luma >= 8);
+        assert!(metadata.bit_depth_chroma >= 8);
     }
 
     #[test]
