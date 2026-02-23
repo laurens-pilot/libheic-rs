@@ -9,6 +9,7 @@ const UUID_BOX_TYPE: [u8; 4] = *b"uuid";
 const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
 const META_BOX_TYPE: [u8; 4] = *b"meta";
 const PITM_BOX_TYPE: [u8; 4] = *b"pitm";
+const ILOC_BOX_TYPE: [u8; 4] = *b"iloc";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -136,6 +137,18 @@ impl<'a> ParsedBox<'a> {
 
         parse_pitm_payload(self.payload, self.payload_offset())
     }
+
+    /// Parse this box payload as an `iloc` box.
+    pub fn parse_iloc(&self) -> Result<ItemLocationBox, ParseItemLocationBoxError> {
+        if self.header.box_type.as_bytes() != ILOC_BOX_TYPE {
+            return Err(ParseItemLocationBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_iloc_payload(self.payload, self.payload_offset())
+    }
 }
 
 /// Parsed `ftyp` box payload fields.
@@ -158,6 +171,35 @@ pub struct FullBoxHeader {
 pub struct PrimaryItemBox {
     pub full_box: FullBoxHeader,
     pub item_id: u32,
+}
+
+/// Parsed `iloc` extent entry fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItemLocationExtent {
+    pub index: u64,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// Parsed `iloc` item entry fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemLocationItem {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub data_reference_index: u16,
+    pub base_offset: u64,
+    pub extents: Vec<ItemLocationExtent>,
+}
+
+/// Parsed `iloc` payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemLocationBox {
+    pub full_box: FullBoxHeader,
+    pub offset_size: u8,
+    pub length_size: u8,
+    pub base_offset_size: u8,
+    pub index_size: u8,
+    pub items: Vec<ItemLocationItem>,
 }
 
 /// Parsed `meta` payload fields.
@@ -320,6 +362,99 @@ impl Error for ParsePrimaryItemBoxError {
 }
 
 impl From<ParseFullBoxError> for ParsePrimaryItemBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Size descriptor fields in an `iloc` box header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemLocationField {
+    Offset,
+    Length,
+    BaseOffset,
+    Index,
+}
+
+impl Display for ItemLocationField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemLocationField::Offset => write!(f, "offset"),
+            ItemLocationField::Length => write!(f, "length"),
+            ItemLocationField::BaseOffset => write!(f, "base_offset"),
+            ItemLocationField::Index => write!(f, "index"),
+        }
+    }
+}
+
+/// Errors returned when parsing an `iloc` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemLocationBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    UnsupportedFieldSize {
+        offset: u64,
+        field: ItemLocationField,
+        size: u8,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseItemLocationBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemLocationBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected iloc box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemLocationBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseItemLocationBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "iloc box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParseItemLocationBoxError::UnsupportedFieldSize {
+                offset,
+                field,
+                size,
+            } => write!(
+                f,
+                "iloc {field}_size field has unsupported size {size} at offset {offset}"
+            ),
+            ParseItemLocationBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "iloc payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseItemLocationBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemLocationBoxError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseItemLocationBoxError {
     fn from(value: ParseFullBoxError) -> Self {
         Self::FullBox(value)
     }
@@ -545,6 +680,258 @@ fn parse_pitm_payload(
     Ok(PrimaryItemBox { full_box, item_id })
 }
 
+fn parse_iloc_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ItemLocationBox, ParseItemLocationBoxError> {
+    // Provenance: mirrors iloc parsing flow in libheif/libheif/box.cc:Box_iloc::parse
+    // (supported versions, size descriptor fields, per-item records, and extents)
+    // while adding explicit field-size validation and truncation errors.
+    let (full_box, iloc_payload, iloc_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version > 2 {
+        return Err(ParseItemLocationBoxError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    let mut cursor = 0_usize;
+    let size_fields = read_u16_cursor(
+        iloc_payload,
+        &mut cursor,
+        iloc_payload_offset,
+        "size descriptor",
+    )?;
+    let offset_size = ((size_fields >> 12) & 0xF) as u8;
+    let length_size = ((size_fields >> 8) & 0xF) as u8;
+    let base_offset_size = ((size_fields >> 4) & 0xF) as u8;
+    let index_size = if full_box.version >= 1 {
+        (size_fields & 0xF) as u8
+    } else {
+        0
+    };
+
+    validate_iloc_size_field(iloc_payload_offset, ItemLocationField::Offset, offset_size)?;
+    validate_iloc_size_field(iloc_payload_offset, ItemLocationField::Length, length_size)?;
+    validate_iloc_size_field(
+        iloc_payload_offset,
+        ItemLocationField::BaseOffset,
+        base_offset_size,
+    )?;
+    if full_box.version >= 1 {
+        validate_iloc_size_field(iloc_payload_offset, ItemLocationField::Index, index_size)?;
+    }
+
+    let item_count = if full_box.version < 2 {
+        u32::from(read_u16_cursor(
+            iloc_payload,
+            &mut cursor,
+            iloc_payload_offset,
+            "item_count",
+        )?)
+    } else {
+        read_u32_cursor(iloc_payload, &mut cursor, iloc_payload_offset, "item_count")?
+    };
+
+    let mut items = Vec::with_capacity(item_count as usize);
+    for _ in 0..item_count {
+        let item_id = if full_box.version < 2 {
+            u32::from(read_u16_cursor(
+                iloc_payload,
+                &mut cursor,
+                iloc_payload_offset,
+                "item_ID",
+            )?)
+        } else {
+            read_u32_cursor(iloc_payload, &mut cursor, iloc_payload_offset, "item_ID")?
+        };
+
+        let construction_method = if full_box.version >= 1 {
+            (read_u16_cursor(
+                iloc_payload,
+                &mut cursor,
+                iloc_payload_offset,
+                "construction_method",
+            )? & 0xF) as u8
+        } else {
+            0
+        };
+        let data_reference_index = read_u16_cursor(
+            iloc_payload,
+            &mut cursor,
+            iloc_payload_offset,
+            "data_reference_index",
+        )?;
+        let base_offset = read_iloc_sized_u64(
+            iloc_payload,
+            &mut cursor,
+            iloc_payload_offset,
+            base_offset_size,
+            ItemLocationField::BaseOffset,
+        )?;
+        let extent_count = read_u16_cursor(
+            iloc_payload,
+            &mut cursor,
+            iloc_payload_offset,
+            "extent_count",
+        )?;
+
+        let mut extents = Vec::with_capacity(usize::from(extent_count));
+        for _ in 0..extent_count {
+            let index = if full_box.version >= 1 && index_size > 0 {
+                read_iloc_sized_u64(
+                    iloc_payload,
+                    &mut cursor,
+                    iloc_payload_offset,
+                    index_size,
+                    ItemLocationField::Index,
+                )?
+            } else {
+                0
+            };
+            let offset = read_iloc_sized_u64(
+                iloc_payload,
+                &mut cursor,
+                iloc_payload_offset,
+                offset_size,
+                ItemLocationField::Offset,
+            )?;
+            let length = read_iloc_sized_u64(
+                iloc_payload,
+                &mut cursor,
+                iloc_payload_offset,
+                length_size,
+                ItemLocationField::Length,
+            )?;
+            extents.push(ItemLocationExtent {
+                index,
+                offset,
+                length,
+            });
+        }
+
+        items.push(ItemLocationItem {
+            item_id,
+            construction_method,
+            data_reference_index,
+            base_offset,
+            extents,
+        });
+    }
+
+    Ok(ItemLocationBox {
+        full_box,
+        offset_size,
+        length_size,
+        base_offset_size,
+        index_size,
+        items,
+    })
+}
+
+fn validate_iloc_size_field(
+    offset: u64,
+    field: ItemLocationField,
+    size: u8,
+) -> Result<(), ParseItemLocationBoxError> {
+    if matches!(size, 0 | 4 | 8) {
+        return Ok(());
+    }
+
+    Err(ParseItemLocationBoxError::UnsupportedFieldSize {
+        offset,
+        field,
+        size,
+    })
+}
+
+fn read_iloc_sized_u64(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    size: u8,
+    field: ItemLocationField,
+) -> Result<u64, ParseItemLocationBoxError> {
+    match size {
+        0 => Ok(0),
+        4 => Ok(u64::from(read_u32_cursor(
+            payload,
+            cursor,
+            payload_offset,
+            iloc_field_context(field),
+        )?)),
+        8 => read_u64_cursor(payload, cursor, payload_offset, iloc_field_context(field)),
+        _ => Err(ParseItemLocationBoxError::UnsupportedFieldSize {
+            offset: payload_offset + *cursor as u64,
+            field,
+            size,
+        }),
+    }
+}
+
+fn iloc_field_context(field: ItemLocationField) -> &'static str {
+    match field {
+        ItemLocationField::Offset => "extent_offset",
+        ItemLocationField::Length => "extent_length",
+        ItemLocationField::BaseOffset => "base_offset",
+        ItemLocationField::Index => "extent_index",
+    }
+}
+
+fn read_u16_cursor(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseItemLocationBoxError> {
+    let bytes = take_cursor_bytes(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseItemLocationBoxError> {
+    let bytes = take_cursor_bytes(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn read_u64_cursor(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u64, ParseItemLocationBoxError> {
+    let bytes = take_cursor_bytes(payload, cursor, size_of::<u64>(), payload_offset, context)?;
+    Ok(read_u64_be(bytes))
+}
+
+fn take_cursor_bytes<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseItemLocationBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseItemLocationBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
 fn parse_next_box(input: &[u8], offset: u64) -> Result<(ParsedBox<'_>, usize), ParseBoxError> {
     let available = input.len() as u64;
     let (header, header_len) = parse_header(input, offset, available)?;
@@ -661,9 +1048,9 @@ fn read_u64_be(input: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_boxes, BoxIter, FourCc, ParseBoxError, ParseFileTypeBoxError, ParseFullBoxError,
-        ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE,
-        LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        parse_boxes, BoxIter, FourCc, ItemLocationField, ParseBoxError, ParseFileTypeBoxError,
+        ParseFullBoxError, ParseItemLocationBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError,
+        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -1142,6 +1529,179 @@ mod tests {
                 offset: BASIC_HEADER_SIZE as u64,
                 available: 3
             })
+        );
+    }
+
+    #[test]
+    fn parses_iloc_version_zero_item_and_extent() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        payload.extend_from_slice(&0x1234_u16.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        payload.extend_from_slice(&0x0102_0304_u32.to_be_bytes()); // base_offset
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        payload.extend_from_slice(&0x10_u32.to_be_bytes()); // extent_offset
+        payload.extend_from_slice(&0x20_u32.to_be_bytes()); // extent_length
+        let bytes = make_basic_box(*b"iloc", &payload);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let iloc = top_level[0]
+            .parse_iloc()
+            .expect("iloc v0 payload should parse");
+        assert_eq!(iloc.full_box.version, 0);
+        assert_eq!(iloc.full_box.flags, 0);
+        assert_eq!(iloc.offset_size, 4);
+        assert_eq!(iloc.length_size, 4);
+        assert_eq!(iloc.base_offset_size, 4);
+        assert_eq!(iloc.index_size, 0);
+        assert_eq!(iloc.items.len(), 1);
+        assert_eq!(iloc.items[0].item_id, 0x1234);
+        assert_eq!(iloc.items[0].construction_method, 0);
+        assert_eq!(iloc.items[0].data_reference_index, 0);
+        assert_eq!(iloc.items[0].base_offset, 0x0102_0304);
+        assert_eq!(iloc.items[0].extents.len(), 1);
+        assert_eq!(iloc.items[0].extents[0].index, 0);
+        assert_eq!(iloc.items[0].extents[0].offset, 0x10);
+        assert_eq!(iloc.items[0].extents[0].length, 0x20);
+    }
+
+    #[test]
+    fn parses_iloc_version_two_with_index_and_u64_fields() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        payload.extend_from_slice(&0x8884_u16.to_be_bytes()); // offset/length/base_offset=8, index=4
+        payload.extend_from_slice(&1_u32.to_be_bytes()); // item_count
+        payload.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&0x0002_u16.to_be_bytes()); // construction_method=2
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // data_reference_index
+        payload.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // base_offset
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        payload.extend_from_slice(&5_u32.to_be_bytes()); // extent_index
+        payload.extend_from_slice(&0x10_u64.to_be_bytes()); // extent_offset
+        payload.extend_from_slice(&0x20_u64.to_be_bytes()); // extent_length
+        let bytes = make_basic_box(*b"iloc", &payload);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let iloc = top_level[0]
+            .parse_iloc()
+            .expect("iloc v2 payload should parse");
+        assert_eq!(iloc.full_box.version, 2);
+        assert_eq!(iloc.offset_size, 8);
+        assert_eq!(iloc.length_size, 8);
+        assert_eq!(iloc.base_offset_size, 8);
+        assert_eq!(iloc.index_size, 4);
+        assert_eq!(iloc.items.len(), 1);
+        assert_eq!(iloc.items[0].item_id, 0x1122_3344);
+        assert_eq!(iloc.items[0].construction_method, 2);
+        assert_eq!(iloc.items[0].data_reference_index, 1);
+        assert_eq!(iloc.items[0].base_offset, 0x0102_0304_0506_0708);
+        assert_eq!(iloc.items[0].extents.len(), 1);
+        assert_eq!(iloc.items[0].extents[0].index, 5);
+        assert_eq!(iloc.items[0].extents[0].offset, 0x10);
+        assert_eq!(iloc.items[0].extents[0].length, 0x20);
+    }
+
+    #[test]
+    fn rejects_iloc_parse_for_non_iloc_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_iloc()
+            .expect_err("parsing non-iloc as iloc must fail");
+        assert_eq!(
+            err,
+            ParseItemLocationBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free")
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iloc_parse_for_unsupported_full_box_version() {
+        let bytes = make_basic_box(*b"iloc", &[0x03, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let err = top_level[0]
+            .parse_iloc()
+            .expect_err("unsupported iloc version must fail");
+        assert_eq!(
+            err,
+            ParseItemLocationBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 3
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iloc_parse_for_invalid_base_offset_size() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&0x4420_u16.to_be_bytes()); // base_offset_size=2 (invalid)
+        let bytes = make_basic_box(*b"iloc", &payload);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let err = top_level[0]
+            .parse_iloc()
+            .expect_err("invalid iloc base_offset_size must fail");
+        assert_eq!(
+            err,
+            ParseItemLocationBoxError::UnsupportedFieldSize {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                field: ItemLocationField::BaseOffset,
+                size: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iloc_parse_for_invalid_index_size_on_version_one() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        payload.extend_from_slice(&0x4442_u16.to_be_bytes()); // index_size=2 (invalid)
+        let bytes = make_basic_box(*b"iloc", &payload);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let err = top_level[0]
+            .parse_iloc()
+            .expect_err("invalid iloc index_size must fail");
+        assert_eq!(
+            err,
+            ParseItemLocationBoxError::UnsupportedFieldSize {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                field: ItemLocationField::Index,
+                size: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iloc_parse_when_base_offset_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        payload.extend_from_slice(&[0xaa, 0xbb]); // truncated base_offset (needs 4 bytes)
+        let bytes = make_basic_box(*b"iloc", &payload);
+        let top_level = parse_boxes(&bytes).expect("iloc box should parse");
+
+        let err = top_level[0]
+            .parse_iloc()
+            .expect_err("truncated base_offset must fail");
+        assert_eq!(
+            err,
+            ParseItemLocationBoxError::PayloadTooSmall {
+                offset: 20,
+                context: "base_offset",
+                available: 2,
+                required: 4,
+            }
         );
     }
 
