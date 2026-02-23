@@ -1174,6 +1174,10 @@ impl<'a> SliceContext<'a> {
             self.decode_quantization_parameters(x0, y0, cu_x, cu_y);
             // Store QPY in the QP map for neighbor lookups
             self.store_qpy(cu_x, cu_y, cu_log2, self.current_qpy);
+            // Mirror libde265 behavior: once cu_qp_delta is decoded, QPY applies
+            // to the whole CU. Re-stamp the deblock QP map so TU leaves decoded
+            // earlier in the same CU do not retain stale pre-delta QP values.
+            frame.store_block_qp(cu_x, cu_y, 1u32 << cu_log2, self.current_qpy as i8);
         }
 
         // Mark TU boundary and store QP for deblocking
