@@ -13,6 +13,8 @@ use rav1d::Dav1dResult;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::BufWriter;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -24,6 +26,7 @@ pub mod isobmff;
 pub enum DecodeError {
     Io(std::io::Error),
     AvifDecode(DecodeAvifError),
+    PngEncoding(png::EncodingError),
     Unsupported(String),
 }
 
@@ -32,6 +35,7 @@ impl Display for DecodeError {
         match self {
             DecodeError::Io(err) => write!(f, "I/O error: {err}"),
             DecodeError::AvifDecode(err) => write!(f, "{err}"),
+            DecodeError::PngEncoding(err) => write!(f, "PNG encode error: {err}"),
             DecodeError::Unsupported(msg) => write!(f, "{msg}"),
         }
     }
@@ -42,6 +46,7 @@ impl Error for DecodeError {
         match self {
             DecodeError::Io(err) => Some(err),
             DecodeError::AvifDecode(err) => Some(err),
+            DecodeError::PngEncoding(err) => Some(err),
             DecodeError::Unsupported(_) => None,
         }
     }
@@ -56,6 +61,12 @@ impl From<std::io::Error> for DecodeError {
 impl From<DecodeAvifError> for DecodeError {
     fn from(value: DecodeAvifError) -> Self {
         Self::AvifDecode(value)
+    }
+}
+
+impl From<png::EncodingError> for DecodeError {
+    fn from(value: png::EncodingError) -> Self {
+        Self::PngEncoding(value)
     }
 }
 
@@ -142,6 +153,23 @@ pub enum DecodeAvifError {
         actual_width: u32,
         actual_height: u32,
     },
+    PlaneSampleTypeMismatch {
+        plane: &'static str,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    PlaneDimensionsMismatch {
+        plane: &'static str,
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    PlaneSampleCountMismatch {
+        plane: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl Display for DecodeAvifError {
@@ -201,6 +229,32 @@ impl Display for DecodeAvifError {
             } => write!(
                 f,
                 "decoded AV1 frame geometry mismatch: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+            ),
+            DecodeAvifError::PlaneSampleTypeMismatch {
+                plane,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "decoded AV1 {plane} plane has sample type {actual}, expected {expected}"
+            ),
+            DecodeAvifError::PlaneDimensionsMismatch {
+                plane,
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                f,
+                "decoded AV1 {plane} plane has dimensions {actual_width}x{actual_height}, expected {expected_width}x{expected_height}"
+            ),
+            DecodeAvifError::PlaneSampleCountMismatch {
+                plane,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "decoded AV1 {plane} plane has {actual} samples, expected {expected}"
             ),
         }
     }
@@ -274,9 +328,6 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
 }
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
-///
-/// This is a placeholder entry point that establishes the public API surface for
-/// upcoming implementation work.
 pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
@@ -293,17 +344,502 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         Some(true)
     ) {
         let input = std::fs::read(input_path)?;
-        let _decoded = decode_primary_avif_to_image(&input)?;
-        return Err(DecodeError::Unsupported(
-            "AVIF decode path reaches an internal YUV image model, but PNG output is not implemented yet."
-                .to_string(),
-        ));
+        let decoded = decode_primary_avif_to_image(&input)?;
+        write_decoded_avif_to_png(&decoded, output_path)?;
+        return Ok(());
     }
 
     let _ = output_path;
     Err(DecodeError::Unsupported(
         "Decoder not implemented yet.".to_string(),
     ))
+}
+
+// Provenance: conversion constants/mapping align with libheif's full-range
+// YCbCr->RGB defaults in libheif/libheif/color-conversion/yuv2rgb.cc
+// (Op_YCbCr420_to_RGB32::convert_colorspace) and libheif/libheif/nclx.cc
+// (YCbCr_to_RGB_coefficients::defaults).
+const YCBCR_TO_RGB_R_CR_COEFF_FP8: i32 = 359;
+const YCBCR_TO_RGB_G_CB_COEFF_FP8: i32 = -88;
+const YCBCR_TO_RGB_G_CR_COEFF_FP8: i32 = -183;
+const YCBCR_TO_RGB_B_CB_COEFF_FP8: i32 = 454;
+
+fn write_decoded_avif_to_png(
+    decoded: &DecodedAvifImage,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    if decoded.bit_depth <= 8 {
+        let pixels = convert_avif_to_rgba8(decoded)?;
+        return write_rgba8_png(decoded.width, decoded.height, &pixels, output_path);
+    }
+
+    let pixels = convert_avif_to_rgba16(decoded)?;
+    write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
+}
+
+fn write_rgba8_png(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let file = File::create(output_path)?;
+    let writer = BufWriter::new(file);
+
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder.write_header()?;
+    png_writer.write_image_data(pixels)?;
+
+    Ok(())
+}
+
+fn write_rgba16_png(
+    width: u32,
+    height: u32,
+    pixels: &[u16],
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let file = File::create(output_path)?;
+    let writer = BufWriter::new(file);
+
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Sixteen);
+    let mut png_writer = encoder.write_header()?;
+
+    let byte_len = pixels
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| DecodeError::Unsupported("RGBA16 byte buffer size overflow".to_string()))?;
+    let mut bytes = Vec::with_capacity(byte_len);
+    for sample in pixels {
+        bytes.extend_from_slice(&sample.to_be_bytes());
+    }
+    png_writer.write_image_data(&bytes)?;
+
+    Ok(())
+}
+
+fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAvifError> {
+    validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
+    let y_samples = plane_samples_u8(&decoded.y_plane, "Y")?;
+    let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
+    if y_samples.len() != expected_y_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "Y",
+            expected: expected_y_samples,
+            actual: y_samples.len(),
+        });
+    }
+
+    let width = usize::try_from(decoded.width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+        plane: "RGBA",
+        width: decoded.width,
+        height: decoded.height,
+    })?;
+    let height =
+        usize::try_from(decoded.height).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+            plane: "RGBA",
+            width: decoded.width,
+            height: decoded.height,
+        })?;
+    let output_len =
+        expected_y_samples
+            .checked_mul(4)
+            .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                plane: "RGBA",
+                width: decoded.width,
+                height: decoded.height,
+            })?;
+    let mut out = Vec::with_capacity(output_len);
+
+    let chroma = prepare_chroma_u8(decoded)?;
+    let half_range = chroma_half_range(decoded.bit_depth);
+
+    for y in 0..height {
+        let row_start = y
+            .checked_mul(width)
+            .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                plane: "RGBA",
+                width: decoded.width,
+                height: decoded.height,
+            })?;
+
+        for x in 0..width {
+            let y_index = row_start
+                .checked_add(x)
+                .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                    plane: "RGBA",
+                    width: decoded.width,
+                    height: decoded.height,
+                })?;
+            let y_sample = i32::from(y_samples[y_index]);
+
+            let (cb_centered, cr_centered) = match &chroma {
+                ChromaPlanesU8::Monochrome => (0, 0),
+                ChromaPlanesU8::Color {
+                    u_samples,
+                    v_samples,
+                    chroma_width,
+                    layout,
+                } => {
+                    let chroma_index = chroma_sample_index(x, y, *chroma_width, *layout);
+                    (
+                        i32::from(u_samples[chroma_index]) - half_range,
+                        i32::from(v_samples[chroma_index]) - half_range,
+                    )
+                }
+            };
+
+            let (r, g, b) =
+                ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, decoded.bit_depth);
+            out.push(scale_sample_to_u8(r, decoded.bit_depth));
+            out.push(scale_sample_to_u8(g, decoded.bit_depth));
+            out.push(scale_sample_to_u8(b, decoded.bit_depth));
+            out.push(u8::MAX);
+        }
+    }
+
+    Ok(out)
+}
+
+fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, DecodeAvifError> {
+    validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
+    let y_samples = plane_samples_u16(&decoded.y_plane, "Y")?;
+    let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
+    if y_samples.len() != expected_y_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "Y",
+            expected: expected_y_samples,
+            actual: y_samples.len(),
+        });
+    }
+
+    let width = usize::try_from(decoded.width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+        plane: "RGBA",
+        width: decoded.width,
+        height: decoded.height,
+    })?;
+    let height =
+        usize::try_from(decoded.height).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+            plane: "RGBA",
+            width: decoded.width,
+            height: decoded.height,
+        })?;
+    let output_len =
+        expected_y_samples
+            .checked_mul(4)
+            .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                plane: "RGBA",
+                width: decoded.width,
+                height: decoded.height,
+            })?;
+    let mut out = Vec::with_capacity(output_len);
+
+    let chroma = prepare_chroma_u16(decoded)?;
+    let half_range = chroma_half_range(decoded.bit_depth);
+
+    for y in 0..height {
+        let row_start = y
+            .checked_mul(width)
+            .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                plane: "RGBA",
+                width: decoded.width,
+                height: decoded.height,
+            })?;
+
+        for x in 0..width {
+            let y_index = row_start
+                .checked_add(x)
+                .ok_or(DecodeAvifError::PlaneSizeOverflow {
+                    plane: "RGBA",
+                    width: decoded.width,
+                    height: decoded.height,
+                })?;
+            let y_sample = i32::from(y_samples[y_index]);
+
+            let (cb_centered, cr_centered) = match &chroma {
+                ChromaPlanesU16::Monochrome => (0, 0),
+                ChromaPlanesU16::Color {
+                    u_samples,
+                    v_samples,
+                    chroma_width,
+                    layout,
+                } => {
+                    let chroma_index = chroma_sample_index(x, y, *chroma_width, *layout);
+                    (
+                        i32::from(u_samples[chroma_index]) - half_range,
+                        i32::from(v_samples[chroma_index]) - half_range,
+                    )
+                }
+            };
+
+            let (r, g, b) =
+                ycbcr_to_rgb_components(y_sample, cb_centered, cr_centered, decoded.bit_depth);
+            out.push(scale_sample_to_u16(r, decoded.bit_depth));
+            out.push(scale_sample_to_u16(g, decoded.bit_depth));
+            out.push(scale_sample_to_u16(b, decoded.bit_depth));
+            out.push(u16::MAX);
+        }
+    }
+
+    Ok(out)
+}
+
+enum ChromaPlanesU8<'a> {
+    Monochrome,
+    Color {
+        u_samples: &'a [u8],
+        v_samples: &'a [u8],
+        chroma_width: usize,
+        layout: AvifPixelLayout,
+    },
+}
+
+enum ChromaPlanesU16<'a> {
+    Monochrome,
+    Color {
+        u_samples: &'a [u16],
+        v_samples: &'a [u16],
+        chroma_width: usize,
+        layout: AvifPixelLayout,
+    },
+}
+
+fn prepare_chroma_u8(decoded: &DecodedAvifImage) -> Result<ChromaPlanesU8<'_>, DecodeAvifError> {
+    if decoded.layout == AvifPixelLayout::Yuv400 {
+        return Ok(ChromaPlanesU8::Monochrome);
+    }
+
+    let (u_plane, v_plane, expected_width, expected_height) = require_chroma_planes(decoded)?;
+    validate_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
+    validate_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
+
+    let u_samples = plane_samples_u8(u_plane, "U")?;
+    let v_samples = plane_samples_u8(v_plane, "V")?;
+    let expected_samples = sample_count(expected_width, expected_height, "U/V")?;
+    if u_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "U",
+            expected: expected_samples,
+            actual: u_samples.len(),
+        });
+    }
+    if v_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "V",
+            expected: expected_samples,
+            actual: v_samples.len(),
+        });
+    }
+
+    let chroma_width =
+        usize::try_from(expected_width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+            plane: "U",
+            width: expected_width,
+            height: expected_height,
+        })?;
+    Ok(ChromaPlanesU8::Color {
+        u_samples,
+        v_samples,
+        chroma_width,
+        layout: decoded.layout,
+    })
+}
+
+fn prepare_chroma_u16(decoded: &DecodedAvifImage) -> Result<ChromaPlanesU16<'_>, DecodeAvifError> {
+    if decoded.layout == AvifPixelLayout::Yuv400 {
+        return Ok(ChromaPlanesU16::Monochrome);
+    }
+
+    let (u_plane, v_plane, expected_width, expected_height) = require_chroma_planes(decoded)?;
+    validate_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
+    validate_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
+
+    let u_samples = plane_samples_u16(u_plane, "U")?;
+    let v_samples = plane_samples_u16(v_plane, "V")?;
+    let expected_samples = sample_count(expected_width, expected_height, "U/V")?;
+    if u_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "U",
+            expected: expected_samples,
+            actual: u_samples.len(),
+        });
+    }
+    if v_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "V",
+            expected: expected_samples,
+            actual: v_samples.len(),
+        });
+    }
+
+    let chroma_width =
+        usize::try_from(expected_width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+            plane: "U",
+            width: expected_width,
+            height: expected_height,
+        })?;
+    Ok(ChromaPlanesU16::Color {
+        u_samples,
+        v_samples,
+        chroma_width,
+        layout: decoded.layout,
+    })
+}
+
+fn require_chroma_planes(
+    decoded: &DecodedAvifImage,
+) -> Result<(&AvifPlane, &AvifPlane, u32, u32), DecodeAvifError> {
+    let (expected_width, expected_height) =
+        chroma_dimensions(decoded.width, decoded.height, decoded.layout);
+    let u_plane = decoded
+        .u_plane
+        .as_ref()
+        .ok_or(DecodeAvifError::MissingPlane {
+            plane: "U",
+            layout: decoded.layout,
+        })?;
+    let v_plane = decoded
+        .v_plane
+        .as_ref()
+        .ok_or(DecodeAvifError::MissingPlane {
+            plane: "V",
+            layout: decoded.layout,
+        })?;
+    Ok((u_plane, v_plane, expected_width, expected_height))
+}
+
+fn plane_samples_u8<'a>(
+    plane: &'a AvifPlane,
+    plane_name: &'static str,
+) -> Result<&'a [u8], DecodeAvifError> {
+    match &plane.samples {
+        AvifPlaneSamples::U8(samples) => Ok(samples),
+        AvifPlaneSamples::U16(_) => Err(DecodeAvifError::PlaneSampleTypeMismatch {
+            plane: plane_name,
+            expected: "u8",
+            actual: "u16",
+        }),
+    }
+}
+
+fn plane_samples_u16<'a>(
+    plane: &'a AvifPlane,
+    plane_name: &'static str,
+) -> Result<&'a [u16], DecodeAvifError> {
+    match &plane.samples {
+        AvifPlaneSamples::U8(_) => Err(DecodeAvifError::PlaneSampleTypeMismatch {
+            plane: plane_name,
+            expected: "u16",
+            actual: "u8",
+        }),
+        AvifPlaneSamples::U16(samples) => Ok(samples),
+    }
+}
+
+fn validate_plane_dimensions(
+    plane: &AvifPlane,
+    expected_width: u32,
+    expected_height: u32,
+    plane_name: &'static str,
+) -> Result<(), DecodeAvifError> {
+    if plane.width != expected_width || plane.height != expected_height {
+        return Err(DecodeAvifError::PlaneDimensionsMismatch {
+            plane: plane_name,
+            expected_width,
+            expected_height,
+            actual_width: plane.width,
+            actual_height: plane.height,
+        });
+    }
+
+    Ok(())
+}
+
+fn sample_count(
+    width: u32,
+    height: u32,
+    plane_name: &'static str,
+) -> Result<usize, DecodeAvifError> {
+    let width_usize = usize::try_from(width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+        plane: plane_name,
+        width,
+        height,
+    })?;
+    let height_usize = usize::try_from(height).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+        plane: plane_name,
+        width,
+        height,
+    })?;
+    width_usize
+        .checked_mul(height_usize)
+        .ok_or(DecodeAvifError::PlaneSizeOverflow {
+            plane: plane_name,
+            width,
+            height,
+        })
+}
+
+fn chroma_sample_index(x: usize, y: usize, chroma_width: usize, layout: AvifPixelLayout) -> usize {
+    match layout {
+        AvifPixelLayout::Yuv400 => 0,
+        AvifPixelLayout::Yuv420 => (y / 2) * chroma_width + (x / 2),
+        AvifPixelLayout::Yuv422 => y * chroma_width + (x / 2),
+        AvifPixelLayout::Yuv444 => y * chroma_width + x,
+    }
+}
+
+fn ycbcr_to_rgb_components(
+    y: i32,
+    cb_centered: i32,
+    cr_centered: i32,
+    bit_depth: u8,
+) -> (u16, u16, u16) {
+    let r = y + ((YCBCR_TO_RGB_R_CR_COEFF_FP8 * cr_centered + 128) >> 8);
+    let g = y
+        + ((YCBCR_TO_RGB_G_CB_COEFF_FP8 * cb_centered
+            + YCBCR_TO_RGB_G_CR_COEFF_FP8 * cr_centered
+            + 128)
+            >> 8);
+    let b = y + ((YCBCR_TO_RGB_B_CB_COEFF_FP8 * cb_centered + 128) >> 8);
+
+    (
+        clip_to_bit_depth(r, bit_depth),
+        clip_to_bit_depth(g, bit_depth),
+        clip_to_bit_depth(b, bit_depth),
+    )
+}
+
+fn chroma_half_range(bit_depth: u8) -> i32 {
+    1_i32 << u32::from(bit_depth.saturating_sub(1))
+}
+
+fn clip_to_bit_depth(value: i32, bit_depth: u8) -> u16 {
+    let max_value = ((1_i32 << bit_depth) - 1).max(0);
+    value.clamp(0, max_value) as u16
+}
+
+fn scale_sample_to_u8(sample: u16, bit_depth: u8) -> u8 {
+    if bit_depth == 8 {
+        return sample as u8;
+    }
+
+    let max_value = (1_u32 << bit_depth) - 1;
+    let scaled = (u32::from(sample) * u32::from(u8::MAX) + (max_value / 2)) / max_value;
+    scaled as u8
+}
+
+fn scale_sample_to_u16(sample: u16, bit_depth: u8) -> u16 {
+    if bit_depth == 16 {
+        return sample;
+    }
+
+    let max_value = (1_u32 << bit_depth) - 1;
+    let scaled = (u32::from(sample) * u32::from(u16::MAX) + (max_value / 2)) / max_value;
+    scaled as u16
 }
 
 #[derive(Default)]
@@ -636,8 +1172,13 @@ fn copy_plane_samples(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_primary_avif_to_image, AvifPixelLayout, AvifPlane, AvifPlaneSamples};
+    use super::{
+        convert_avif_to_rgba8, decode_file_to_png, decode_primary_avif_to_image, AvifPixelLayout,
+        AvifPlane, AvifPlaneSamples, DecodedAvifImage,
+    };
+    use std::io::Cursor;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn decodes_example_avif_into_internal_plane_model() {
@@ -670,6 +1211,77 @@ mod tests {
                 assert_eq!(u_plane.height, v_plane.height);
             }
         }
+    }
+
+    #[test]
+    fn decodes_example_avif_to_png() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let decoded =
+            decode_primary_avif_to_image(&input).expect("example AVIF should decode into planes");
+
+        let output = test_output_png_path("example-avif");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output).expect("AVIF decode should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert!(matches!(
+            frame_info.bit_depth,
+            png::BitDepth::Eight | png::BitDepth::Sixteen
+        ));
+    }
+
+    #[test]
+    fn converts_monochrome_u8_planes_to_rgba8() {
+        let image = DecodedAvifImage {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv400,
+            y_plane: AvifPlane {
+                width: 2,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![32, 200]),
+            },
+            u_plane: None,
+            v_plane: None,
+        };
+
+        let rgba = convert_avif_to_rgba8(&image).expect("YUV400 should convert to RGBA8");
+        assert_eq!(rgba, vec![32, 32, 32, 255, 200, 200, 200, 255]);
+    }
+
+    struct TempFileGuard(PathBuf);
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn test_output_png_path(label: &str) -> PathBuf {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH");
+        let nanos = since_epoch.as_nanos();
+        std::env::temp_dir().join(format!(
+            "libheic-rs-{label}-{}-{nanos}.png",
+            std::process::id()
+        ))
     }
 
     fn assert_plane_len(plane: &AvifPlane, expected_samples: usize) {
