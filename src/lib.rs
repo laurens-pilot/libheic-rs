@@ -26,6 +26,7 @@ pub mod isobmff;
 pub enum DecodeError {
     Io(std::io::Error),
     AvifDecode(DecodeAvifError),
+    HeicDecode(DecodeHeicError),
     PngEncoding(png::EncodingError),
     Unsupported(String),
 }
@@ -35,6 +36,7 @@ impl Display for DecodeError {
         match self {
             DecodeError::Io(err) => write!(f, "I/O error: {err}"),
             DecodeError::AvifDecode(err) => write!(f, "{err}"),
+            DecodeError::HeicDecode(err) => write!(f, "{err}"),
             DecodeError::PngEncoding(err) => write!(f, "PNG encode error: {err}"),
             DecodeError::Unsupported(msg) => write!(f, "{msg}"),
         }
@@ -46,6 +48,7 @@ impl Error for DecodeError {
         match self {
             DecodeError::Io(err) => Some(err),
             DecodeError::AvifDecode(err) => Some(err),
+            DecodeError::HeicDecode(err) => Some(err),
             DecodeError::PngEncoding(err) => Some(err),
             DecodeError::Unsupported(_) => None,
         }
@@ -61,6 +64,12 @@ impl From<std::io::Error> for DecodeError {
 impl From<DecodeAvifError> for DecodeError {
     fn from(value: DecodeAvifError) -> Self {
         Self::AvifDecode(value)
+    }
+}
+
+impl From<DecodeHeicError> for DecodeError {
+    fn from(value: DecodeHeicError) -> Self {
+        Self::HeicDecode(value)
     }
 }
 
@@ -282,6 +291,83 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
     }
 }
 
+/// Errors from HEIC primary-item bitstream assembly for decoder handoff.
+#[derive(Debug)]
+pub enum DecodeHeicError {
+    ParsePrimaryProperties(isobmff::ParsePrimaryHeicPropertiesError),
+    ExtractPrimaryPayload(isobmff::ExtractHeicItemDataError),
+    InvalidNalLengthSize {
+        nal_length_size: u8,
+    },
+    TruncatedNalLengthField {
+        offset: usize,
+        nal_length_size: u8,
+        available: usize,
+    },
+    TruncatedNalUnit {
+        offset: usize,
+        declared: usize,
+        available: usize,
+    },
+    NalUnitTooLarge {
+        nal_size: usize,
+    },
+}
+
+impl Display for DecodeHeicError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeHeicError::ParsePrimaryProperties(err) => write!(f, "{err}"),
+            DecodeHeicError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
+            DecodeHeicError::InvalidNalLengthSize { nal_length_size } => write!(
+                f,
+                "HEVC nal_length_size must be in 1..=4, got {nal_length_size}"
+            ),
+            DecodeHeicError::TruncatedNalLengthField {
+                offset,
+                nal_length_size,
+                available,
+            } => write!(
+                f,
+                "truncated HEVC NAL length field at payload offset {offset}: need {nal_length_size} bytes, have {available}"
+            ),
+            DecodeHeicError::TruncatedNalUnit {
+                offset,
+                declared,
+                available,
+            } => write!(
+                f,
+                "truncated HEVC NAL unit at payload offset {offset}: declared {declared} bytes, have {available}"
+            ),
+            DecodeHeicError::NalUnitTooLarge { nal_size } => {
+                write!(f, "HEVC NAL unit size {nal_size} exceeds 32-bit length limit")
+            }
+        }
+    }
+}
+
+impl Error for DecodeHeicError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            DecodeHeicError::ParsePrimaryProperties(err) => Some(err),
+            DecodeHeicError::ExtractPrimaryPayload(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<isobmff::ParsePrimaryHeicPropertiesError> for DecodeHeicError {
+    fn from(value: isobmff::ParsePrimaryHeicPropertiesError) -> Self {
+        Self::ParsePrimaryProperties(value)
+    }
+}
+
+impl From<isobmff::ExtractHeicItemDataError> for DecodeHeicError {
+    fn from(value: isobmff::ExtractHeicItemDataError) -> Self {
+        Self::ExtractPrimaryPayload(value)
+    }
+}
+
 /// Decode the primary AVIF item into an internal planar YUV image model.
 pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
     // Provenance: mirrors libheif configuration+payload bitstream assembly in
@@ -325,6 +411,31 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
     }
 
     Ok(decoded)
+}
+
+/// Assemble primary HEIC coded data as a decoder-ready HEVC stream.
+pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, DecodeHeicError> {
+    // Provenance: mirrors libheif's decoder input assembly flow from
+    // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
+    // libheif/libheif/codecs/hevc_dec.cc:Decoder_HEVC::read_bitstream_configuration_data,
+    // with hvcC header NAL packing semantics from
+    // libheif/libheif/codecs/hevc_boxes.cc:Box_hvcC::get_header_nals.
+    let properties = isobmff::parse_primary_heic_item_properties(input)?;
+    let item_data = isobmff::extract_primary_heic_item_data(input)?;
+
+    let nal_length_size = properties.hvcc.nal_length_size;
+    if !(1..=4).contains(&nal_length_size) {
+        return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
+    }
+
+    let mut stream = Vec::new();
+    append_hvcc_header_nals(&properties.hvcc.nal_arrays, &mut stream)?;
+    append_normalized_hevc_payload_nals(
+        &item_data.payload,
+        usize::from(nal_length_size),
+        &mut stream,
+    )?;
+    Ok(stream)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
@@ -375,6 +486,71 @@ fn write_decoded_avif_to_png(
 
     let pixels = convert_avif_to_rgba16(decoded)?;
     write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
+}
+
+fn append_hvcc_header_nals(
+    nal_arrays: &[isobmff::HevcNalArray],
+    stream: &mut Vec<u8>,
+) -> Result<(), DecodeHeicError> {
+    for nal_array in nal_arrays {
+        for nal_unit in &nal_array.nal_units {
+            append_nal_with_u32_length_prefix(nal_unit, stream)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn append_normalized_hevc_payload_nals(
+    payload: &[u8],
+    nal_length_size: usize,
+    stream: &mut Vec<u8>,
+) -> Result<(), DecodeHeicError> {
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let length_field_start = cursor;
+        let remaining = payload.len() - cursor;
+        if remaining < nal_length_size {
+            return Err(DecodeHeicError::TruncatedNalLengthField {
+                offset: length_field_start,
+                nal_length_size: nal_length_size as u8,
+                available: remaining,
+            });
+        }
+
+        let mut nal_size: usize = 0;
+        for byte in &payload[cursor..cursor + nal_length_size] {
+            nal_size = (nal_size << 8) | usize::from(*byte);
+        }
+        cursor += nal_length_size;
+
+        let available = payload.len() - cursor;
+        if available < nal_size {
+            return Err(DecodeHeicError::TruncatedNalUnit {
+                offset: cursor,
+                declared: nal_size,
+                available,
+            });
+        }
+
+        let nal_end = cursor + nal_size;
+        append_nal_with_u32_length_prefix(&payload[cursor..nal_end], stream)?;
+        cursor = nal_end;
+    }
+
+    Ok(())
+}
+
+fn append_nal_with_u32_length_prefix(
+    nal_unit: &[u8],
+    stream: &mut Vec<u8>,
+) -> Result<(), DecodeHeicError> {
+    let nal_size = nal_unit.len();
+    let nal_size_u32 =
+        u32::try_from(nal_size).map_err(|_| DecodeHeicError::NalUnitTooLarge { nal_size })?;
+    stream.extend_from_slice(&nal_size_u32.to_be_bytes());
+    stream.extend_from_slice(nal_unit);
+    Ok(())
 }
 
 fn write_rgba8_png(
@@ -1173,8 +1349,9 @@ fn copy_plane_samples(
 #[cfg(test)]
 mod tests {
     use super::{
+        append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
         convert_avif_to_rgba8, decode_file_to_png, decode_primary_avif_to_image, AvifPixelLayout,
-        AvifPlane, AvifPlaneSamples, DecodedAvifImage,
+        AvifPlane, AvifPlaneSamples, DecodeHeicError, DecodedAvifImage,
     };
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -1263,6 +1440,70 @@ mod tests {
 
         let rgba = convert_avif_to_rgba8(&image).expect("YUV400 should convert to RGBA8");
         assert_eq!(rgba, vec![32, 32, 32, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn reports_missing_pixi_when_assembling_primary_heic_stream_for_fixture() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/fuzzing/data/corpus/colors-no-alpha.heic");
+        let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+
+        let err = assemble_primary_heic_hevc_stream(&input)
+            .expect_err("fixture without pixi should currently fail HEIC preflight");
+        assert!(matches!(
+            err,
+            DecodeHeicError::ParsePrimaryProperties(
+                crate::isobmff::ParsePrimaryHeicPropertiesError::MissingRequiredProperty {
+                    property_type,
+                    ..
+                }
+            ) if property_type.as_bytes() == *b"pixi"
+        ));
+    }
+
+    #[test]
+    fn normalizes_two_byte_nal_lengths_to_four_byte_stream() {
+        let payload = vec![0x00, 0x03, 0x41, 0x42, 0x43, 0x00, 0x01, 0x99];
+        let mut stream = Vec::new();
+        append_normalized_hevc_payload_nals(&payload, 2, &mut stream)
+            .expect("2-byte HEVC NAL lengths should normalize to 4-byte lengths");
+
+        assert_eq!(
+            stream,
+            vec![0x00, 0x00, 0x00, 0x03, 0x41, 0x42, 0x43, 0x00, 0x00, 0x00, 0x01, 0x99,]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_normalized_hevc_payload_nal_length_field() {
+        let payload = vec![0x00];
+        let mut stream = Vec::new();
+        let err = append_normalized_hevc_payload_nals(&payload, 2, &mut stream)
+            .expect_err("truncated NAL length field must fail");
+        assert!(matches!(
+            err,
+            DecodeHeicError::TruncatedNalLengthField {
+                offset: 0,
+                nal_length_size: 2,
+                available: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_normalized_hevc_payload_nal_unit() {
+        let payload = vec![0x00, 0x02, 0xAA];
+        let mut stream = Vec::new();
+        let err = append_normalized_hevc_payload_nals(&payload, 2, &mut stream)
+            .expect_err("truncated NAL payload must fail");
+        assert!(matches!(
+            err,
+            DecodeHeicError::TruncatedNalUnit {
+                offset: 2,
+                declared: 2,
+                available: 1,
+            }
+        ));
     }
 
     struct TempFileGuard(PathBuf);
