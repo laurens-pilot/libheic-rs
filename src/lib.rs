@@ -961,11 +961,15 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
 /// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
-    let (stream, metadata, ycbcr_range, ycbcr_matrix) =
+    let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
         decode_primary_heic_stream_and_metadata(input)?;
     let mut decoded = decode_hevc_stream_to_image(&stream)?;
-    decoded.ycbcr_range = ycbcr_range;
-    decoded.ycbcr_matrix = ycbcr_matrix;
+    if let Some(ycbcr_range) = ycbcr_range_override {
+        decoded.ycbcr_range = ycbcr_range;
+    }
+    if let Some(ycbcr_matrix) = ycbcr_matrix_override {
+        decoded.ycbcr_matrix = ycbcr_matrix;
+    }
     validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
     Ok(decoded)
 }
@@ -978,21 +982,20 @@ pub fn decode_primary_heic_to_metadata(
     Ok(metadata)
 }
 
+type PrimaryHeicStreamDecodeContext = (
+    Vec<u8>,
+    DecodedHeicImageMetadata,
+    Option<YCbCrRange>,
+    Option<YCbCrMatrixCoefficients>,
+);
+
 fn decode_primary_heic_stream_and_metadata(
     input: &[u8],
-) -> Result<
-    (
-        Vec<u8>,
-        DecodedHeicImageMetadata,
-        YCbCrRange,
-        YCbCrMatrixCoefficients,
-    ),
-    DecodeHeicError,
-> {
+) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
-    let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
-    let ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
+    let ycbcr_range_override = ycbcr_range_override_from_primary_colr(&properties.colr);
+    let ycbcr_matrix_override = ycbcr_matrix_override_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
     let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
     validate_decoded_heic_geometry_against_ispe(
@@ -1000,7 +1003,7 @@ fn decode_primary_heic_stream_and_metadata(
         properties.ispe.width,
         properties.ispe.height,
     )?;
-    Ok((stream, decoded, ycbcr_range, ycbcr_matrix))
+    Ok((stream, decoded, ycbcr_range_override, ycbcr_matrix_override))
 }
 
 fn validate_decoded_heic_geometry_against_ispe(
@@ -1153,8 +1156,19 @@ fn heic_decoder_frame_to_internal_image(
         bit_depth_luma: frame.bit_depth,
         bit_depth_chroma: frame.bit_depth,
         layout,
-        ycbcr_range: YCbCrRange::Full,
-        ycbcr_matrix: YCbCrMatrixCoefficients::default(),
+        // Provenance: mirror libheif decoder-plugin color handoff where
+        // bitstream-derived range/matrix metadata is attached when available
+        // (libheif/libheif/plugins/decoder_libde265.cc:
+        // de265_get_image_{full_range_flag,matrix_coefficients}).
+        ycbcr_range: if frame.full_range {
+            YCbCrRange::Full
+        } else {
+            YCbCrRange::Limited
+        },
+        ycbcr_matrix: YCbCrMatrixCoefficients {
+            matrix_coefficients: u16::from(frame.matrix_coeffs),
+            colour_primaries: YCbCrMatrixCoefficients::default().colour_primaries,
+        },
         y_plane,
         u_plane,
         v_plane,
@@ -1669,66 +1683,86 @@ fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> YCbCrRange {
-    // Provenance: mirrors libheif default/input range selection in
-    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace,
-    // where full range is assumed unless an nclx profile explicitly marks
-    // limited range.
-    match colr.nclx.as_ref().map(|nclx| nclx.full_range_flag) {
-        Some(true) | None => YCbCrRange::Full,
-        Some(false) => YCbCrRange::Limited,
-    }
+    ycbcr_range_override_from_primary_colr(colr).unwrap_or(YCbCrRange::Full)
+}
+
+fn ycbcr_range_override_from_primary_colr(
+    colr: &isobmff::PrimaryItemColorProperties,
+) -> Option<YCbCrRange> {
+    // Provenance: mirrors libheif container color-profile override semantics:
+    // if no primary-item nclx exists, decoder-provided stream metadata remains
+    // in effect (libheif/libheif/color-conversion/yuv2rgb.cc:
+    // Op_YCbCr_to_RGB::convert_colorspace and
+    // libheif/libheif/plugins/decoder_libde265.cc color-profile population).
+    colr.nclx.as_ref().map(|nclx| {
+        if nclx.full_range_flag {
+            YCbCrRange::Full
+        } else {
+            YCbCrRange::Limited
+        }
+    })
 }
 
 fn ycbcr_matrix_from_primary_colr(
     colr: &isobmff::PrimaryItemColorProperties,
 ) -> YCbCrMatrixCoefficients {
+    ycbcr_matrix_override_from_primary_colr(colr).unwrap_or_default()
+}
+
+fn ycbcr_matrix_override_from_primary_colr(
+    colr: &isobmff::PrimaryItemColorProperties,
+) -> Option<YCbCrMatrixCoefficients> {
     // Provenance: default/parsed matrix metadata mirrors libheif nclx handling in
     // libheif/libheif/nclx.cc:{nclx_profile::set_undefined,Box_colr::parse}.
-    match colr.nclx.as_ref() {
-        Some(nclx) => YCbCrMatrixCoefficients {
-            matrix_coefficients: nclx.matrix_coefficients,
-            colour_primaries: nclx.colour_primaries,
-        },
-        None => YCbCrMatrixCoefficients::default(),
-    }
+    colr.nclx.as_ref().map(|nclx| YCbCrMatrixCoefficients {
+        matrix_coefficients: nclx.matrix_coefficients,
+        colour_primaries: nclx.colour_primaries,
+    })
 }
 
 #[derive(Clone, Copy)]
 enum YCbCrToRgbTransform {
     Identity,
-    Matrix(YCbCrToRgbCoefficientsFp8),
+    Matrix(YCbCrToRgbCoefficients),
 }
 
 #[derive(Clone, Copy)]
-struct YCbCrToRgbCoefficientsFp8 {
-    r_cr: i32,
-    g_cb: i32,
-    g_cr: i32,
-    b_cb: i32,
+struct YCbCrToRgbCoefficients {
+    r_cr_fp8: i32,
+    g_cb_fp8: i32,
+    g_cr_fp8: i32,
+    b_cb_fp8: i32,
+    r_cr: f32,
+    g_cb: f32,
+    g_cr: f32,
+    b_cb: f32,
 }
 
 #[derive(Clone, Copy)]
 struct ColourPrimaries {
-    red_x: f64,
-    red_y: f64,
-    green_x: f64,
-    green_y: f64,
-    blue_x: f64,
-    blue_y: f64,
-    white_x: f64,
-    white_y: f64,
+    red_x: f32,
+    red_y: f32,
+    green_x: f32,
+    green_y: f32,
+    blue_x: f32,
+    blue_y: f32,
+    white_x: f32,
+    white_y: f32,
 }
 
 // Provenance: default conversion constants/mapping align with libheif's
 // YCbCr->RGB defaults in libheif/libheif/nclx.cc
 // (YCbCr_to_RGB_coefficients::defaults).
-const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8: YCbCrToRgbCoefficientsFp8 =
-    YCbCrToRgbCoefficientsFp8 {
-        r_cr: 359,
-        g_cb: -88,
-        g_cr: -183,
-        b_cb: 454,
-    };
+const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS: YCbCrToRgbCoefficients = YCbCrToRgbCoefficients {
+    r_cr_fp8: 359,
+    g_cb_fp8: -88,
+    g_cr_fp8: -183,
+    b_cb_fp8: 454,
+    r_cr: 1.402,
+    g_cb: -0.344_136,
+    g_cr: -0.714_136,
+    b_cb: 1.772,
+};
 
 fn ycbcr_transform_from_matrix(
     matrix: YCbCrMatrixCoefficients,
@@ -1755,63 +1789,67 @@ fn ycbcr_transform_from_matrix(
 fn ycbcr_coefficients_from_matrix(
     matrix_coefficients: u16,
     colour_primaries: u16,
-) -> YCbCrToRgbCoefficientsFp8 {
+) -> YCbCrToRgbCoefficients {
     // Provenance: coefficient derivation mirrors
     // libheif/libheif/nclx.cc:{get_Kr_Kb,get_YCbCr_to_RGB_coefficients}.
     let Some((kr, kb)) = kr_kb_from_matrix(matrix_coefficients, colour_primaries) else {
-        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS;
     };
 
-    if kr == 0.0 && kb == 0.0 {
-        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+    if kr == 0.0_f32 && kb == 0.0_f32 {
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS;
     }
 
     let denom = kb + kr - 1.0;
-    if denom == 0.0 {
-        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS_FP8;
+    if denom == 0.0_f32 {
+        return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS;
     }
 
     ycbcr_coefficients_from_kr_kb(kr, kb)
 }
 
-fn ycbcr_coefficients_from_kr_kb(kr: f64, kb: f64) -> YCbCrToRgbCoefficientsFp8 {
+fn ycbcr_coefficients_from_kr_kb(kr: f32, kb: f32) -> YCbCrToRgbCoefficients {
     let r_cr = 2.0 * (1.0 - kr);
     let g_cb = 2.0 * kb * (1.0 - kb) / (kb + kr - 1.0);
     let g_cr = 2.0 * kr * (1.0 - kr) / (kb + kr - 1.0);
     let b_cb = 2.0 * (1.0 - kb);
 
-    YCbCrToRgbCoefficientsFp8 {
-        r_cr: (256.0 * r_cr).round() as i32,
-        g_cb: (256.0 * g_cb).round() as i32,
-        g_cr: (256.0 * g_cr).round() as i32,
-        b_cb: (256.0 * b_cb).round() as i32,
+    YCbCrToRgbCoefficients {
+        r_cr_fp8: (256.0_f32 * r_cr).round() as i32,
+        g_cb_fp8: (256.0_f32 * g_cb).round() as i32,
+        g_cr_fp8: (256.0_f32 * g_cr).round() as i32,
+        b_cb_fp8: (256.0_f32 * b_cb).round() as i32,
+        r_cr,
+        g_cb,
+        g_cr,
+        b_cb,
     }
 }
 
-fn kr_kb_from_matrix(matrix_coefficients: u16, colour_primaries: u16) -> Option<(f64, f64)> {
+fn kr_kb_from_matrix(matrix_coefficients: u16, colour_primaries: u16) -> Option<(f32, f32)> {
     match matrix_coefficients {
-        1 => Some((0.2126, 0.0722)),
-        4 => Some((0.30, 0.11)),
-        5 | 6 => Some((0.299, 0.114)),
-        7 => Some((0.212, 0.087)),
-        9 | 10 => Some((0.2627, 0.0593)),
+        1 => Some((0.2126_f32, 0.0722_f32)),
+        4 => Some((0.30_f32, 0.11_f32)),
+        5 | 6 => Some((0.299_f32, 0.114_f32)),
+        7 => Some((0.212_f32, 0.087_f32)),
+        9 | 10 => Some((0.2627_f32, 0.0593_f32)),
         12 | 13 => chromaticity_derived_kr_kb(colour_primaries),
         _ => None,
     }
 }
 
-fn chromaticity_derived_kr_kb(colour_primaries: u16) -> Option<(f64, f64)> {
+fn chromaticity_derived_kr_kb(colour_primaries: u16) -> Option<(f32, f32)> {
     let p = colour_primaries_from_index(colour_primaries)?;
-    let zr = 1.0 - (p.red_x + p.red_y);
-    let zg = 1.0 - (p.green_x + p.green_y);
-    let zb = 1.0 - (p.blue_x + p.blue_y);
-    let zw = 1.0 - (p.white_x + p.white_y);
+    let zr = 1.0_f32 - (p.red_x + p.red_y);
+    let zg = 1.0_f32 - (p.green_x + p.green_y);
+    let zb = 1.0_f32 - (p.blue_x + p.blue_y);
+    let zw = 1.0_f32 - (p.white_x + p.white_y);
 
     let denom = p.white_y
         * (p.red_x * (p.green_y * zb - p.blue_y * zg)
             + p.green_x * (p.blue_y * zr - p.red_y * zb)
             + p.blue_x * (p.red_y * zg - p.green_y * zr));
-    if denom == 0.0 {
+    if denom == 0.0_f32 {
         return None;
     }
 
@@ -3480,24 +3518,61 @@ fn ycbcr_to_rgb_components(
 ) -> (u16, u16, u16) {
     match transform {
         YCbCrToRgbTransform::Identity => {
-            let (r, g, b) =
-                normalize_nclx_identity_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
+            if range == YCbCrRange::Full {
+                return (
+                    clip_to_bit_depth(i64::from(cr_sample), bit_depth),
+                    clip_to_bit_depth(i64::from(y_sample), bit_depth),
+                    clip_to_bit_depth(i64::from(cb_sample), bit_depth),
+                );
+            }
+
+            // Provenance: limited-range identity handling mirrors
+            // libheif/libheif/color-conversion/yuv2rgb.cc:
+            // Op_YCbCr_to_RGB::convert_colorspace and
+            // libheif/libheif/common_utils.h:clip_f_u16.
+            let limited_offset = limited_range_offset(bit_depth) as f32;
+            let r = (cr_sample as f32 - limited_offset) * 1.1429;
+            let g = (y_sample as f32 - limited_offset) * 1.1689;
+            let b = (cb_sample as f32 - limited_offset) * 1.1429;
             (
-                clip_to_bit_depth(i64::from(r), bit_depth),
-                clip_to_bit_depth(i64::from(g), bit_depth),
-                clip_to_bit_depth(i64::from(b), bit_depth),
+                clip_float_to_bit_depth(r, bit_depth),
+                clip_float_to_bit_depth(g, bit_depth),
+                clip_float_to_bit_depth(b, bit_depth),
             )
         }
         YCbCrToRgbTransform::Matrix(coeffs) => {
-            let (y, cb_centered, cr_centered) =
-                normalize_nclx_ycbcr_samples(y_sample, cb_sample, cr_sample, bit_depth, range);
-            let r = i64::from(y) + ((i64::from(coeffs.r_cr) * i64::from(cr_centered) + 128) >> 8);
-            let g = i64::from(y)
-                + ((i64::from(coeffs.g_cb) * i64::from(cb_centered)
-                    + i64::from(coeffs.g_cr) * i64::from(cr_centered)
+            if range == YCbCrRange::Limited {
+                // Provenance: limited-range matrix conversion mirrors
+                // libheif/libheif/color-conversion/yuv2rgb.cc:
+                // Op_YCbCr_to_RGB::convert_colorspace and
+                // libheif/libheif/common_utils.h:clip_f_u16.
+                let limited_offset = limited_range_offset(bit_depth) as f32;
+                let chroma_midpoint = chroma_midpoint(bit_depth) as f32;
+                let yv = (y_sample as f32 - limited_offset) * 1.1689;
+                let cb = (cb_sample as f32 - chroma_midpoint) * 1.1429;
+                let cr = (cr_sample as f32 - chroma_midpoint) * 1.1429;
+                let r = yv + coeffs.r_cr * cr;
+                let g = yv + coeffs.g_cb * cb + coeffs.g_cr * cr;
+                let b = yv + coeffs.b_cb * cb;
+                return (
+                    clip_float_to_bit_depth(r, bit_depth),
+                    clip_float_to_bit_depth(g, bit_depth),
+                    clip_float_to_bit_depth(b, bit_depth),
+                );
+            }
+
+            let chroma_midpoint = chroma_midpoint(bit_depth);
+            let cb_centered = cb_sample - chroma_midpoint;
+            let cr_centered = cr_sample - chroma_midpoint;
+            let r = i64::from(y_sample)
+                + ((i64::from(coeffs.r_cr_fp8) * i64::from(cr_centered) + 128) >> 8);
+            let g = i64::from(y_sample)
+                + ((i64::from(coeffs.g_cb_fp8) * i64::from(cb_centered)
+                    + i64::from(coeffs.g_cr_fp8) * i64::from(cr_centered)
                     + 128)
                     >> 8);
-            let b = i64::from(y) + ((i64::from(coeffs.b_cb) * i64::from(cb_centered) + 128) >> 8);
+            let b = i64::from(y_sample)
+                + ((i64::from(coeffs.b_cb_fp8) * i64::from(cb_centered) + 128) >> 8);
 
             (
                 clip_to_bit_depth(r, bit_depth),
@@ -3508,59 +3583,10 @@ fn ycbcr_to_rgb_components(
     }
 }
 
-fn normalize_nclx_identity_samples(
-    y_sample: i32,
-    cb_sample: i32,
-    cr_sample: i32,
-    bit_depth: u8,
-    range: YCbCrRange,
-) -> (i32, i32, i32) {
-    // Provenance: matrix_coefficients=0 handling mirrors
-    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace.
-    if range == YCbCrRange::Full {
-        return (cr_sample, y_sample, cb_sample);
-    }
-
-    let limited_offset = limited_range_offset(bit_depth);
-    let r = div_round_nearest(i64::from(cr_sample - limited_offset) * 256, 224) as i32;
-    let g = div_round_nearest(i64::from(y_sample - limited_offset) * 256, 219) as i32;
-    let b = div_round_nearest(i64::from(cb_sample - limited_offset) * 256, 224) as i32;
-    (r, g, b)
-}
-
-fn normalize_nclx_ycbcr_samples(
-    y_sample: i32,
-    cb_sample: i32,
-    cr_sample: i32,
-    bit_depth: u8,
-    range: YCbCrRange,
-) -> (i32, i32, i32) {
-    let chroma_midpoint = chroma_midpoint(bit_depth);
-    if range == YCbCrRange::Full {
-        return (
-            y_sample,
-            cb_sample - chroma_midpoint,
-            cr_sample - chroma_midpoint,
-        );
-    }
-
-    // Provenance: limited-range normalization mirrors the pre-matrix scaling in
-    // libheif/libheif/color-conversion/yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace:
-    // y'=(y-offset)*(256/219) and cb/cr centered terms scaled by (256/224).
-    let limited_offset = limited_range_offset(bit_depth);
-    let y_scaled = div_round_nearest(i64::from(y_sample - limited_offset) * 256, 219) as i32;
-    let cb_scaled = div_round_nearest(i64::from(cb_sample - chroma_midpoint) * 256, 224) as i32;
-    let cr_scaled = div_round_nearest(i64::from(cr_sample - chroma_midpoint) * 256, 224) as i32;
-    (y_scaled, cb_scaled, cr_scaled)
-}
-
-fn div_round_nearest(value: i64, divisor: i64) -> i64 {
-    debug_assert!(divisor > 0);
-    if value >= 0 {
-        (value + (divisor / 2)) / divisor
-    } else {
-        (value - (divisor / 2)) / divisor
-    }
+fn clip_float_to_bit_depth(value: f32, bit_depth: u8) -> u16 {
+    let rounded = (value + 0.5) as i32;
+    let max_value = ((1_i32 << bit_depth) - 1).max(0);
+    rounded.clamp(0, max_value) as u16
 }
 
 fn limited_range_offset(bit_depth: u8) -> i32 {
@@ -4648,6 +4674,11 @@ mod tests {
         assert_eq!(decoded.bit_depth_luma, metadata.bit_depth_luma);
         assert_eq!(decoded.bit_depth_chroma, metadata.bit_depth_chroma);
         assert_eq!(decoded.layout, metadata.layout);
+        assert_eq!(
+            decoded.ycbcr_range,
+            YCbCrRange::Limited,
+            "fixture without primary colr should keep limited-range signaling from HEVC bitstream metadata"
+        );
         assert_heic_plane_shapes(&decoded);
     }
 
