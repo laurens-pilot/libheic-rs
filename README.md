@@ -20,3 +20,7 @@ libheic-rs/target/release/heif-decode <input.heif|.heic|.avif> <output.png>
 
 - Project scaffolding and validation harness are in place.
 - Decoder implementation is not complete yet.
+
+## License
+
+`libheic-rs` is licensed under `LGPL-3.0-or-later`. See `LICENSE`.
