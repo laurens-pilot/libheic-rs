@@ -12,6 +12,7 @@ use rav1d::src::lib::{
 };
 use rav1d::Dav1dResult;
 use scuffle_h265::{NALUnitType, SpsNALUnit};
+use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
@@ -1109,8 +1110,14 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         let input = std::fs::read(input_path)?;
         let transforms = isobmff::parse_primary_item_transform_properties(&input)
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
+        let icc_profile = primary_icc_profile_from_avif(&input);
         let decoded = decode_primary_avif_to_image(&input)?;
-        write_decoded_avif_to_png(&decoded, &transforms.transforms, output_path)?;
+        write_decoded_avif_to_png(
+            &decoded,
+            &transforms.transforms,
+            icc_profile.as_deref(),
+            output_path,
+        )?;
         return Ok(());
     }
 
@@ -1119,8 +1126,14 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         let input = std::fs::read(input_path)?;
         let transforms = isobmff::parse_primary_item_transform_properties(&input)
             .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
+        let icc_profile = primary_icc_profile_from_heic(&input);
         let decoded = decode_primary_heic_to_image(&input)?;
-        write_decoded_heic_to_png(&decoded, &transforms.transforms, output_path)?;
+        write_decoded_heic_to_png(
+            &decoded,
+            &transforms.transforms,
+            icc_profile.as_deref(),
+            output_path,
+        )?;
         return Ok(());
     }
 
@@ -1128,6 +1141,24 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         "Unsupported file extension for input: {}",
         input_path.display()
     )))
+}
+
+fn primary_icc_profile_from_avif(input: &[u8]) -> Option<Vec<u8>> {
+    // Provenance: primary-item colr extraction follows libheif item-property
+    // traversal in libheif/libheif/context.cc, with colr payload parsing from
+    // libheif/libheif/nclx.cc:Box_colr::parse.
+    isobmff::parse_primary_avif_item_properties(input)
+        .ok()
+        .and_then(|properties| properties.colr.icc.map(|profile| profile.profile))
+}
+
+fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
+    // Provenance: primary-item colr extraction follows libheif item-property
+    // traversal in libheif/libheif/context.cc, with colr payload parsing from
+    // libheif/libheif/nclx.cc:Box_colr::parse.
+    isobmff::parse_primary_heic_item_preflight_properties(input)
+        .ok()
+        .and_then(|properties| properties.colr.icc.map(|profile| profile.profile))
 }
 
 fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> YCbCrRange {
@@ -1400,37 +1431,39 @@ fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
 fn write_decoded_avif_to_png(
     decoded: &DecodedAvifImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth <= 8 {
         let pixels = convert_avif_to_rgba8(decoded)?;
         let (width, height, transformed) =
             apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-        return write_rgba8_png(width, height, &transformed, output_path);
+        return write_rgba8_png(width, height, &transformed, icc_profile, output_path);
     }
 
     let pixels = convert_avif_to_rgba16(decoded)?;
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-    write_rgba16_png(width, height, &transformed, output_path)
+    write_rgba16_png(width, height, &transformed, icc_profile, output_path)
 }
 
 fn write_decoded_heic_to_png(
     decoded: &DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth_luma <= 8 {
         let pixels = convert_heic_to_rgba8(decoded)?;
         let (width, height, transformed) =
             apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-        return write_rgba8_png(width, height, &transformed, output_path);
+        return write_rgba8_png(width, height, &transformed, icc_profile, output_path);
     }
 
     let pixels = convert_heic_to_rgba16(decoded)?;
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-    write_rgba16_png(width, height, &transformed, output_path)
+    write_rgba16_png(width, height, &transformed, icc_profile, output_path)
 }
 
 fn apply_primary_item_transforms_rgba<T: Copy + Default>(
@@ -1963,14 +1996,19 @@ fn write_rgba8_png(
     width: u32,
     height: u32,
     pixels: &[u8],
+    icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     let file = File::create(output_path)?;
     let writer = BufWriter::new(file);
 
-    let mut encoder = png::Encoder::new(writer, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
+    let encoder = rgba_png_encoder_with_optional_icc_profile(
+        writer,
+        width,
+        height,
+        png::BitDepth::Eight,
+        icc_profile,
+    )?;
     let mut png_writer = encoder.write_header()?;
     png_writer.write_image_data(pixels)?;
 
@@ -1981,14 +2019,19 @@ fn write_rgba16_png(
     width: u32,
     height: u32,
     pixels: &[u16],
+    icc_profile: Option<&[u8]>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     let file = File::create(output_path)?;
     let writer = BufWriter::new(file);
 
-    let mut encoder = png::Encoder::new(writer, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Sixteen);
+    let encoder = rgba_png_encoder_with_optional_icc_profile(
+        writer,
+        width,
+        height,
+        png::BitDepth::Sixteen,
+        icc_profile,
+    )?;
     let mut png_writer = encoder.write_header()?;
 
     let byte_len = pixels
@@ -2002,6 +2045,23 @@ fn write_rgba16_png(
     png_writer.write_image_data(&bytes)?;
 
     Ok(())
+}
+
+fn rgba_png_encoder_with_optional_icc_profile<W: std::io::Write>(
+    writer: W,
+    width: u32,
+    height: u32,
+    bit_depth: png::BitDepth,
+    icc_profile: Option<&[u8]>,
+) -> Result<png::Encoder<'static, W>, DecodeError> {
+    let mut info = png::Info::with_size(width, height);
+    info.color_type = png::ColorType::Rgba;
+    info.bit_depth = bit_depth;
+    if let Some(profile) = icc_profile {
+        info.icc_profile = Some(Cow::Owned(profile.to_vec()));
+    }
+
+    png::Encoder::with_info(writer, info).map_err(DecodeError::PngEncoding)
 }
 
 fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAvifError> {
@@ -3222,14 +3282,15 @@ mod tests {
         decode_file_to_png, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
-        validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeAvifError, DecodeError, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
-        DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
+        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifPixelLayout, AvifPlane,
+        AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeHeicError, DecodedAvifImage,
+        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
         YCbCrMatrixCoefficients, YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -3329,6 +3390,20 @@ mod tests {
             png::BitDepth::Sixteen
         };
         assert_eq!(frame_info.bit_depth, expected_bit_depth);
+    }
+
+    #[test]
+    fn writes_rgba8_png_with_embedded_icc_profile() {
+        let output = test_output_png_path("rgba8-icc");
+        let _guard = TempFileGuard(output.clone());
+        let profile = vec![0x01, 0x23, 0x45, 0x67, 0x89];
+
+        write_rgba8_png(1, 1, &[0, 0, 0, 255], Some(&profile), &output)
+            .expect("RGBA8 PNG writer should embed provided ICC bytes");
+
+        let decoded_profile =
+            png_icc_profile(&output).expect("PNG reader should expose embedded ICC profile");
+        assert_eq!(decoded_profile, profile);
     }
 
     #[test]
@@ -3762,6 +3837,55 @@ mod tests {
     }
 
     #[test]
+    fn matches_libheif_primary_icc_profile_size_for_prof_fixture() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../libheif/fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5752063708495872.heic",
+        );
+        let input = std::fs::read(&fixture).expect("ICC fixture should be readable");
+        let preflight = crate::isobmff::parse_primary_heic_item_preflight_properties(&input)
+            .expect("HEIC preflight should parse ICC fixture");
+        let icc = preflight
+            .colr
+            .icc
+            .expect("fixture should provide a primary ICC colr payload");
+        assert_eq!(icc.profile_type.as_bytes(), *b"prof");
+
+        // Differential oracle: compare against libheif heif-info --dump-boxes
+        // output for the same fixture.
+        let heif_info_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.ralph/tools/libheif-build/examples/heif-info");
+        if !heif_info_bin.is_file() {
+            eprintln!(
+                "skipping libheif differential ICC test because {} is missing",
+                heif_info_bin.display()
+            );
+            return;
+        }
+
+        let output = Command::new(&heif_info_bin)
+            .arg("--dump-boxes")
+            .arg(&fixture)
+            .output()
+            .expect("heif-info should run for ICC differential check");
+        assert!(
+            output.status.success(),
+            "heif-info --dump-boxes failed with status {:?}",
+            output.status.code()
+        );
+
+        let reported_sizes = profile_sizes_from_libheif_dump(&output.stdout);
+        assert!(
+            !reported_sizes.is_empty(),
+            "libheif dump did not report any ICC profile size entries"
+        );
+        assert!(
+            reported_sizes.iter().all(|size| *size == icc.profile.len()),
+            "libheif profile sizes {reported_sizes:?} differ from parsed primary ICC payload size {}",
+            icc.profile.len()
+        );
+    }
+
+    #[test]
     fn decodes_assembled_heic_stream_for_fixture_into_image_model() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
@@ -3971,6 +4095,27 @@ mod tests {
             "libheic-rs-{label}-{}-{nanos}.png",
             std::process::id()
         ))
+    }
+
+    fn png_icc_profile(path: &PathBuf) -> Option<Vec<u8>> {
+        let png_data = std::fs::read(path).expect("PNG fixture should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let reader = decoder.read_info().expect("PNG info should decode");
+        reader
+            .info()
+            .icc_profile
+            .as_ref()
+            .map(|profile| profile.to_vec())
+    }
+
+    fn profile_sizes_from_libheif_dump(output: &[u8]) -> Vec<usize> {
+        String::from_utf8_lossy(output)
+            .lines()
+            .filter_map(|line| {
+                let (_, value) = line.split_once("profile size: ")?;
+                value.split_whitespace().next()?.parse::<usize>().ok()
+            })
+            .collect()
     }
 
     fn assert_plane_len(plane: &AvifPlane, expected_samples: usize) {
