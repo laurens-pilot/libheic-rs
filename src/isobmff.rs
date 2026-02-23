@@ -56,6 +56,24 @@ pub struct ParsedBox<'a> {
     pub offset: u64,
 }
 
+impl<'a> ParsedBox<'a> {
+    pub fn payload_offset(&self) -> u64 {
+        self.offset + u64::from(self.header.header_size)
+    }
+
+    /// Iterate immediate child boxes inside this box payload.
+    pub fn children(&self) -> BoxIter<'a> {
+        // Provenance: mirrors libheif child parsing in
+        // libheif/libheif/box.cc:Box::read_children, where child reads are
+        // range-limited to the parent payload and keep absolute offsets.
+        BoxIter::with_offset(self.payload, self.payload_offset())
+    }
+
+    pub fn parse_children(&self) -> Result<Vec<ParsedBox<'a>>, ParseBoxError> {
+        self.children().collect()
+    }
+}
+
 /// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseBoxError {
@@ -120,7 +138,7 @@ impl Display for ParseBoxError {
 
 impl Error for ParseBoxError {}
 
-/// Iterate top-level boxes from an input slice.
+/// Iterate BMFF boxes from an input slice.
 pub struct BoxIter<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -398,6 +416,72 @@ mod tests {
         let payload_ptr = parsed[0].payload.as_ptr();
         let expected_ptr = bytes[8..].as_ptr();
         assert_eq!(payload_ptr, expected_ptr);
+    }
+
+    #[test]
+    fn parses_nested_child_boxes_inside_parent_payload() {
+        let child_a = make_basic_box(*b"hdlr", &[0x00, 0x00, 0x00, 0x00]);
+        let child_b = make_basic_box(*b"pitm", &[0x01, 0x02]);
+        let mut meta_payload = Vec::new();
+        meta_payload.extend_from_slice(&child_a);
+        meta_payload.extend_from_slice(&child_b);
+        let bytes = make_basic_box(*b"meta", &meta_payload);
+
+        let top_level = parse_boxes(&bytes).expect("top-level box should parse");
+        let children = top_level[0]
+            .parse_children()
+            .expect("child boxes should parse");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].header.box_type.as_bytes(), *b"hdlr");
+        assert_eq!(children[1].header.box_type.as_bytes(), *b"pitm");
+        assert_eq!(children[0].offset, 8);
+        assert_eq!(children[1].offset, 8 + child_a.len() as u64);
+    }
+
+    #[test]
+    fn rejects_child_box_past_parent_payload_range() {
+        let mut invalid_child = Vec::new();
+        invalid_child.extend_from_slice(&16_u32.to_be_bytes());
+        invalid_child.extend_from_slice(b"hdlr");
+        invalid_child.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let bytes = make_basic_box(*b"meta", &invalid_child);
+
+        let top_level = parse_boxes(&bytes).expect("parent box should parse");
+        let err = top_level[0]
+            .parse_children()
+            .expect_err("out-of-range child must fail");
+        assert_eq!(
+            err,
+            ParseBoxError::BoxOutOfBounds {
+                offset: 8,
+                box_size: 16,
+                available: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn size_zero_child_box_consumes_remaining_parent_payload() {
+        let mut meta_payload = Vec::new();
+        meta_payload.extend_from_slice(&0_u32.to_be_bytes());
+        meta_payload.extend_from_slice(b"free");
+        meta_payload.extend_from_slice(&[0x10, 0x11, 0x12]);
+        meta_payload.extend_from_slice(&12_u32.to_be_bytes());
+        meta_payload.extend_from_slice(b"skip");
+        meta_payload.extend_from_slice(&[0x20, 0x21, 0x22, 0x23]);
+        let bytes = make_basic_box(*b"meta", &meta_payload);
+
+        let top_level = parse_boxes(&bytes).expect("parent box should parse");
+        let mut children = top_level[0].children();
+        let first = children
+            .next()
+            .expect("first child result should exist")
+            .expect("size=0 child should parse");
+        assert_eq!(first.header.box_type.as_bytes(), *b"free");
+        assert_eq!(first.header.box_size, meta_payload.len() as u64);
+        assert_eq!(first.offset, 8);
+        assert_eq!(first.payload, &meta_payload[8..]);
+        assert!(children.next().is_none());
     }
 
     fn make_basic_box(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
