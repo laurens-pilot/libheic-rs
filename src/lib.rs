@@ -431,6 +431,16 @@ pub enum DecodeHeicError {
         actual_width: u32,
         actual_height: u32,
     },
+    DecodedBitDepthMismatch {
+        expected_luma: u8,
+        expected_chroma: u8,
+        actual_luma: u8,
+        actual_chroma: u8,
+    },
+    DecodedLayoutMismatch {
+        expected: HeicPixelLayout,
+        actual: HeicPixelLayout,
+    },
 }
 
 impl Display for DecodeHeicError {
@@ -506,6 +516,19 @@ impl Display for DecodeHeicError {
             } => write!(
                 f,
                 "decoded HEVC SPS geometry mismatch: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+            ),
+            DecodeHeicError::DecodedBitDepthMismatch {
+                expected_luma,
+                expected_chroma,
+                actual_luma,
+                actual_chroma,
+            } => write!(
+                f,
+                "decoded HEVC bit depth mismatch: expected luma/chroma {expected_luma}/{expected_chroma}, got {actual_luma}/{actual_chroma}"
+            ),
+            DecodeHeicError::DecodedLayoutMismatch { expected, actual } => write!(
+                f,
+                "decoded HEVC chroma layout mismatch: expected {expected:?}, got {actual:?}"
             ),
         }
     }
@@ -592,29 +615,89 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
 /// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
-    let stream = assemble_primary_heic_hevc_stream(input)?;
-    decode_hevc_stream_to_image(&stream)
+    let (stream, metadata) = decode_primary_heic_stream_and_metadata(input)?;
+    let decoded = decode_hevc_stream_to_image(&stream)?;
+    validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+    Ok(decoded)
 }
 
 /// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    let (_, metadata) = decode_primary_heic_stream_and_metadata(input)?;
+    Ok(metadata)
+}
+
+fn decode_primary_heic_stream_and_metadata(
+    input: &[u8],
+) -> Result<(Vec<u8>, DecodedHeicImageMetadata), DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
     let decoded = decode_hevc_stream_metadata_from_sps(&stream)?;
+    validate_decoded_heic_geometry_against_ispe(
+        &decoded,
+        properties.ispe.width,
+        properties.ispe.height,
+    )?;
+    Ok((stream, decoded))
+}
 
-    if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
+fn validate_decoded_heic_geometry_against_ispe(
+    metadata: &DecodedHeicImageMetadata,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), DecodeHeicError> {
+    if metadata.width != expected_width || metadata.height != expected_height {
         return Err(DecodeHeicError::DecodedGeometryMismatch {
-            expected_width: properties.ispe.width,
-            expected_height: properties.ispe.height,
+            expected_width,
+            expected_height,
+            actual_width: metadata.width,
+            actual_height: metadata.height,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_decoded_heic_image_against_metadata(
+    decoded: &DecodedHeicImage,
+    metadata: &DecodedHeicImageMetadata,
+) -> Result<(), DecodeHeicError> {
+    // Provenance: mirrors libheif's decoder metadata expectations where HEVC
+    // coded-image chroma/bit-depth metadata is exposed by
+    // Decoder_HEVC::{get_coded_image_colorspace,get_luma_bits_per_pixel,get_chroma_bits_per_pixel}
+    // and backend output planes are materialized in
+    // plugins/decoder_libde265.cc:convert_libde265_image_to_heif_image.
+    if decoded.width != metadata.width || decoded.height != metadata.height {
+        return Err(DecodeHeicError::DecodedGeometryMismatch {
+            expected_width: metadata.width,
+            expected_height: metadata.height,
             actual_width: decoded.width,
             actual_height: decoded.height,
         });
     }
 
-    Ok(decoded)
+    if decoded.layout != metadata.layout {
+        return Err(DecodeHeicError::DecodedLayoutMismatch {
+            expected: metadata.layout,
+            actual: decoded.layout,
+        });
+    }
+
+    if decoded.bit_depth_luma != metadata.bit_depth_luma
+        || decoded.bit_depth_chroma != metadata.bit_depth_chroma
+    {
+        return Err(DecodeHeicError::DecodedBitDepthMismatch {
+            expected_luma: metadata.bit_depth_luma,
+            expected_chroma: metadata.bit_depth_chroma,
+            actual_luma: decoded.bit_depth_luma,
+            actual_chroma: decoded.bit_depth_chroma,
+        });
+    }
+
+    Ok(())
 }
 
 fn decode_hevc_stream_to_image(stream: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
@@ -1852,9 +1935,10 @@ mod tests {
         append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
         convert_avif_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
         decode_hevc_stream_to_image, decode_primary_avif_to_image, decode_primary_heic_to_image,
-        decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units, AvifPixelLayout,
-        AvifPlane, AvifPlaneSamples, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
-        HeicPixelLayout, HevcNalClass,
+        decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
+        validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
+        DecodeHeicError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
+        HeicPixelLayout, HeicPlane, HevcNalClass,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -2051,14 +2135,89 @@ mod tests {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
         let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+        let metadata = decode_primary_heic_to_metadata(&input)
+            .expect("fixture metadata should decode before image-model validation");
 
         let decoded = decode_primary_heic_to_image(&input)
             .expect("fixture without pixi should decode to planar HEIC image");
-        assert!(decoded.width > 0);
-        assert!(decoded.height > 0);
-        assert!(decoded.bit_depth_luma >= 8);
-        assert!(decoded.bit_depth_chroma >= 8);
+        assert_eq!(decoded.width, metadata.width);
+        assert_eq!(decoded.height, metadata.height);
+        assert_eq!(decoded.bit_depth_luma, metadata.bit_depth_luma);
+        assert_eq!(decoded.bit_depth_chroma, metadata.bit_depth_chroma);
+        assert_eq!(decoded.layout, metadata.layout);
         assert_heic_plane_shapes(&decoded);
+    }
+
+    #[test]
+    fn rejects_decoded_heic_image_with_layout_mismatch_against_metadata() {
+        let decoded = DecodedHeicImage {
+            width: 2,
+            height: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: HeicPixelLayout::Yuv400,
+            y_plane: HeicPlane {
+                width: 2,
+                height: 1,
+                samples: vec![0, 0],
+            },
+            u_plane: None,
+            v_plane: None,
+        };
+        let metadata = DecodedHeicImageMetadata {
+            width: 2,
+            height: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: HeicPixelLayout::Yuv420,
+        };
+
+        let err = validate_decoded_heic_image_against_metadata(&decoded, &metadata)
+            .expect_err("layout mismatch should fail deterministic metadata validation");
+        assert!(matches!(
+            err,
+            DecodeHeicError::DecodedLayoutMismatch {
+                expected: HeicPixelLayout::Yuv420,
+                actual: HeicPixelLayout::Yuv400,
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_decoded_heic_image_with_bit_depth_mismatch_against_metadata() {
+        let decoded = DecodedHeicImage {
+            width: 2,
+            height: 1,
+            bit_depth_luma: 10,
+            bit_depth_chroma: 10,
+            layout: HeicPixelLayout::Yuv400,
+            y_plane: HeicPlane {
+                width: 2,
+                height: 1,
+                samples: vec![0, 0],
+            },
+            u_plane: None,
+            v_plane: None,
+        };
+        let metadata = DecodedHeicImageMetadata {
+            width: 2,
+            height: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout: HeicPixelLayout::Yuv400,
+        };
+
+        let err = validate_decoded_heic_image_against_metadata(&decoded, &metadata)
+            .expect_err("bit-depth mismatch should fail deterministic metadata validation");
+        assert!(matches!(
+            err,
+            DecodeHeicError::DecodedBitDepthMismatch {
+                expected_luma: 8,
+                expected_chroma: 8,
+                actual_luma: 10,
+                actual_chroma: 10,
+            }
+        ));
     }
 
     #[test]
