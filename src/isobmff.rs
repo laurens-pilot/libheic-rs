@@ -10,6 +10,10 @@ const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
 const META_BOX_TYPE: [u8; 4] = *b"meta";
 const PITM_BOX_TYPE: [u8; 4] = *b"pitm";
 const ILOC_BOX_TYPE: [u8; 4] = *b"iloc";
+const IINF_BOX_TYPE: [u8; 4] = *b"iinf";
+const INFE_BOX_TYPE: [u8; 4] = *b"infe";
+const INFE_ITEM_TYPE_MIME: [u8; 4] = *b"mime";
+const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
@@ -149,6 +153,30 @@ impl<'a> ParsedBox<'a> {
 
         parse_iloc_payload(self.payload, self.payload_offset())
     }
+
+    /// Parse this box payload as an `infe` box.
+    pub fn parse_infe(&self) -> Result<ItemInfoEntryBox, ParseItemInfoEntryBoxError> {
+        if self.header.box_type.as_bytes() != INFE_BOX_TYPE {
+            return Err(ParseItemInfoEntryBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_infe_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `iinf` box.
+    pub fn parse_iinf(&self) -> Result<ItemInfoBox, ParseItemInfoBoxError> {
+        if self.header.box_type.as_bytes() != IINF_BOX_TYPE {
+            return Err(ParseItemInfoBoxError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_iinf_payload(self.payload, self.payload_offset())
+    }
 }
 
 /// Parsed `ftyp` box payload fields.
@@ -200,6 +228,28 @@ pub struct ItemLocationBox {
     pub base_offset_size: u8,
     pub index_size: u8,
     pub items: Vec<ItemLocationItem>,
+}
+
+/// Parsed `infe` (item info entry) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemInfoEntryBox {
+    pub full_box: FullBoxHeader,
+    pub item_id: u32,
+    pub item_protection_index: u16,
+    pub item_type: Option<FourCc>,
+    pub item_name: Vec<u8>,
+    pub content_type: Option<Vec<u8>>,
+    pub content_encoding: Option<Vec<u8>>,
+    pub item_uri_type: Option<Vec<u8>>,
+    pub hidden_item: bool,
+}
+
+/// Parsed `iinf` (item info) payload fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItemInfoBox {
+    pub full_box: FullBoxHeader,
+    pub item_count: u32,
+    pub entries: Vec<ItemInfoEntryBox>,
 }
 
 /// Parsed `meta` payload fields.
@@ -457,6 +507,165 @@ impl Error for ParseItemLocationBoxError {
 impl From<ParseFullBoxError> for ParseItemLocationBoxError {
     fn from(value: ParseFullBoxError) -> Self {
         Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing an `infe` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemInfoEntryBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseItemInfoEntryBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemInfoEntryBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected infe box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemInfoEntryBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseItemInfoEntryBoxError::UnsupportedVersion { offset, version } => write!(
+                f,
+                "infe box at offset {offset} has unsupported full box version {version}"
+            ),
+            ParseItemInfoEntryBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "infe payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseItemInfoEntryBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemInfoEntryBoxError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseItemInfoEntryBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+/// Errors returned when parsing an `iinf` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseItemInfoBoxError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    EntryCountTooLarge {
+        offset: u64,
+        item_count: u32,
+    },
+    ChildBox(ParseBoxError),
+    DeclaredEntryCountMismatch {
+        offset: u64,
+        declared: u32,
+        parsed: usize,
+    },
+    UnexpectedEntryBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    Entry(ParseItemInfoEntryBoxError),
+}
+
+impl Display for ParseItemInfoBoxError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseItemInfoBoxError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected iinf box at offset {offset}, got box type {actual}"
+            ),
+            ParseItemInfoBoxError::FullBox(err) => write!(f, "{err}"),
+            ParseItemInfoBoxError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "iinf payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseItemInfoBoxError::EntryCountTooLarge { offset, item_count } => write!(
+                f,
+                "iinf item_count {item_count} cannot be represented at offset {offset}"
+            ),
+            ParseItemInfoBoxError::ChildBox(err) => write!(f, "{err}"),
+            ParseItemInfoBoxError::DeclaredEntryCountMismatch {
+                offset,
+                declared,
+                parsed,
+            } => write!(
+                f,
+                "iinf declared {declared} item info entries but parsed {parsed} entries at offset {offset}"
+            ),
+            ParseItemInfoBoxError::UnexpectedEntryBoxType { offset, actual } => write!(
+                f,
+                "expected infe child box in iinf at offset {offset}, got box type {actual}"
+            ),
+            ParseItemInfoBoxError::Entry(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for ParseItemInfoBoxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseItemInfoBoxError::FullBox(err) => Some(err),
+            ParseItemInfoBoxError::ChildBox(err) => Some(err),
+            ParseItemInfoBoxError::Entry(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseItemInfoBoxError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
+impl From<ParseBoxError> for ParseItemInfoBoxError {
+    fn from(value: ParseBoxError) -> Self {
+        Self::ChildBox(value)
+    }
+}
+
+impl From<ParseItemInfoEntryBoxError> for ParseItemInfoBoxError {
+    fn from(value: ParseItemInfoEntryBoxError) -> Self {
+        Self::Entry(value)
     }
 }
 
@@ -830,6 +1039,149 @@ fn parse_iloc_payload(
     })
 }
 
+fn parse_infe_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ItemInfoEntryBox, ParseItemInfoEntryBoxError> {
+    // Provenance: mirrors infe field parsing in
+    // libheif/libheif/box.cc:Box_infe::parse, including supported version
+    // handling (0..=3), hidden-item flag decoding for v2+, and conditional
+    // MIME/URI string fields based on item_type.
+    let (full_box, infe_payload, infe_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    if full_box.version > 3 {
+        return Err(ParseItemInfoEntryBoxError::UnsupportedVersion {
+            offset: payload_offset,
+            version: full_box.version,
+        });
+    }
+
+    let mut cursor = 0_usize;
+    let item_id;
+    let item_protection_index;
+    let mut item_type = None;
+    let item_name;
+    let mut content_type = None;
+    let mut content_encoding = None;
+    let mut item_uri_type = None;
+    let hidden_item;
+
+    if full_box.version <= 1 {
+        item_id = u32::from(read_u16_cursor_infe(
+            infe_payload,
+            &mut cursor,
+            infe_payload_offset,
+            "item_ID",
+        )?);
+        item_protection_index = read_u16_cursor_infe(
+            infe_payload,
+            &mut cursor,
+            infe_payload_offset,
+            "item_protection_index",
+        )?;
+        item_name = read_c_string_cursor(infe_payload, &mut cursor);
+        content_type = Some(read_c_string_cursor(infe_payload, &mut cursor));
+        content_encoding = Some(read_c_string_cursor(infe_payload, &mut cursor));
+        hidden_item = false;
+    } else {
+        hidden_item = (full_box.flags & 0x1) != 0;
+        item_id = if full_box.version == 2 {
+            u32::from(read_u16_cursor_infe(
+                infe_payload,
+                &mut cursor,
+                infe_payload_offset,
+                "item_ID",
+            )?)
+        } else {
+            read_u32_cursor_infe(infe_payload, &mut cursor, infe_payload_offset, "item_ID")?
+        };
+        item_protection_index = read_u16_cursor_infe(
+            infe_payload,
+            &mut cursor,
+            infe_payload_offset,
+            "item_protection_index",
+        )?;
+        let parsed_item_type =
+            read_fourcc_cursor_infe(infe_payload, &mut cursor, infe_payload_offset, "item_type")?;
+        item_type = Some(parsed_item_type);
+        item_name = read_c_string_cursor(infe_payload, &mut cursor);
+        if parsed_item_type.as_bytes() == INFE_ITEM_TYPE_MIME {
+            content_type = Some(read_c_string_cursor(infe_payload, &mut cursor));
+            content_encoding = Some(read_c_string_cursor(infe_payload, &mut cursor));
+        } else if parsed_item_type.as_bytes() == INFE_ITEM_TYPE_URI {
+            item_uri_type = Some(read_c_string_cursor(infe_payload, &mut cursor));
+        }
+    }
+
+    Ok(ItemInfoEntryBox {
+        full_box,
+        item_id,
+        item_protection_index,
+        item_type,
+        item_name,
+        content_type,
+        content_encoding,
+        item_uri_type,
+        hidden_item,
+    })
+}
+
+fn parse_iinf_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ItemInfoBox, ParseItemInfoBoxError> {
+    // Provenance: mirrors iinf parsing flow in libheif/libheif/box.cc:Box_iinf::parse,
+    // where entry_count width is 16-bit for v0 and 32-bit for v1+.
+    let (full_box, iinf_payload, iinf_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+    let mut cursor = 0_usize;
+    let item_count = if full_box.version == 0 {
+        u32::from(read_u16_cursor_iinf(
+            iinf_payload,
+            &mut cursor,
+            iinf_payload_offset,
+            "item_count",
+        )?)
+    } else {
+        read_u32_cursor_iinf(iinf_payload, &mut cursor, iinf_payload_offset, "item_count")?
+    };
+    let declared_item_count =
+        usize::try_from(item_count).map_err(|_| ParseItemInfoBoxError::EntryCountTooLarge {
+            offset: iinf_payload_offset,
+            item_count,
+        })?;
+
+    let entries_payload = &iinf_payload[cursor..];
+    let entries_payload_offset = iinf_payload_offset + cursor as u64;
+    let child_boxes: Vec<ParsedBox<'_>> =
+        BoxIter::with_offset(entries_payload, entries_payload_offset)
+            .collect::<Result<Vec<_>, ParseBoxError>>()?;
+    if child_boxes.len() != declared_item_count {
+        return Err(ParseItemInfoBoxError::DeclaredEntryCountMismatch {
+            offset: entries_payload_offset,
+            declared: item_count,
+            parsed: child_boxes.len(),
+        });
+    }
+
+    let mut entries = Vec::with_capacity(child_boxes.len());
+    for child in child_boxes {
+        if child.header.box_type.as_bytes() != INFE_BOX_TYPE {
+            return Err(ParseItemInfoBoxError::UnexpectedEntryBoxType {
+                offset: child.offset,
+                actual: child.header.box_type,
+            });
+        }
+        entries.push(parse_infe_payload(child.payload, child.payload_offset())?);
+    }
+
+    Ok(ItemInfoBox {
+        full_box,
+        item_count,
+        entries,
+    })
+}
+
 fn validate_iloc_size_field(
     offset: u64,
     field: ItemLocationField,
@@ -876,6 +1228,119 @@ fn iloc_field_context(field: ItemLocationField) -> &'static str {
         ItemLocationField::Length => "extent_length",
         ItemLocationField::BaseOffset => "base_offset",
         ItemLocationField::Index => "extent_index",
+    }
+}
+
+fn read_u16_cursor_infe(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseItemInfoEntryBoxError> {
+    let bytes = take_cursor_bytes_infe(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_infe(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseItemInfoEntryBoxError> {
+    let bytes = take_cursor_bytes_infe(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn read_fourcc_cursor_infe(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<FourCc, ParseItemInfoEntryBoxError> {
+    let bytes = take_cursor_bytes_infe(payload, cursor, BRAND_FIELD_SIZE, payload_offset, context)?;
+    Ok(read_fourcc(bytes))
+}
+
+fn take_cursor_bytes_infe<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseItemInfoEntryBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseItemInfoEntryBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
+fn read_u16_cursor_iinf(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseItemInfoBoxError> {
+    let bytes = take_cursor_bytes_iinf(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_iinf(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseItemInfoBoxError> {
+    let bytes = take_cursor_bytes_iinf(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn take_cursor_bytes_iinf<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseItemInfoBoxError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseItemInfoBoxError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
+fn read_c_string_cursor(payload: &[u8], cursor: &mut usize) -> Vec<u8> {
+    if *cursor >= payload.len() {
+        return Vec::new();
+    }
+
+    let start = *cursor;
+    let tail = &payload[start..];
+    if let Some(terminator) = tail.iter().position(|byte| *byte == 0) {
+        let end = start + terminator;
+        *cursor = end + 1;
+        payload[start..end].to_vec()
+    } else {
+        *cursor = payload.len();
+        payload[start..].to_vec()
     }
 }
 
@@ -1049,8 +1514,9 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         parse_boxes, BoxIter, FourCc, ItemLocationField, ParseBoxError, ParseFileTypeBoxError,
-        ParseFullBoxError, ParseItemLocationBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError,
-        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParseFullBoxError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
+        ParseItemLocationBoxError, ParseMetaBoxError, ParsePrimaryItemBoxError, BASIC_HEADER_SIZE,
+        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -1699,6 +2165,287 @@ mod tests {
             ParseItemLocationBoxError::PayloadTooSmall {
                 offset: 20,
                 context: "base_offset",
+                available: 2,
+                required: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_infe_version_two_entry_with_item_type() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x01]); // version=2, flags=1 (hidden)
+        payload.extend_from_slice(&0x0042_u16.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        payload.extend_from_slice(b"av01"); // item_type
+        payload.extend_from_slice(b"primary\0"); // item_name
+        let bytes = make_basic_box(*b"infe", &payload);
+        let top_level = parse_boxes(&bytes).expect("infe box should parse");
+
+        let infe = top_level[0]
+            .parse_infe()
+            .expect("infe v2 payload should parse");
+        assert_eq!(infe.full_box.version, 2);
+        assert_eq!(infe.full_box.flags, 1);
+        assert_eq!(infe.item_id, 0x42);
+        assert_eq!(infe.item_protection_index, 0);
+        assert_eq!(infe.item_type, Some(FourCc::new(*b"av01")));
+        assert_eq!(infe.item_name, b"primary".to_vec());
+        assert_eq!(infe.content_type, None);
+        assert_eq!(infe.content_encoding, None);
+        assert_eq!(infe.item_uri_type, None);
+        assert!(infe.hidden_item);
+    }
+
+    #[test]
+    fn parses_infe_version_three_mime_entry_fields() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]); // version=3, flags=0
+        payload.extend_from_slice(&0x1234_5678_u32.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&2_u16.to_be_bytes()); // item_protection_index
+        payload.extend_from_slice(b"mime"); // item_type
+        payload.extend_from_slice(b"Exif\0"); // item_name
+        payload.extend_from_slice(b"application/rdf+xml\0"); // content_type
+        payload.extend_from_slice(b"compress_zlib\0"); // content_encoding
+        let bytes = make_basic_box(*b"infe", &payload);
+        let top_level = parse_boxes(&bytes).expect("infe box should parse");
+
+        let infe = top_level[0]
+            .parse_infe()
+            .expect("infe v3 MIME payload should parse");
+        assert_eq!(infe.full_box.version, 3);
+        assert_eq!(infe.item_id, 0x1234_5678);
+        assert_eq!(infe.item_protection_index, 2);
+        assert_eq!(infe.item_type, Some(FourCc::new(*b"mime")));
+        assert_eq!(infe.item_name, b"Exif".to_vec());
+        assert_eq!(infe.content_type, Some(b"application/rdf+xml".to_vec()));
+        assert_eq!(infe.content_encoding, Some(b"compress_zlib".to_vec()));
+        assert_eq!(infe.item_uri_type, None);
+        assert!(!infe.hidden_item);
+    }
+
+    #[test]
+    fn parses_infe_version_zero_legacy_fields() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&0x0203_u16.to_be_bytes()); // item_ID
+        payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // item_protection_index
+        payload.extend_from_slice(b"legacy\0"); // item_name
+        payload.extend_from_slice(b"image/jpeg\0"); // content_type
+        payload.extend_from_slice(b"gzip\0"); // content_encoding
+        let bytes = make_basic_box(*b"infe", &payload);
+        let top_level = parse_boxes(&bytes).expect("infe box should parse");
+
+        let infe = top_level[0]
+            .parse_infe()
+            .expect("infe v0 payload should parse");
+        assert_eq!(infe.full_box.version, 0);
+        assert_eq!(infe.item_id, 0x0203);
+        assert_eq!(infe.item_protection_index, 1);
+        assert_eq!(infe.item_type, None);
+        assert_eq!(infe.item_name, b"legacy".to_vec());
+        assert_eq!(infe.content_type, Some(b"image/jpeg".to_vec()));
+        assert_eq!(infe.content_encoding, Some(b"gzip".to_vec()));
+        assert_eq!(infe.item_uri_type, None);
+        assert!(!infe.hidden_item);
+    }
+
+    #[test]
+    fn rejects_infe_parse_for_non_infe_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_infe()
+            .expect_err("parsing non-infe as infe must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoEntryBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_infe_parse_for_unsupported_version() {
+        let bytes = make_basic_box(*b"infe", &[0x04, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("infe box should parse");
+
+        let err = top_level[0]
+            .parse_infe()
+            .expect_err("unsupported infe version must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoEntryBoxError::UnsupportedVersion {
+                offset: BASIC_HEADER_SIZE as u64,
+                version: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_infe_parse_when_item_id_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]); // version=3, flags=0
+        payload.extend_from_slice(&[0xaa, 0xbb, 0xcc]); // truncated item_ID
+        let bytes = make_basic_box(*b"infe", &payload);
+        let top_level = parse_boxes(&bytes).expect("infe box should parse");
+
+        let err = top_level[0]
+            .parse_infe()
+            .expect_err("truncated infe item_ID must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoEntryBoxError::PayloadTooSmall {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                context: "item_ID",
+                available: 3,
+                required: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_iinf_version_zero_with_infe_entries() {
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x01]); // version=2, flags=1
+        infe_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01"); // item_type
+        infe_payload.extend_from_slice(b"primary\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let bytes = make_basic_box(*b"iinf", &iinf_payload);
+        let top_level = parse_boxes(&bytes).expect("iinf box should parse");
+
+        let iinf = top_level[0]
+            .parse_iinf()
+            .expect("iinf payload should parse");
+        assert_eq!(iinf.full_box.version, 0);
+        assert_eq!(iinf.item_count, 1);
+        assert_eq!(iinf.entries.len(), 1);
+        assert_eq!(iinf.entries[0].item_id, 1);
+        assert_eq!(iinf.entries[0].item_type, Some(FourCc::new(*b"av01")));
+        assert!(iinf.entries[0].hidden_item);
+    }
+
+    #[test]
+    fn parses_iinf_version_one_with_u32_count() {
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&0x0020_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"hvc1"); // item_type
+        infe_payload.extend_from_slice(b"image\0"); // item_name
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        iinf_payload.extend_from_slice(&1_u32.to_be_bytes()); // item_count
+        iinf_payload.extend_from_slice(&infe);
+        let bytes = make_basic_box(*b"iinf", &iinf_payload);
+        let top_level = parse_boxes(&bytes).expect("iinf box should parse");
+
+        let iinf = top_level[0]
+            .parse_iinf()
+            .expect("iinf v1 payload should parse");
+        assert_eq!(iinf.full_box.version, 1);
+        assert_eq!(iinf.item_count, 1);
+        assert_eq!(iinf.entries.len(), 1);
+        assert_eq!(iinf.entries[0].item_id, 0x20);
+        assert_eq!(iinf.entries[0].item_type, Some(FourCc::new(*b"hvc1")));
+    }
+
+    #[test]
+    fn rejects_iinf_parse_for_non_iinf_box() {
+        let bytes = make_basic_box(*b"free", &[0x00, 0x00, 0x00, 0x00]);
+        let top_level = parse_boxes(&bytes).expect("free box should parse");
+
+        let err = top_level[0]
+            .parse_iinf()
+            .expect_err("parsing non-iinf as iinf must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoBoxError::UnexpectedBoxType {
+                offset: 0,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iinf_when_declared_entry_count_mismatches_payload() {
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version=2, flags=0
+        infe_payload.extend_from_slice(&0x0001_u16.to_be_bytes()); // item_ID
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        infe_payload.extend_from_slice(b"av01");
+        infe_payload.extend_from_slice(b"a\0");
+        let infe = make_basic_box(*b"infe", &infe_payload);
+
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iinf_payload.extend_from_slice(&2_u16.to_be_bytes()); // item_count (mismatch)
+        iinf_payload.extend_from_slice(&infe); // only one entry present
+        let bytes = make_basic_box(*b"iinf", &iinf_payload);
+        let top_level = parse_boxes(&bytes).expect("iinf box should parse");
+
+        let err = top_level[0]
+            .parse_iinf()
+            .expect_err("mismatched iinf item_count must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoBoxError::DeclaredEntryCountMismatch {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE + 2) as u64,
+                declared: 2,
+                parsed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iinf_when_child_box_type_is_not_infe() {
+        let child = make_basic_box(*b"free", &[0x01, 0x02, 0x03, 0x04]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        payload.extend_from_slice(&child);
+        let bytes = make_basic_box(*b"iinf", &payload);
+        let top_level = parse_boxes(&bytes).expect("iinf box should parse");
+
+        let err = top_level[0]
+            .parse_iinf()
+            .expect_err("unexpected iinf child type must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoBoxError::UnexpectedEntryBoxType {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE + 2) as u64,
+                actual: FourCc::new(*b"free"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_iinf_when_item_count_field_is_truncated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version=1, flags=0
+        payload.extend_from_slice(&[0xaa, 0xbb]); // truncated 32-bit item_count
+        let bytes = make_basic_box(*b"iinf", &payload);
+        let top_level = parse_boxes(&bytes).expect("iinf box should parse");
+
+        let err = top_level[0]
+            .parse_iinf()
+            .expect_err("truncated iinf item_count must fail");
+        assert_eq!(
+            err,
+            ParseItemInfoBoxError::PayloadTooSmall {
+                offset: (BASIC_HEADER_SIZE + FULL_BOX_HEADER_SIZE) as u64,
+                context: "item_count",
                 available: 2,
                 required: 4,
             }
