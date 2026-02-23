@@ -233,6 +233,7 @@ impl<'a> LengthPrefixedHevcNalUnit<'a> {
 #[derive(Debug)]
 pub enum DecodeAvifError {
     ParsePrimaryProperties(isobmff::ParsePrimaryAvifPropertiesError),
+    ParsePrimaryTransforms(isobmff::ParsePrimaryItemTransformPropertiesError),
     ExtractPrimaryPayload(isobmff::ExtractAvifItemDataError),
     DecoderAllocationFailed {
         length: usize,
@@ -302,6 +303,7 @@ impl Display for DecodeAvifError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeAvifError::ParsePrimaryProperties(err) => write!(f, "{err}"),
+            DecodeAvifError::ParsePrimaryTransforms(err) => write!(f, "{err}"),
             DecodeAvifError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
             DecodeAvifError::DecoderAllocationFailed { length } => write!(
                 f,
@@ -396,6 +398,7 @@ impl Error for DecodeAvifError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             DecodeAvifError::ParsePrimaryProperties(err) => Some(err),
+            DecodeAvifError::ParsePrimaryTransforms(err) => Some(err),
             DecodeAvifError::ExtractPrimaryPayload(err) => Some(err),
             _ => None,
         }
@@ -418,6 +421,7 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
 #[derive(Debug)]
 pub enum DecodeHeicError {
     ParsePrimaryProperties(isobmff::ParsePrimaryHeicPropertiesError),
+    ParsePrimaryTransforms(isobmff::ParsePrimaryItemTransformPropertiesError),
     ExtractPrimaryPayload(isobmff::ExtractHeicItemDataError),
     BackendDecodeFailed {
         detail: String,
@@ -488,6 +492,7 @@ impl Display for DecodeHeicError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeHeicError::ParsePrimaryProperties(err) => write!(f, "{err}"),
+            DecodeHeicError::ParsePrimaryTransforms(err) => write!(f, "{err}"),
             DecodeHeicError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
             DecodeHeicError::BackendDecodeFailed { detail } => {
                 write!(f, "pure-Rust HEVC backend failed to decode frame: {detail}")
@@ -585,6 +590,7 @@ impl Error for DecodeHeicError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             DecodeHeicError::ParsePrimaryProperties(err) => Some(err),
+            DecodeHeicError::ParsePrimaryTransforms(err) => Some(err),
             DecodeHeicError::ExtractPrimaryPayload(err) => Some(err),
             _ => None,
         }
@@ -1101,16 +1107,20 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     let extension = input_path.extension().and_then(|ext| ext.to_str());
     if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("avif")) {
         let input = std::fs::read(input_path)?;
+        let transforms = isobmff::parse_primary_item_transform_properties(&input)
+            .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
         let decoded = decode_primary_avif_to_image(&input)?;
-        write_decoded_avif_to_png(&decoded, output_path)?;
+        write_decoded_avif_to_png(&decoded, &transforms.transforms, output_path)?;
         return Ok(());
     }
 
     if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"))
     {
         let input = std::fs::read(input_path)?;
+        let transforms = isobmff::parse_primary_item_transform_properties(&input)
+            .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
         let decoded = decode_primary_heic_to_image(&input)?;
-        write_decoded_heic_to_png(&decoded, output_path)?;
+        write_decoded_heic_to_png(&decoded, &transforms.transforms, output_path)?;
         return Ok(());
     }
 
@@ -1389,28 +1399,238 @@ fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
 
 fn write_decoded_avif_to_png(
     decoded: &DecodedAvifImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth <= 8 {
         let pixels = convert_avif_to_rgba8(decoded)?;
-        return write_rgba8_png(decoded.width, decoded.height, &pixels, output_path);
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+        return write_rgba8_png(width, height, &transformed, output_path);
     }
 
     let pixels = convert_avif_to_rgba16(decoded)?;
-    write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
+    let (width, height, transformed) =
+        apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+    write_rgba16_png(width, height, &transformed, output_path)
 }
 
 fn write_decoded_heic_to_png(
     decoded: &DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
     output_path: &Path,
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth_luma <= 8 {
         let pixels = convert_heic_to_rgba8(decoded)?;
-        return write_rgba8_png(decoded.width, decoded.height, &pixels, output_path);
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+        return write_rgba8_png(width, height, &transformed, output_path);
     }
 
     let pixels = convert_heic_to_rgba16(decoded)?;
-    write_rgba16_png(decoded.width, decoded.height, &pixels, output_path)
+    let (width, height, transformed) =
+        apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
+    write_rgba16_png(width, height, &transformed, output_path)
+}
+
+fn apply_primary_item_transforms_rgba<T: Copy + Default>(
+    width: u32,
+    height: u32,
+    pixels: Vec<T>,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<(u32, u32, Vec<T>), DecodeError> {
+    let expected = checked_rgba_sample_count(width, height)?;
+    if pixels.len() != expected {
+        return Err(DecodeError::Unsupported(format!(
+            "RGBA sample count mismatch for transform input: got {}, expected {expected} for {}x{}",
+            pixels.len(),
+            width,
+            height
+        )));
+    }
+
+    let mut current_width = width;
+    let mut current_height = height;
+    let mut current_pixels = pixels;
+
+    for transform in transforms {
+        match transform {
+            isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
+                let (next_width, next_height, next_pixels) = rotate_rgba_ccw(
+                    current_width,
+                    current_height,
+                    &current_pixels,
+                    rotation.rotation_ccw_degrees,
+                )?;
+                current_width = next_width;
+                current_height = next_height;
+                current_pixels = next_pixels;
+            }
+            isobmff::PrimaryItemTransformProperty::Mirror(mirror) => {
+                current_pixels = mirror_rgba(
+                    current_width,
+                    current_height,
+                    &current_pixels,
+                    mirror.direction,
+                )?;
+            }
+        }
+    }
+
+    Ok((current_width, current_height, current_pixels))
+}
+
+fn checked_rgba_sample_count(width: u32, height: u32) -> Result<usize, DecodeError> {
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| {
+            DecodeError::Unsupported(format!(
+                "RGBA pixel count overflow for dimensions {}x{}",
+                width, height
+            ))
+        })?;
+    let sample_count = pixel_count.checked_mul(4).ok_or_else(|| {
+        DecodeError::Unsupported(format!(
+            "RGBA sample count overflow for dimensions {}x{}",
+            width, height
+        ))
+    })?;
+    usize::try_from(sample_count).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "RGBA sample count does not fit in memory on this platform for dimensions {}x{}",
+            width, height
+        ))
+    })
+}
+
+fn rotate_rgba_ccw<T: Copy + Default>(
+    width: u32,
+    height: u32,
+    pixels: &[T],
+    rotation_ccw_degrees: u16,
+) -> Result<(u32, u32, Vec<T>), DecodeError> {
+    let normalized = rotation_ccw_degrees % 360;
+    if normalized == 0 {
+        return Ok((width, height, pixels.to_vec()));
+    }
+
+    let (dst_width, dst_height) = match normalized {
+        90 | 270 => (height, width),
+        180 => (width, height),
+        _ => {
+            return Err(DecodeError::Unsupported(format!(
+                "unsupported irot rotation angle {rotation_ccw_degrees} degrees"
+            )));
+        }
+    };
+
+    let src_width = usize::try_from(width).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "source width does not fit in usize ({width}) while applying rotation"
+        ))
+    })?;
+    let src_height = usize::try_from(height).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "source height does not fit in usize ({height}) while applying rotation"
+        ))
+    })?;
+    let dst_width_usize = usize::try_from(dst_width).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "destination width does not fit in usize ({dst_width}) while applying rotation"
+        ))
+    })?;
+    let output_len = checked_rgba_sample_count(dst_width, dst_height)?;
+    let mut out = vec![T::default(); output_len];
+
+    for y in 0..src_height {
+        for x in 0..src_width {
+            let (dst_x, dst_y) = match normalized {
+                90 => (y, src_width - 1 - x),
+                180 => (src_width - 1 - x, src_height - 1 - y),
+                270 => (src_height - 1 - y, x),
+                _ => unreachable!(),
+            };
+
+            let src_index = y
+                .checked_mul(src_width)
+                .and_then(|row| row.checked_add(x))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| {
+                    DecodeError::Unsupported(format!(
+                        "source pixel index overflow at ({x}, {y}) while rotating {}x{}",
+                        width, height
+                    ))
+                })?;
+            let dst_index = dst_y
+                .checked_mul(dst_width_usize)
+                .and_then(|row| row.checked_add(dst_x))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| {
+                    DecodeError::Unsupported(format!(
+                        "destination pixel index overflow at ({dst_x}, {dst_y}) while rotating to {}x{}",
+                        dst_width, dst_height
+                    ))
+                })?;
+
+            out[dst_index..dst_index + 4].copy_from_slice(&pixels[src_index..src_index + 4]);
+        }
+    }
+
+    Ok((dst_width, dst_height, out))
+}
+
+fn mirror_rgba<T: Copy + Default>(
+    width: u32,
+    height: u32,
+    pixels: &[T],
+    direction: isobmff::ImageMirrorDirection,
+) -> Result<Vec<T>, DecodeError> {
+    let src_width = usize::try_from(width).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "source width does not fit in usize ({width}) while applying mirror"
+        ))
+    })?;
+    let src_height = usize::try_from(height).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "source height does not fit in usize ({height}) while applying mirror"
+        ))
+    })?;
+    let output_len = checked_rgba_sample_count(width, height)?;
+    let mut out = vec![T::default(); output_len];
+
+    for y in 0..src_height {
+        for x in 0..src_width {
+            let (dst_x, dst_y) = match direction {
+                isobmff::ImageMirrorDirection::Horizontal => (src_width - 1 - x, y),
+                isobmff::ImageMirrorDirection::Vertical => (x, src_height - 1 - y),
+            };
+
+            let src_index = y
+                .checked_mul(src_width)
+                .and_then(|row| row.checked_add(x))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| {
+                    DecodeError::Unsupported(format!(
+                        "source pixel index overflow at ({x}, {y}) while mirroring {}x{}",
+                        width, height
+                    ))
+                })?;
+            let dst_index = dst_y
+                .checked_mul(src_width)
+                .and_then(|row| row.checked_add(dst_x))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| {
+                    DecodeError::Unsupported(format!(
+                        "destination pixel index overflow at ({dst_x}, {dst_y}) while mirroring {}x{}",
+                        width, height
+                    ))
+                })?;
+
+            out[dst_index..dst_index + 4].copy_from_slice(&pixels[src_index..src_index + 4]);
+        }
+    }
+
+    Ok(out)
 }
 
 fn append_hvcc_header_nals(
@@ -2736,9 +2956,9 @@ fn copy_plane_samples(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_normalized_hevc_payload_nals, assemble_primary_heic_hevc_stream,
-        convert_avif_to_rgba8, convert_heic_to_rgba8, decode_file_to_png,
-        decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
+        append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
+        assemble_primary_heic_hevc_stream, convert_avif_to_rgba8, convert_heic_to_rgba8,
+        decode_file_to_png, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
         validate_decoded_heic_image_against_metadata, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
@@ -2848,6 +3068,67 @@ mod tests {
             png::BitDepth::Sixteen
         };
         assert_eq!(frame_info.bit_depth, expected_bit_depth);
+    }
+
+    #[test]
+    fn rotates_rgba_pixels_by_primary_irot_transform() {
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A
+            2_u8, 0, 0, 255, // B
+        ];
+        let transforms = vec![crate::isobmff::PrimaryItemTransformProperty::Rotation(
+            crate::isobmff::ImageRotationProperty {
+                rotation_ccw_degrees: 90,
+            },
+        )];
+
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(2, 1, pixels, &transforms)
+                .expect("irot transform should rotate RGBA geometry and pixel order");
+        assert_eq!((width, height), (1, 2));
+        assert_eq!(
+            transformed,
+            vec![
+                2_u8, 0, 0, 255, // B (top)
+                1_u8, 0, 0, 255, // A (bottom)
+            ]
+        );
+    }
+
+    #[test]
+    fn applies_primary_imir_and_irot_in_property_order() {
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A (0,0)
+            2_u8, 0, 0, 255, // B (1,0)
+            3_u8, 0, 0, 255, // C (0,1)
+            4_u8, 0, 0, 255, // D (1,1)
+        ];
+        let transforms = vec![
+            crate::isobmff::PrimaryItemTransformProperty::Mirror(
+                crate::isobmff::ImageMirrorProperty {
+                    direction: crate::isobmff::ImageMirrorDirection::Horizontal,
+                },
+            ),
+            crate::isobmff::PrimaryItemTransformProperty::Rotation(
+                crate::isobmff::ImageRotationProperty {
+                    rotation_ccw_degrees: 90,
+                },
+            ),
+        ];
+
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(2, 2, pixels, &transforms)
+                .expect("imir+irot should be applied in transform-property order");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            transformed,
+            vec![
+                1_u8, 0, 0, 255, // A
+                3_u8, 0, 0, 255, // C
+                2_u8, 0, 0, 255, // B
+                4_u8, 0, 0, 255, // D
+            ]
+        );
     }
 
     #[test]

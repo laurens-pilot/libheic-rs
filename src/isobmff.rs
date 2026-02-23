@@ -22,6 +22,8 @@ const HVCC_BOX_TYPE: [u8; 4] = *b"hvcC";
 const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
 const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
+const IROT_BOX_TYPE: [u8; 4] = *b"irot";
+const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
 const NCLX_COLOR_TYPE: [u8; 4] = *b"nclx";
 const NCLC_COLOR_TYPE: [u8; 4] = *b"nclc";
 const PROF_COLOR_TYPE: [u8; 4] = *b"prof";
@@ -315,6 +317,30 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_colr_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `irot` property.
+    pub fn parse_irot(&self) -> Result<ImageRotationProperty, ParseImageRotationPropertyError> {
+        if self.header.box_type.as_bytes() != IROT_BOX_TYPE {
+            return Err(ParseImageRotationPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_irot_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `imir` property.
+    pub fn parse_imir(&self) -> Result<ImageMirrorProperty, ParseImageMirrorPropertyError> {
+        if self.header.box_type.as_bytes() != IMIR_BOX_TYPE {
+            return Err(ParseImageMirrorPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_imir_payload(self.payload, self.payload_offset())
     }
 }
 
@@ -732,6 +758,39 @@ pub enum ColorInformation {
 pub struct ColorInformationProperty {
     pub colour_type: FourCc,
     pub information: ColorInformation,
+}
+
+/// Parsed `irot` property fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageRotationProperty {
+    pub rotation_ccw_degrees: u16,
+}
+
+/// Mirror direction parsed from an `imir` property.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageMirrorDirection {
+    Horizontal,
+    Vertical,
+}
+
+/// Parsed `imir` property fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageMirrorProperty {
+    pub direction: ImageMirrorDirection,
+}
+
+/// Parsed primary-item transform property in associated-property order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimaryItemTransformProperty {
+    Rotation(ImageRotationProperty),
+    Mirror(ImageMirrorProperty),
+}
+
+/// Aggregated primary-item transform properties in associated-property order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimaryItemTransformProperties {
+    pub item_id: u32,
+    pub transforms: Vec<PrimaryItemTransformProperty>,
 }
 
 /// Aggregated primary-item color profiles from associated `colr` properties.
@@ -1780,6 +1839,115 @@ impl Display for ParseColorInformationPropertyError {
 
 impl Error for ParseColorInformationPropertyError {}
 
+/// Errors returned when parsing an `irot` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseImageRotationPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseImageRotationPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseImageRotationPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected irot box at offset {offset}, got box type {actual}"
+            ),
+            ParseImageRotationPropertyError::PayloadTooSmall {
+                offset,
+                available,
+                required,
+            } => write!(
+                f,
+                "irot payload too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseImageRotationPropertyError {}
+
+/// Errors returned when parsing an `imir` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseImageMirrorPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseImageMirrorPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseImageMirrorPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected imir box at offset {offset}, got box type {actual}"
+            ),
+            ParseImageMirrorPropertyError::PayloadTooSmall {
+                offset,
+                available,
+                required,
+            } => write!(
+                f,
+                "imir payload too small at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseImageMirrorPropertyError {}
+
+/// Errors returned when parsing primary-item transform properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePrimaryItemTransformPropertiesError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    ImageRotation(ParseImageRotationPropertyError),
+    ImageMirror(ParseImageMirrorPropertyError),
+}
+
+impl Display for ParsePrimaryItemTransformPropertiesError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePrimaryItemTransformPropertiesError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ParsePrimaryItemTransformPropertiesError::Meta(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::ImageRotation(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::ImageMirror(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for ParsePrimaryItemTransformPropertiesError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePrimaryItemTransformPropertiesError::TopLevelBoxes(err) => Some(err),
+            ParsePrimaryItemTransformPropertiesError::Meta(err) => Some(err),
+            ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem(err) => Some(err),
+            ParsePrimaryItemTransformPropertiesError::ImageRotation(err) => Some(err),
+            ParsePrimaryItemTransformPropertiesError::ImageMirror(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned when parsing/validating primary AVIF properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryAvifPropertiesError {
@@ -2371,6 +2539,51 @@ impl<'a> Iterator for BoxIter<'a> {
 /// Parse all top-level boxes from an input slice.
 pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
+}
+
+/// Parse primary-item orientation transforms (`irot`/`imir`) in property order.
+pub fn parse_primary_item_transform_properties(
+    input: &[u8],
+) -> Result<PrimaryItemTransformProperties, ParsePrimaryItemTransformPropertiesError> {
+    // Provenance: mirrors `irot`/`imir` parse semantics from
+    // libheif/libheif/box.cc:{Box_irot::parse,Box_imir::parse} and preserves
+    // associated-property order used by libheif transform application in
+    // libheif/libheif/image-items/image_item.cc:ImageItem::decode_compressed_image.
+    let top_level =
+        parse_boxes(input).map_err(ParsePrimaryItemTransformPropertiesError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ParsePrimaryItemTransformPropertiesError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ParsePrimaryItemTransformPropertiesError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem)?;
+
+    let mut transforms = Vec::new();
+    for property in &resolved.primary_item.properties {
+        let property_type = property.property.header.box_type;
+        if property_type.as_bytes() == IROT_BOX_TYPE {
+            transforms.push(PrimaryItemTransformProperty::Rotation(
+                property
+                    .property
+                    .parse_irot()
+                    .map_err(ParsePrimaryItemTransformPropertiesError::ImageRotation)?,
+            ));
+        } else if property_type.as_bytes() == IMIR_BOX_TYPE {
+            transforms.push(PrimaryItemTransformProperty::Mirror(
+                property
+                    .property
+                    .parse_imir()
+                    .map_err(ParsePrimaryItemTransformPropertiesError::ImageMirror)?,
+            ));
+        }
+    }
+
+    Ok(PrimaryItemTransformProperties {
+        item_id: resolved.primary_item.item_id,
+        transforms,
+    })
 }
 
 /// Parse and validate primary AVIF properties needed before decode.
@@ -3280,6 +3493,50 @@ fn parse_colr_payload(
         offset: payload_offset,
         colour_type,
     })
+}
+
+fn parse_irot_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ImageRotationProperty, ParseImageRotationPropertyError> {
+    // Provenance: mirrors libheif/libheif/box.cc:Box_irot::parse, where the
+    // low two bits encode rotation units of 90 degrees.
+    let required = size_of::<u8>();
+    if payload.len() < required {
+        return Err(ParseImageRotationPropertyError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+            required,
+        });
+    }
+
+    let rotation_ccw_degrees = u16::from(payload[0] & 0x03) * 90;
+    Ok(ImageRotationProperty {
+        rotation_ccw_degrees,
+    })
+}
+
+fn parse_imir_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ImageMirrorProperty, ParseImageMirrorPropertyError> {
+    // Provenance: mirrors libheif/libheif/box.cc:Box_imir::parse, where bit 0
+    // selects mirror direction (1=horizontal, 0=vertical).
+    let required = size_of::<u8>();
+    if payload.len() < required {
+        return Err(ParseImageMirrorPropertyError::PayloadTooSmall {
+            offset: payload_offset,
+            available: payload.len(),
+            required,
+        });
+    }
+
+    let direction = if (payload[0] & 0x01) != 0 {
+        ImageMirrorDirection::Horizontal
+    } else {
+        ImageMirrorDirection::Vertical
+    };
+    Ok(ImageMirrorProperty { direction })
 }
 
 fn parse_ftyp_payload(
@@ -4378,16 +4635,19 @@ mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data, parse_boxes,
         parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
-        parse_primary_heic_item_properties, BoxIter, ColorInformation, ExtractAvifItemDataError,
-        ExtractHeicItemDataError, FourCc, IccColorProfile, ItemLocationField, NclxColorProfile,
-        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseColorInformationPropertyError,
-        ParseFileTypeBoxError, ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
-        ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
-        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
-        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
-        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
-        ParsePrimaryAvifPropertiesError, ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
-        PrimaryItemColorProperties, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
+        parse_primary_heic_item_properties, parse_primary_item_transform_properties, BoxIter,
+        ColorInformation, ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc,
+        IccColorProfile, ImageMirrorDirection, ImageMirrorProperty, ImageRotationProperty,
+        ItemLocationField, NclxColorProfile, ParseAv1CodecConfigurationBoxError, ParseBoxError,
+        ParseColorInformationPropertyError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseHevcDecoderConfigurationBoxError, ParseImageMirrorPropertyError,
+        ParseImageRotationPropertyError, ParseImageSpatialExtentsPropertyError,
+        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
+        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
+        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
+        ParsePixelInformationPropertyError, ParsePrimaryAvifPropertiesError,
+        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError, PrimaryItemColorProperties,
+        PrimaryItemTransformProperty, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
         FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
@@ -6574,6 +6834,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_irot_property_rotation_steps() {
+        let irot = make_irot_property(3);
+        let parsed = parse_boxes(&irot).expect("irot box should parse");
+        let property = parsed[0]
+            .parse_irot()
+            .expect("irot property should parse rotation");
+        assert_eq!(property.rotation_ccw_degrees, 270);
+    }
+
+    #[test]
+    fn rejects_irot_parse_when_payload_is_truncated() {
+        let irot = make_basic_box(*b"irot", &[]);
+        let parsed = parse_boxes(&irot).expect("irot box should parse");
+        let err = parsed[0]
+            .parse_irot()
+            .expect_err("truncated irot payload must fail");
+        assert_eq!(
+            err,
+            ParseImageRotationPropertyError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 0,
+                required: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_imir_property_direction_bit() {
+        let horizontal = make_imir_property(true);
+        let parsed = parse_boxes(&horizontal).expect("imir box should parse");
+        let property = parsed[0]
+            .parse_imir()
+            .expect("imir property should parse direction");
+        assert_eq!(property.direction, ImageMirrorDirection::Horizontal);
+
+        let vertical = make_imir_property(false);
+        let parsed = parse_boxes(&vertical).expect("imir box should parse");
+        let property = parsed[0]
+            .parse_imir()
+            .expect("imir property should parse direction");
+        assert_eq!(property.direction, ImageMirrorDirection::Vertical);
+    }
+
+    #[test]
+    fn rejects_imir_parse_when_payload_is_truncated() {
+        let imir = make_basic_box(*b"imir", &[]);
+        let parsed = parse_boxes(&imir).expect("imir box should parse");
+        let err = parsed[0]
+            .parse_imir()
+            .expect_err("truncated imir payload must fail");
+        assert_eq!(
+            err,
+            ParseImageMirrorPropertyError::PayloadTooSmall {
+                offset: BASIC_HEADER_SIZE as u64,
+                available: 0,
+                required: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_primary_item_transform_properties_in_association_order() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![
+            make_av1c_property(),
+            make_ispe_property(640, 480),
+            make_pixi_property(0, &[8, 8, 8]),
+            make_imir_property(true),
+            make_irot_property(1),
+        ];
+        let meta = make_primary_avif_meta_with_properties(iloc, &properties, &[]);
+        let transforms = parse_primary_item_transform_properties(&meta)
+            .expect("primary transform parse should preserve association order");
+
+        assert_eq!(transforms.item_id, 1);
+        assert_eq!(
+            transforms.transforms,
+            vec![
+                PrimaryItemTransformProperty::Mirror(ImageMirrorProperty {
+                    direction: ImageMirrorDirection::Horizontal,
+                }),
+                PrimaryItemTransformProperty::Rotation(ImageRotationProperty {
+                    rotation_ccw_degrees: 90,
+                }),
+            ]
+        );
+    }
+
     fn make_primary_avif_meta(iloc: Vec<u8>, additional_children: &[Vec<u8>]) -> Vec<u8> {
         let properties = vec![
             make_av1c_property(),
@@ -6750,6 +7107,15 @@ mod tests {
         payload.extend_from_slice(&profile_type);
         payload.extend_from_slice(profile);
         make_basic_box(*b"colr", &payload)
+    }
+
+    fn make_irot_property(rotation_steps_ccw: u8) -> Vec<u8> {
+        make_basic_box(*b"irot", &[rotation_steps_ccw & 0x03])
+    }
+
+    fn make_imir_property(horizontal: bool) -> Vec<u8> {
+        let axis = if horizontal { 1 } else { 0 };
+        make_basic_box(*b"imir", &[axis])
     }
 
     fn make_meta_box(children: &[Vec<u8>]) -> Vec<u8> {
