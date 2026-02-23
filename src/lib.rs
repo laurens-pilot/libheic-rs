@@ -2149,6 +2149,23 @@ mod tests {
     }
 
     #[test]
+    fn decodes_assembled_heic_stream_for_fixture_into_image_model() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("HEIC fixture must be readable");
+        let stream = assemble_primary_heic_hevc_stream(&input)
+            .expect("fixture should assemble into backend-ready HEVC stream");
+
+        let decoded = decode_hevc_stream_to_image(&stream)
+            .expect("assembled fixture stream should decode through HEVC backend");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert!(decoded.bit_depth_luma >= 8);
+        assert!(decoded.bit_depth_chroma >= 8);
+        assert_heic_plane_shapes(&decoded);
+    }
+
+    #[test]
     fn rejects_decoded_heic_image_with_layout_mismatch_against_metadata() {
         let decoded = DecodedHeicImage {
             width: 2,
@@ -2258,6 +2275,21 @@ mod tests {
         let err = decode_hevc_stream_to_image(&stream)
             .expect_err("stream without VCL NAL must fail backend image decode");
         assert!(matches!(err, DecodeHeicError::MissingVclNalUnit));
+    }
+
+    #[test]
+    fn reports_backend_decode_failure_for_malformed_vcl_stream() {
+        let sps_nal = [0x42, 0x01, 0x01];
+        let vcl_nal = [0x26, 0x01, 0x01];
+        let mut stream = Vec::new();
+        for nal in [&sps_nal[..], &vcl_nal[..]] {
+            stream.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            stream.extend_from_slice(nal);
+        }
+
+        let err = decode_hevc_stream_to_image(&stream)
+            .expect_err("malformed stream with VCL should fail inside backend decode");
+        assert!(matches!(err, DecodeHeicError::BackendDecodeFailed { .. }));
     }
 
     #[test]
