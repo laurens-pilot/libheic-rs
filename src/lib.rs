@@ -1732,10 +1732,10 @@ struct YCbCrToRgbCoefficients {
     g_cb_fp8: i32,
     g_cr_fp8: i32,
     b_cb_fp8: i32,
-    r_cr: f32,
-    g_cb: f32,
-    g_cr: f32,
-    b_cb: f32,
+    r_cr: f64,
+    g_cb: f64,
+    g_cr: f64,
+    b_cb: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1758,10 +1758,10 @@ const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS: YCbCrToRgbCoefficients = YCbCrToRgbCoef
     g_cb_fp8: -88,
     g_cr_fp8: -183,
     b_cb_fp8: 454,
-    r_cr: 1.402,
-    g_cb: -0.344_136,
-    g_cr: -0.714_136,
-    b_cb: 1.772,
+    r_cr: 1.402_f64,
+    g_cb: -0.344_136_f64,
+    g_cr: -0.714_136_f64,
+    b_cb: 1.772_f64,
 };
 
 fn ycbcr_transform_from_matrix(
@@ -1809,16 +1809,18 @@ fn ycbcr_coefficients_from_matrix(
 }
 
 fn ycbcr_coefficients_from_kr_kb(kr: f32, kb: f32) -> YCbCrToRgbCoefficients {
-    let r_cr = 2.0 * (1.0 - kr);
-    let g_cb = 2.0 * kb * (1.0 - kb) / (kb + kr - 1.0);
-    let g_cr = 2.0 * kr * (1.0 - kr) / (kb + kr - 1.0);
-    let b_cb = 2.0 * (1.0 - kb);
+    let kr = f64::from(kr);
+    let kb = f64::from(kb);
+    let r_cr = 2.0_f64 * (1.0_f64 - kr);
+    let g_cb = 2.0_f64 * kb * (1.0_f64 - kb) / (kb + kr - 1.0_f64);
+    let g_cr = 2.0_f64 * kr * (1.0_f64 - kr) / (kb + kr - 1.0_f64);
+    let b_cb = 2.0_f64 * (1.0_f64 - kb);
 
     YCbCrToRgbCoefficients {
-        r_cr_fp8: (256.0_f32 * r_cr).round() as i32,
-        g_cb_fp8: (256.0_f32 * g_cb).round() as i32,
-        g_cr_fp8: (256.0_f32 * g_cr).round() as i32,
-        b_cb_fp8: (256.0_f32 * b_cb).round() as i32,
+        r_cr_fp8: (256.0_f64 * r_cr).round() as i32,
+        g_cb_fp8: (256.0_f64 * g_cb).round() as i32,
+        g_cr_fp8: (256.0_f64 * g_cr).round() as i32,
+        b_cb_fp8: (256.0_f64 * b_cb).round() as i32,
         r_cr,
         g_cb,
         g_cr,
@@ -3530,10 +3532,12 @@ fn ycbcr_to_rgb_components(
             // libheif/libheif/color-conversion/yuv2rgb.cc:
             // Op_YCbCr_to_RGB::convert_colorspace and
             // libheif/libheif/common_utils.h:clip_f_u16.
-            let limited_offset = limited_range_offset(bit_depth) as f32;
-            let r = (cr_sample as f32 - limited_offset) * 1.1429;
-            let g = (y_sample as f32 - limited_offset) * 1.1689;
-            let b = (cb_sample as f32 - limited_offset) * 1.1429;
+            // Keep libheif's float constants but evaluate with f64
+            // intermediates to reduce residual cross-backend rounding drift.
+            let limited_offset = f64::from(limited_range_offset(bit_depth));
+            let r = (f64::from(cr_sample) - limited_offset) * 1.1429_f64;
+            let g = (f64::from(y_sample) - limited_offset) * 1.1689_f64;
+            let b = (f64::from(cb_sample) - limited_offset) * 1.1429_f64;
             (
                 clip_float_to_bit_depth(r, bit_depth),
                 clip_float_to_bit_depth(g, bit_depth),
@@ -3546,11 +3550,11 @@ fn ycbcr_to_rgb_components(
                 // libheif/libheif/color-conversion/yuv2rgb.cc:
                 // Op_YCbCr_to_RGB::convert_colorspace and
                 // libheif/libheif/common_utils.h:clip_f_u16.
-                let limited_offset = limited_range_offset(bit_depth) as f32;
-                let chroma_midpoint = chroma_midpoint(bit_depth) as f32;
-                let yv = (y_sample as f32 - limited_offset) * 1.1689;
-                let cb = (cb_sample as f32 - chroma_midpoint) * 1.1429;
-                let cr = (cr_sample as f32 - chroma_midpoint) * 1.1429;
+                let limited_offset = f64::from(limited_range_offset(bit_depth));
+                let chroma_midpoint = f64::from(chroma_midpoint(bit_depth));
+                let yv = (f64::from(y_sample) - limited_offset) * 1.1689_f64;
+                let cb = (f64::from(cb_sample) - chroma_midpoint) * 1.1429_f64;
+                let cr = (f64::from(cr_sample) - chroma_midpoint) * 1.1429_f64;
                 let r = yv + coeffs.r_cr * cr;
                 let g = yv + coeffs.g_cb * cb + coeffs.g_cr * cr;
                 let b = yv + coeffs.b_cb * cb;
@@ -3583,7 +3587,7 @@ fn ycbcr_to_rgb_components(
     }
 }
 
-fn clip_float_to_bit_depth(value: f32, bit_depth: u8) -> u16 {
+fn clip_float_to_bit_depth(value: f64, bit_depth: u8) -> u16 {
     let rounded = (value + 0.5) as i32;
     let max_value = ((1_i32 << bit_depth) - 1).max(0);
     rounded.clamp(0, max_value) as u16
