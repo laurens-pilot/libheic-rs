@@ -8803,6 +8803,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_bufread_guardrail_rejects_inputs_that_exceed_max_temp_spool_bytes() {
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(vec![0xC4_u8; 17])),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: Some(16),
+                temp_spool_directory: None,
+            },
+        )
+        .expect_err("non-seek BufRead decode should fail when max_temp_spool_bytes is exceeded");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolLimitExceeded {
+                attempted_bytes,
+                max_temp_spool_bytes
+            }) if attempted_bytes == 17 && max_temp_spool_bytes == 16
+        ));
+    }
+
+    #[test]
     fn decode_read_cleans_up_temp_spool_files_after_successful_decode() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
@@ -9067,6 +9089,29 @@ mod tests {
             source.bytes_requested < 128 * 1024,
             "source scan should not materialize the full file"
         );
+    }
+
+    #[test]
+    fn seekable_decode_reports_io_category_for_short_source_reads() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("example.heic fixture must be readable");
+        let reported_len = input.len() as u64;
+        let truncated = input[..8].to_vec();
+        let mut source = ShortReadTrackingSource::with_reported_len(truncated, reported_len);
+
+        let err = decode_source_to_rgba_with_hint_and_guardrails(
+            &mut source,
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect_err("seekable decode should surface short-read IO failures");
+
+        assert_eq!(err.category(), DecodeErrorCategory::Io);
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]
@@ -10711,6 +10756,66 @@ mod tests {
                 .bytes_requested
                 .checked_add(requested)
                 .expect("tracking byte counter should not overflow in tests");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShortReadTrackingSource {
+        data: Vec<u8>,
+        reported_len: u64,
+    }
+
+    impl ShortReadTrackingSource {
+        fn with_reported_len(data: Vec<u8>, reported_len: u64) -> Self {
+            Self { data, reported_len }
+        }
+    }
+
+    impl super::source::RandomAccessSource for ShortReadTrackingSource {
+        fn len(&self) -> u64 {
+            self.reported_len
+        }
+
+        fn read_exact_at(
+            &mut self,
+            offset: u64,
+            output: &mut [u8],
+        ) -> Result<(), super::source::SourceReadError> {
+            let requested = output.len();
+            let end = offset
+                .checked_add(requested as u64)
+                .ok_or(super::source::SourceReadError::RangeOverflow { offset, requested })?;
+            if end > self.reported_len {
+                return Err(super::source::SourceReadError::OutOfBounds {
+                    offset,
+                    requested,
+                    source_len: self.reported_len,
+                });
+            }
+
+            let actual_len = self.data.len() as u64;
+            if end > actual_len {
+                return Err(super::source::SourceReadError::Io {
+                    operation: "short-read",
+                    offset,
+                    requested,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "simulated seekable short read",
+                    ),
+                });
+            }
+
+            let start = usize::try_from(offset).map_err(|_| {
+                super::source::SourceReadError::OutOfBounds {
+                    offset,
+                    requested,
+                    source_len: self.reported_len,
+                }
+            })?;
+            let end = start + requested;
+            output.copy_from_slice(&self.data[start..end]);
             Ok(())
         }
     }
