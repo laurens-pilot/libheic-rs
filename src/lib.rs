@@ -74,6 +74,12 @@ pub enum DecodeGuardrailError {
         actual_bytes: u64,
         max_input_bytes: u64,
     },
+    PixelCountExceeded {
+        width: u32,
+        height: u32,
+        actual_pixels: u64,
+        max_pixels: u64,
+    },
     TempSpoolLimitExceeded {
         attempted_bytes: u64,
         max_temp_spool_bytes: u64,
@@ -95,6 +101,15 @@ impl Display for DecodeGuardrailError {
             } => write!(
                 f,
                 "input exceeds configured max_input_bytes: got {actual_bytes} bytes, max is {max_input_bytes}"
+            ),
+            DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            } => write!(
+                f,
+                "decoded image exceeds configured max_pixels: got {actual_pixels} pixels ({width}x{height}), max is {max_pixels}"
             ),
             DecodeGuardrailError::TempSpoolLimitExceeded {
                 attempted_bytes,
@@ -5192,29 +5207,39 @@ const HEIF_FILE_BRANDS: [[u8; 4]; 9] = [
     *b"mif1", *b"msf1", *b"miaf", *b"heic", *b"heix", *b"hevc", *b"hevx", *b"heim", *b"heis",
 ];
 
-fn decode_avif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
+fn decode_avif_bytes_to_rgba(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_avif(input);
     let decoded = decode_primary_avif_to_image(input)?;
+    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
 
 fn decode_avif_source_to_rgba<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
+    guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_avif(input);
     let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
     let decoded = decode_primary_avif_to_image_internal(input, &mut source)?;
+    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
 
-fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
+fn decode_heif_bytes_to_rgba(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
     match decode_primary_uncompressed_to_image(input) {
         Ok(decoded) => {
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             let transforms = isobmff::parse_primary_item_transform_properties(input)
                 .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
             return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
@@ -5229,6 +5254,7 @@ fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeErr
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_heic(input);
     let decoded = decode_primary_heic_to_image(input)?;
+    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     let auxiliary_alpha =
         decode_primary_heic_auxiliary_alpha_plane(input, decoded.width, decoded.height);
     decoded_heic_to_rgba_image(
@@ -5242,10 +5268,12 @@ fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeErr
 fn decode_heif_source_to_rgba<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
+    guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
     match decode_primary_uncompressed_to_image_internal(input, &mut source) {
         Ok(decoded) => {
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             let transforms = isobmff::parse_primary_item_transform_properties(input)
                 .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
             return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
@@ -5260,6 +5288,7 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_heic(input);
     let decoded = decode_primary_heic_to_image_internal(input, &mut source)?;
+    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
         input,
         &mut source,
@@ -5274,13 +5303,21 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
     )
 }
 
-fn decode_avif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
-    let decoded = decode_avif_bytes_to_rgba(input)?;
+fn decode_avif_bytes_to_png(
+    input: &[u8],
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
     write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
-fn decode_heif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
-    let decoded = decode_heif_bytes_to_rgba(input)?;
+fn decode_heif_bytes_to_png(
+    input: &[u8],
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    let decoded = decode_heif_bytes_to_rgba(input, guardrails)?;
     write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
@@ -5537,6 +5574,8 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
 pub struct DecodeGuardrails {
     /// Optional maximum accepted input size in bytes for all decode entry points.
     pub max_input_bytes: Option<u64>,
+    /// Optional maximum decoded image area in pixels before RGBA materialization.
+    pub max_pixels: Option<u64>,
     /// Optional cap for bytes spooled from non-seek `Read`/`BufRead` inputs.
     pub max_temp_spool_bytes: Option<u64>,
 }
@@ -5548,6 +5587,22 @@ impl DecodeGuardrails {
                 return Err(DecodeGuardrailError::InputTooLarge {
                     actual_bytes,
                     max_input_bytes,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_pixel_count(self, width: u32, height: u32) -> Result<(), DecodeError> {
+        if let Some(max_pixels) = self.max_pixels {
+            let actual_pixels = u64::from(width) * u64::from(height);
+            if actual_pixels > max_pixels {
+                return Err(DecodeGuardrailError::PixelCountExceeded {
+                    width,
+                    height,
+                    actual_pixels,
+                    max_pixels,
                 }
                 .into());
             }
@@ -5577,8 +5632,8 @@ fn decode_bytes_to_rgba_with_hint_and_guardrails(
             )
         })?;
     match family {
-        HeifInputFamily::Avif => decode_avif_bytes_to_rgba(input),
-        HeifInputFamily::Heif => decode_heif_bytes_to_rgba(input),
+        HeifInputFamily::Avif => decode_avif_bytes_to_rgba(input, guardrails),
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba(input, guardrails),
     }
 }
 
@@ -5598,8 +5653,8 @@ fn decode_bytes_to_png_with_hint_and_guardrails(
             )
         })?;
     match family {
-        HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path),
-        HeifInputFamily::Heif => decode_heif_bytes_to_png(input, output_path),
+        HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path, guardrails),
+        HeifInputFamily::Heif => decode_heif_bytes_to_png(input, output_path, guardrails),
     }
 }
 
@@ -5637,8 +5692,8 @@ fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
         )
     })?;
     match family {
-        HeifInputFamily::Avif => decode_avif_source_to_rgba(source, &input),
-        HeifInputFamily::Heif => decode_heif_source_to_rgba(source, &input),
+        HeifInputFamily::Avif => decode_avif_source_to_rgba(source, &input, guardrails),
+        HeifInputFamily::Heif => decode_heif_source_to_rgba(source, &input, guardrails),
     }
 }
 
@@ -8636,6 +8691,7 @@ mod tests {
             &input,
             DecodeGuardrails {
                 max_input_bytes: Some(input_bytes - 1),
+                max_pixels: None,
                 max_temp_spool_bytes: None,
             },
         )
@@ -8662,6 +8718,7 @@ mod tests {
             &fixture,
             DecodeGuardrails {
                 max_input_bytes: Some(input_bytes - 1),
+                max_pixels: None,
                 max_temp_spool_bytes: None,
             },
         )
@@ -8682,6 +8739,7 @@ mod tests {
             Cursor::new(vec![0xB6_u8; 17]),
             DecodeGuardrails {
                 max_input_bytes: None,
+                max_pixels: None,
                 max_temp_spool_bytes: Some(16),
             },
         )
@@ -8693,6 +8751,91 @@ mod tests {
                 attempted_bytes,
                 max_temp_spool_bytes
             }) if attempted_bytes == 17 && max_temp_spool_bytes == 16
+        ));
+    }
+
+    #[test]
+    fn decode_bytes_guardrail_rejects_avif_images_larger_than_max_pixels() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+
+        let err = decode_bytes_to_rgba_with_guardrails(
+            &input,
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+            },
+        )
+        .expect_err("bytes decode should fail when max_pixels is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            }) if max_pixels == 1
+                && actual_pixels == u64::from(width) * u64::from(height)
+                && actual_pixels > max_pixels
+        ));
+    }
+
+    #[test]
+    fn decode_path_guardrail_rejects_heic_images_larger_than_max_pixels() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+
+        let err = decode_path_to_rgba_with_guardrails(
+            &fixture,
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+            },
+        )
+        .expect_err("path decode should fail when max_pixels is too small for HEIC");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            }) if max_pixels == 1
+                && actual_pixels == u64::from(width) * u64::from(height)
+                && actual_pixels > max_pixels
+        ));
+    }
+
+    #[test]
+    fn decode_path_guardrail_rejects_uncompressed_images_larger_than_max_pixels() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/uncompressed_pix_RGB.heif");
+
+        let err = decode_path_to_rgba_with_guardrails(
+            &fixture,
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+            },
+        )
+        .expect_err("path decode should fail when max_pixels is too small for uncompressed HEIF");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            }) if max_pixels == 1
+                && actual_pixels == u64::from(width) * u64::from(height)
+                && actual_pixels > max_pixels
         ));
     }
 
