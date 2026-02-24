@@ -1106,6 +1106,15 @@ struct UncompressedComponentDecodeSpec {
     component_align_size: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UncompressedDecodeTileRegion {
+    image_width: usize,
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+}
+
 struct UncompressedBitReader<'a> {
     data: &'a [u8],
     bit_offset: usize,
@@ -1475,14 +1484,6 @@ pub fn decode_primary_uncompressed_to_image(
             ),
         });
     }
-    if properties.unc_c.num_tile_cols != 1 || properties.unc_c.num_tile_rows != 1 {
-        return Err(DecodeUncompressedError::UnsupportedFeature {
-            detail: format!(
-                "tiled uncompressed decode is not supported in this baseline (tiles={}x{})",
-                properties.unc_c.num_tile_cols, properties.unc_c.num_tile_rows
-            ),
-        });
-    }
     if properties.unc_c.block_size != 0
         || properties.unc_c.components_little_endian
         || properties.unc_c.block_pad_lsb
@@ -1516,6 +1517,49 @@ pub fn decode_primary_uncompressed_to_image(
     let height_usize =
         usize::try_from(height).map_err(|_| DecodeUncompressedError::InvalidInput {
             detail: format!("uncompressed image height {height} cannot be represented"),
+        })?;
+    let tile_cols = properties.unc_c.num_tile_cols;
+    let tile_rows = properties.unc_c.num_tile_rows;
+    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_codec.cc:
+    // UncompressedImageCodec::check_header_validity tile-grid checks.
+    if tile_cols > width || tile_rows > height {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncC tile grid {tile_cols}x{tile_rows} exceeds image extent {width}x{height}"
+            ),
+        });
+    }
+    if width % tile_cols != 0 || height % tile_rows != 0 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncC tile grid {tile_cols}x{tile_rows} does not evenly divide image extent {width}x{height}"
+            ),
+        });
+    }
+    let tile_width = width / tile_cols;
+    let tile_height = height / tile_rows;
+    if tile_width == 0 || tile_height == 0 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncC tile dimensions must be non-zero, got {tile_width}x{tile_height}"
+            ),
+        });
+    }
+    let tile_width_usize =
+        usize::try_from(tile_width).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncompressed tile width {tile_width} cannot be represented"),
+        })?;
+    let tile_height_usize =
+        usize::try_from(tile_height).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncompressed tile height {tile_height} cannot be represented"),
+        })?;
+    let tile_cols_usize =
+        usize::try_from(tile_cols).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncC tile column count {tile_cols} cannot be represented"),
+        })?;
+    let tile_rows_usize =
+        usize::try_from(tile_rows).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncC tile row count {tile_rows} cannot be represented"),
         })?;
     let pixel_count = width_usize.checked_mul(height_usize).ok_or_else(|| {
         DecodeUncompressedError::InvalidInput {
@@ -1575,37 +1619,58 @@ pub fn decode_primary_uncompressed_to_image(
 
     let payload = isobmff::extract_primary_uncompressed_item_data(input)?;
     let mut reader = UncompressedBitReader::new(&payload.payload);
-    reader.mark_tile_start();
-
-    match interleave_type {
-        UNCOMPRESSED_INTERLEAVE_COMPONENT => decode_uncompressed_component_interleave(
-            &mut reader,
-            &component_specs,
-            width_usize,
-            height_usize,
-            properties.unc_c.row_align_size,
-            &mut channel_samples,
-        )?,
-        UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
-            &mut reader,
-            &component_specs,
-            width_usize,
-            height_usize,
-            properties.unc_c.pixel_size,
-            properties.unc_c.row_align_size,
-            &mut channel_samples,
-        )?,
-        UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
-            &mut reader,
-            &component_specs,
-            width_usize,
-            height_usize,
-            properties.unc_c.row_align_size,
-            &mut channel_samples,
-        )?,
-        _ => unreachable!(),
+    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_decoder.cc:
+    // unc_decoder::decode_image tile iteration order (row-major grid traversal).
+    for tile_row in 0..tile_rows_usize {
+        let tile_origin_y = tile_row.checked_mul(tile_height_usize).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!("uncompressed tile y-origin overflow for tile row {tile_row}"),
+            }
+        })?;
+        for tile_column in 0..tile_cols_usize {
+            let tile_origin_x = tile_column.checked_mul(tile_width_usize).ok_or_else(|| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed tile x-origin overflow for tile column {tile_column}"
+                    ),
+                }
+            })?;
+            let tile_region = UncompressedDecodeTileRegion {
+                image_width: width_usize,
+                width: tile_width_usize,
+                height: tile_height_usize,
+                origin_x: tile_origin_x,
+                origin_y: tile_origin_y,
+            };
+            reader.mark_tile_start();
+            match interleave_type {
+                UNCOMPRESSED_INTERLEAVE_COMPONENT => decode_uncompressed_component_interleave(
+                    &mut reader,
+                    &component_specs,
+                    tile_region,
+                    properties.unc_c.row_align_size,
+                    &mut channel_samples,
+                )?,
+                UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
+                    &mut reader,
+                    &component_specs,
+                    tile_region,
+                    properties.unc_c.pixel_size,
+                    properties.unc_c.row_align_size,
+                    &mut channel_samples,
+                )?,
+                UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
+                    &mut reader,
+                    &component_specs,
+                    tile_region,
+                    properties.unc_c.row_align_size,
+                    &mut channel_samples,
+                )?,
+                _ => unreachable!(),
+            }
+            reader.handle_tile_alignment(properties.unc_c.tile_align_size)?;
+        }
     }
-    reader.handle_tile_alignment(properties.unc_c.tile_align_size)?;
 
     let mut output_bit_depth = 0_u8;
     for (is_present, bit_depth) in has_channel.iter().zip(channel_bit_depths) {
@@ -1720,22 +1785,29 @@ pub fn decode_primary_uncompressed_to_image(
 fn decode_uncompressed_component_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
-    width: usize,
-    height: usize,
+    tile_region: UncompressedDecodeTileRegion,
     row_align_size: u32,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
     for spec in specs {
-        for row in 0..height {
+        for row in 0..tile_region.height {
             reader.mark_row_start();
-            for column in 0..width {
+            for column in 0..tile_region.width {
                 let sample = read_uncompressed_component_sample(reader, *spec)?;
-                let pixel_index = row
-                    .checked_mul(width)
-                    .and_then(|offset| offset.checked_add(column))
+                let pixel_index = tile_region
+                    .origin_y
+                    .checked_add(row)
+                    .and_then(|y| y.checked_mul(tile_region.image_width))
+                    .and_then(|offset| {
+                        tile_region
+                            .origin_x
+                            .checked_add(column)
+                            .and_then(|x| offset.checked_add(x))
+                    })
                     .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                         detail: format!(
-                            "uncompressed component-interleave pixel index overflow at row={row}, column={column}"
+                            "uncompressed component-interleave pixel index overflow at tile origin ({},{}), row={row}, column={column}",
+                            tile_region.origin_x, tile_region.origin_y,
                         ),
                     })?;
                 write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
@@ -1750,24 +1822,31 @@ fn decode_uncompressed_component_interleave(
 fn decode_uncompressed_pixel_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
-    width: usize,
-    height: usize,
+    tile_region: UncompressedDecodeTileRegion,
     pixel_size: u32,
     row_align_size: u32,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
-    for row in 0..height {
+    for row in 0..tile_region.height {
         reader.mark_row_start();
-        for column in 0..width {
+        for column in 0..tile_region.width {
             reader.mark_pixel_start();
             for spec in specs {
                 let sample = read_uncompressed_component_sample(reader, *spec)?;
-                let pixel_index = row
-                    .checked_mul(width)
-                    .and_then(|offset| offset.checked_add(column))
+                let pixel_index = tile_region
+                    .origin_y
+                    .checked_add(row)
+                    .and_then(|y| y.checked_mul(tile_region.image_width))
+                    .and_then(|offset| {
+                        tile_region
+                            .origin_x
+                            .checked_add(column)
+                            .and_then(|x| offset.checked_add(x))
+                    })
                     .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                         detail: format!(
-                            "uncompressed pixel-interleave pixel index overflow at row={row}, column={column}"
+                            "uncompressed pixel-interleave pixel index overflow at tile origin ({},{}), row={row}, column={column}",
+                            tile_region.origin_x, tile_region.origin_y,
                         ),
                     })?;
                 write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
@@ -1783,22 +1862,29 @@ fn decode_uncompressed_pixel_interleave(
 fn decode_uncompressed_row_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
-    width: usize,
-    height: usize,
+    tile_region: UncompressedDecodeTileRegion,
     row_align_size: u32,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
-    for row in 0..height {
+    for row in 0..tile_region.height {
         for spec in specs {
             reader.mark_row_start();
-            for column in 0..width {
+            for column in 0..tile_region.width {
                 let sample = read_uncompressed_component_sample(reader, *spec)?;
-                let pixel_index = row
-                    .checked_mul(width)
-                    .and_then(|offset| offset.checked_add(column))
+                let pixel_index = tile_region
+                    .origin_y
+                    .checked_add(row)
+                    .and_then(|y| y.checked_mul(tile_region.image_width))
+                    .and_then(|offset| {
+                        tile_region
+                            .origin_x
+                            .checked_add(column)
+                            .and_then(|x| offset.checked_add(x))
+                    })
                     .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                         detail: format!(
-                            "uncompressed row-interleave pixel index overflow at row={row}, column={column}"
+                            "uncompressed row-interleave pixel index overflow at tile origin ({},{}), row={row}, column={column}",
+                            tile_region.origin_x, tile_region.origin_y,
                         ),
                     })?;
                 write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
@@ -5720,6 +5806,82 @@ mod tests {
                 png::BitDepth::Sixteen
             }
         );
+    }
+
+    #[test]
+    fn decodes_uncompressed_tiled_component_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/uncompressed_comp_RGB_tiled.heif");
+        let input =
+            std::fs::read(&fixture).expect("uncompressed tiled component fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("uncompressed tiled component fixture should decode");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(decoded.bit_depth, 8);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("uncompressed-comp-rgb-tiled");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("uncompressed tiled component fixture should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn decodes_uncompressed_tiled_pixel_alignment_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/uncompressed_pix_RGB_tiled_row_tile_align.heif");
+        let input =
+            std::fs::read(&fixture).expect("uncompressed tiled pixel fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("uncompressed tiled pixel fixture should decode");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(decoded.bit_depth, 8);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("uncompressed-pix-rgb-tiled-row-tile-align");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("uncompressed tiled pixel fixture should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
     }
 
     #[test]
