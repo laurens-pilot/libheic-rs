@@ -5261,10 +5261,9 @@ fn read_selected_top_level_boxes_from_source<S: RandomAccessSource>(
     Ok(selected)
 }
 
-fn detect_input_family_from_source<S: RandomAccessSource>(
-    source: &mut S,
+fn detect_input_family_from_source_selected_boxes(
+    selected: &[SourceTopLevelBox],
 ) -> Result<Option<HeifInputFamily>, DecodeError> {
-    let selected = read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE])?;
     let Some(ftyp_box) = selected
         .iter()
         .find(|candidate| candidate.header.box_type == FTYP_BOX_TYPE)
@@ -5293,6 +5292,17 @@ fn detect_input_family_from_source<S: RandomAccessSource>(
         return Ok(Some(HeifInputFamily::Heif));
     }
     Ok(None)
+}
+
+fn detect_input_family_from_source<S: RandomAccessSource>(
+    source: &mut S,
+) -> Result<Option<HeifInputFamily>, DecodeError> {
+    // [stream/2.2] preload both top-level ftyp and meta boxes through the
+    // source-backed scanner on seekable paths so family detection and metadata
+    // loading are wired before full-input materialization.
+    let selected =
+        read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
+    detect_input_family_from_source_selected_boxes(&selected)
 }
 
 fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
@@ -8288,22 +8298,28 @@ mod tests {
     }
 
     #[test]
-    fn detects_input_family_from_source_ftyp_scan() {
+    fn detects_input_family_from_source_ftyp_and_meta_scan() {
         let ftyp_payload = make_ftyp_payload(*b"avif");
         let ftyp = make_basic_box(FTYP_BOX_TYPE, &ftyp_payload);
         let mdat = make_basic_box(*b"mdat", &vec![0x55_u8; 128 * 1024]);
+        let meta = make_basic_box(META_BOX_TYPE, &[0x00, 0x00, 0x00, 0x00]);
 
         let mut input = Vec::new();
         input.extend_from_slice(&ftyp);
         input.extend_from_slice(&mdat);
+        input.extend_from_slice(&meta);
 
         let mut source = TrackingSliceSource::new(input);
         let family = detect_input_family_from_source(&mut source)
             .expect("source ftyp scan should not fail for valid payload");
         assert_eq!(family, Some(HeifInputFamily::Avif));
         assert!(
+            source.bytes_requested >= ftyp.len() + meta.len(),
+            "source scan should read both ftyp and meta selected boxes"
+        );
+        assert!(
             source.bytes_requested < 128 * 1024,
-            "ftyp source scan should not materialize the full file"
+            "source scan should not materialize the full file"
         );
     }
 
