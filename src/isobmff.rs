@@ -697,6 +697,7 @@ pub struct HeicGridDescriptor {
 pub struct HeicGridTileItemData {
     pub item_id: u32,
     pub construction_method: u8,
+    pub hvcc: HevcDecoderConfigurationBox,
     pub payload: Vec<u8>,
 }
 
@@ -2468,6 +2469,25 @@ pub enum ExtractHeicItemDataError {
         item_id: u32,
         tile_item_id: u32,
     },
+    GridTilePropertyIndexOutOfRange {
+        item_id: u32,
+        tile_item_id: u32,
+        property_index: u16,
+        available: usize,
+    },
+    MissingGridTileCodecConfiguration {
+        item_id: u32,
+        tile_item_id: u32,
+    },
+    DuplicateGridTileCodecConfiguration {
+        item_id: u32,
+        tile_item_id: u32,
+    },
+    GridTileCodecConfiguration {
+        item_id: u32,
+        tile_item_id: u32,
+        source: ParseHevcDecoderConfigurationBoxError,
+    },
     UnsupportedDataReferenceIndex {
         item_id: u32,
         data_reference_index: u16,
@@ -2573,6 +2593,37 @@ impl Display for ExtractHeicItemDataError {
                 f,
                 "primary grid item_ID {item_id} references tile item_ID {tile_item_id} that is missing from iloc"
             ),
+            ExtractHeicItemDataError::GridTilePropertyIndexOutOfRange {
+                item_id,
+                tile_item_id,
+                property_index,
+                available,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} references property index {property_index}, but only {available} properties are available"
+            ),
+            ExtractHeicItemDataError::MissingGridTileCodecConfiguration {
+                item_id,
+                tile_item_id,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} is missing required hvcC property"
+            ),
+            ExtractHeicItemDataError::DuplicateGridTileCodecConfiguration {
+                item_id,
+                tile_item_id,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} has multiple hvcC properties"
+            ),
+            ExtractHeicItemDataError::GridTileCodecConfiguration {
+                item_id,
+                tile_item_id,
+                source,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} has invalid hvcC property: {source}"
+            ),
             ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
                 item_id,
                 data_reference_index,
@@ -2626,6 +2677,7 @@ impl Error for ExtractHeicItemDataError {
             ExtractHeicItemDataError::Meta(err) => Some(err),
             ExtractHeicItemDataError::ResolvePrimaryItem(err) => Some(err),
             ExtractHeicItemDataError::MetaChildBoxes(err) => Some(err),
+            ExtractHeicItemDataError::GridTileCodecConfiguration { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -3290,6 +3342,11 @@ pub fn extract_primary_heic_item_data_with_grid(
         });
     }
 
+    let mut flattened_properties = Vec::new();
+    for property_container in &resolved.iprp.property_containers {
+        flattened_properties.extend(property_container.properties.iter().cloned());
+    }
+
     let mut tiles = Vec::with_capacity(tile_item_ids.len());
     for &tile_item_id in &tile_item_ids {
         let tile_item_info = resolved
@@ -3318,6 +3375,13 @@ pub fn extract_primary_heic_item_data_with_grid(
             });
         }
 
+        let tile_hvcc = resolve_grid_tile_hvcc(
+            item_id,
+            tile_item_id,
+            &resolved.iprp.associations,
+            &flattened_properties,
+        )?;
+
         let tile_location = resolved
             .iloc
             .items
@@ -3332,6 +3396,7 @@ pub fn extract_primary_heic_item_data_with_grid(
         tiles.push(HeicGridTileItemData {
             item_id: tile_item_id,
             construction_method: tile_construction_method,
+            hvcc: tile_hvcc,
             payload,
         });
     }
@@ -3343,6 +3408,67 @@ pub fn extract_primary_heic_item_data_with_grid(
         tile_item_ids,
         tiles,
     }))
+}
+
+fn resolve_grid_tile_hvcc(
+    item_id: u32,
+    tile_item_id: u32,
+    associations: &[ItemPropertyAssociationBox],
+    flattened_properties: &[ParsedBox<'_>],
+) -> Result<HevcDecoderConfigurationBox, ExtractHeicItemDataError> {
+    let mut hvcc = None;
+
+    for association_box in associations {
+        for entry in &association_box.entries {
+            if entry.item_id != tile_item_id {
+                continue;
+            }
+
+            for association in &entry.associations {
+                if association.property_index == 0 {
+                    continue;
+                }
+
+                let property_index = usize::from(association.property_index - 1);
+                if property_index >= flattened_properties.len() {
+                    return Err(ExtractHeicItemDataError::GridTilePropertyIndexOutOfRange {
+                        item_id,
+                        tile_item_id,
+                        property_index: association.property_index,
+                        available: flattened_properties.len(),
+                    });
+                }
+                let property = &flattened_properties[property_index];
+                if property.header.box_type.as_bytes() != HVCC_BOX_TYPE {
+                    continue;
+                }
+
+                if hvcc.is_some() {
+                    return Err(
+                        ExtractHeicItemDataError::DuplicateGridTileCodecConfiguration {
+                            item_id,
+                            tile_item_id,
+                        },
+                    );
+                }
+
+                hvcc = Some(property.parse_hvcc().map_err(|source| {
+                    ExtractHeicItemDataError::GridTileCodecConfiguration {
+                        item_id,
+                        tile_item_id,
+                        source,
+                    }
+                })?);
+            }
+        }
+    }
+
+    hvcc.ok_or(
+        ExtractHeicItemDataError::MissingGridTileCodecConfiguration {
+            item_id,
+            tile_item_id,
+        },
+    )
 }
 
 fn resolve_primary_heic_item_graph<'a>(
@@ -6953,7 +7079,27 @@ mod tests {
             (3_u16, *b"hev1", b"tile-1"),
         ]);
         let iref = make_iref_dimg_v0(1_u16, &[2_u16, 3_u16]);
-        let meta = make_primary_grid_heic_meta(iloc, iinf, Some(iref), &[]);
+
+        let hvcc_property = make_hvcc_property();
+        let expected_hvcc = parse_boxes(&hvcc_property).expect("hvcC property should parse")[0]
+            .parse_hvcc()
+            .expect("hvcC property payload should parse");
+        let ipco = make_basic_box(*b"ipco", &hvcc_property);
+        let mut ipma_payload = Vec::new();
+        ipma_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        ipma_payload.extend_from_slice(&2_u32.to_be_bytes()); // entry_count
+        for tile_item_id in [2_u16, 3_u16] {
+            ipma_payload.extend_from_slice(&tile_item_id.to_be_bytes());
+            ipma_payload.push(1); // association_count
+            ipma_payload.push(0x01); // property_index=1
+        }
+        let ipma = make_basic_box(*b"ipma", &ipma_payload);
+        let mut iprp_payload = Vec::new();
+        iprp_payload.extend_from_slice(&ipco);
+        iprp_payload.extend_from_slice(&ipma);
+        let iprp = make_basic_box(*b"iprp", &iprp_payload);
+        let pitm = make_basic_box(*b"pitm", &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let meta = make_meta_box(&[pitm, iloc, iinf, iprp, iref]);
 
         let mut file = Vec::new();
         file.extend_from_slice(&mdat);
@@ -6978,11 +7124,13 @@ mod tests {
                     super::HeicGridTileItemData {
                         item_id: 2,
                         construction_method: 0,
+                        hvcc: expected_hvcc.clone(),
                         payload: tile_a,
                     },
                     super::HeicGridTileItemData {
                         item_id: 3,
                         construction_method: 0,
+                        hvcc: expected_hvcc,
                         payload: tile_b,
                     },
                 ],
@@ -7056,6 +7204,56 @@ mod tests {
                 columns: 2,
                 expected: 2,
                 actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_primary_heic_grid_extraction_when_tile_hvcc_property_is_missing() {
+        let grid_descriptor = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0x02];
+        let tile_a = vec![0xaa, 0xbb];
+        let tile_b = vec![0xcc, 0xdd, 0xee];
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&grid_descriptor);
+        mdat_payload.extend_from_slice(&tile_a);
+        mdat_payload.extend_from_slice(&tile_b);
+        let mdat = make_basic_box(*b"mdat", &mdat_payload);
+
+        let base_offset = BASIC_HEADER_SIZE as u32;
+        let iloc = make_iloc_v0_single_extent_items(&[
+            (1_u16, base_offset, 0_u32, grid_descriptor.len() as u32),
+            (
+                2_u16,
+                base_offset,
+                grid_descriptor.len() as u32,
+                tile_a.len() as u32,
+            ),
+            (
+                3_u16,
+                base_offset,
+                (grid_descriptor.len() + tile_a.len()) as u32,
+                tile_b.len() as u32,
+            ),
+        ]);
+        let iinf = make_iinf_with_entries(&[
+            (1_u16, *b"grid", b"primary-grid"),
+            (2_u16, *b"hvc1", b"tile-0"),
+            (3_u16, *b"hev1", b"tile-1"),
+        ]);
+        let iref = make_iref_dimg_v0(1_u16, &[2_u16, 3_u16]);
+        let meta = make_primary_grid_heic_meta(iloc, iinf, Some(iref), &[]);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("grid tile without hvcC must fail");
+        assert_eq!(
+            err,
+            ExtractHeicItemDataError::MissingGridTileCodecConfiguration {
+                item_id: 1,
+                tile_item_id: 2,
             }
         );
     }
