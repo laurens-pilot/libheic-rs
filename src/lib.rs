@@ -1,3 +1,4 @@
+use flate2::read::{DeflateDecoder, ZlibDecoder};
 use heic_decoder::DecodedFrame as HeicDecoderFrame;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -17,7 +18,7 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -1343,13 +1344,6 @@ pub fn decode_primary_uncompressed_to_image(
     // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
     // unc_decoder_factory::{check_common_requirements,get_unc_decoder}.
     let properties = isobmff::parse_primary_uncompressed_item_properties(input)?;
-    if primary_uncompressed_uses_generic_compression(input)? {
-        return Err(DecodeUncompressedError::UnsupportedFeature {
-            detail:
-                "generic-compressed uncompressed (`unci`) payloads are not supported in this baseline decoder"
-                    .to_string(),
-        });
-    }
 
     let mut interleave_type = properties.unc_c.interleave_type;
     let mut sampling_type = properties.unc_c.sampling_type;
@@ -1802,7 +1796,9 @@ pub fn decode_primary_uncompressed_to_image(
         }
     }
 
-    let payload = isobmff::extract_primary_uncompressed_item_data(input)?;
+    let item_data = isobmff::extract_primary_uncompressed_item_data(input)?;
+    let payload =
+        maybe_decode_primary_uncompressed_generic_compression_payload(input, &item_data.payload)?;
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
         let tile_layout = UncompressedTileDecodeLayout {
             tile_rows: tile_rows_usize,
@@ -1814,14 +1810,14 @@ pub fn decode_primary_uncompressed_to_image(
             tile_align_size: properties.unc_c.tile_align_size,
         };
         decode_uncompressed_tile_component_interleave(
-            &payload.payload,
+            &payload,
             &component_specs,
             tile_layout,
             sampling_type,
             &mut channel_samples,
         )?;
     } else {
-        let mut reader = UncompressedBitReader::new(&payload.payload);
+        let mut reader = UncompressedBitReader::new(&payload);
         // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_decoder.cc:
         // unc_decoder::decode_image tile iteration order (row-major grid traversal).
         for tile_row in 0..tile_rows_usize {
@@ -3118,9 +3114,139 @@ fn scale_uncompressed_sample_bit_depth(
     })
 }
 
-fn primary_uncompressed_uses_generic_compression(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenericCompressedUnit {
+    offset: u64,
+    size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrimaryUncompressedGenericCompressionConfig {
+    compression_type: [u8; 4],
+    compressed_unit_type: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryUncompressedGenericCompression {
+    config: PrimaryUncompressedGenericCompressionConfig,
+    units: Vec<GenericCompressedUnit>,
+}
+
+fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     input: &[u8],
-) -> Result<bool, DecodeUncompressedError> {
+    payload: &'a [u8],
+) -> Result<Cow<'a, [u8]>, DecodeUncompressedError> {
+    // Provenance: generic compression handling mirrors libheif
+    // uncompressed decode flow and cmpC/icef semantics in
+    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
+    // unc_decoder::{get_compressed_image_data_uncompressed,do_decompress_data}
+    // and libheif/libheif/codecs/uncompressed/unc_boxes.cc:
+    // {Box_cmpC::parse,Box_icef::parse}.
+    let Some(generic_compression) = parse_primary_uncompressed_generic_compression(input)? else {
+        return Ok(Cow::Borrowed(payload));
+    };
+
+    let compressed_unit_type = generic_compression.config.compressed_unit_type;
+    if compressed_unit_type == GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: "unsupported cmpC compressed_unit_type 4 (image-pixel) for generic-compressed uncompressed (`unci`) payload"
+                .to_string(),
+        });
+    }
+    if !matches!(
+        compressed_unit_type,
+        GENERIC_COMPRESSED_UNIT_FULL_ITEM
+            | GENERIC_COMPRESSED_UNIT_IMAGE
+            | GENERIC_COMPRESSED_UNIT_IMAGE_TILE
+            | GENERIC_COMPRESSED_UNIT_IMAGE_ROW
+    ) {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported cmpC compressed_unit_type {compressed_unit_type} for generic-compressed uncompressed (`unci`) payload"
+            ),
+        });
+    }
+    if matches!(
+        compressed_unit_type,
+        GENERIC_COMPRESSED_UNIT_IMAGE_TILE | GENERIC_COMPRESSED_UNIT_IMAGE_ROW
+    ) && generic_compression.units.is_empty()
+    {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "cmpC compressed_unit_type {compressed_unit_type} requires associated icef unit entries"
+            ),
+        });
+    }
+
+    let fallback_size =
+        u64::try_from(payload.len()).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "generic-compressed payload length {} cannot be represented as u64",
+                payload.len()
+            ),
+        })?;
+    let units: Cow<'_, [GenericCompressedUnit]> = if generic_compression.units.is_empty() {
+        Cow::Owned(vec![GenericCompressedUnit {
+            offset: 0,
+            size: fallback_size,
+        }])
+    } else {
+        Cow::Borrowed(&generic_compression.units)
+    };
+
+    let mut decompressed = Vec::new();
+    for (unit_index, unit) in units.iter().enumerate() {
+        let start = usize::try_from(unit.offset).map_err(|_| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "generic-compressed unit {unit_index} offset {} cannot be represented on this platform",
+                    unit.offset
+                ),
+            }
+        })?;
+        let size = usize::try_from(unit.size).map_err(|_| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "generic-compressed unit {unit_index} size {} cannot be represented on this platform",
+                    unit.size
+                ),
+            }
+        })?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "generic-compressed unit {unit_index} range overflow for offset {} and size {}",
+                    unit.offset, unit.size
+                ),
+            })?;
+        if end > payload.len() {
+            let unit_end = unit.offset.saturating_add(unit.size);
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "generic-compressed unit {unit_index} range {}..{} exceeds payload size {}",
+                    unit.offset,
+                    unit_end,
+                    payload.len()
+                ),
+            });
+        }
+
+        let unit_payload = &payload[start..end];
+        let unit_data = decompress_generic_compressed_unit(
+            generic_compression.config.compression_type,
+            unit_payload,
+            unit_index,
+        )?;
+        decompressed.extend_from_slice(&unit_data);
+    }
+
+    Ok(Cow::Owned(decompressed))
+}
+
+fn parse_primary_uncompressed_generic_compression(
+    input: &[u8],
+) -> Result<Option<PrimaryUncompressedGenericCompression>, DecodeUncompressedError> {
     let top_level =
         isobmff::parse_boxes(input).map_err(|err| DecodeUncompressedError::InvalidInput {
             detail: format!("failed to inspect primary uncompressed properties: {err}"),
@@ -3141,14 +3267,279 @@ fn primary_uncompressed_uses_generic_compression(
         meta.resolve_primary_item()
             .map_err(|err| DecodeUncompressedError::InvalidInput {
                 detail: format!(
-                "failed to resolve primary item while inspecting uncompressed properties: {err}"
-            ),
+                    "failed to resolve primary item while inspecting uncompressed properties: {err}"
+                ),
             })?;
 
-    Ok(resolved.primary_item.properties.iter().any(|property| {
+    let mut cmpc = None;
+    let mut icef = None;
+    for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type.as_bytes();
-        property_type == CMPC_PROPERTY_TYPE || property_type == ICEF_PROPERTY_TYPE
+        if property_type == CMPC_PROPERTY_TYPE {
+            if cmpc.is_some() {
+                return Err(DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "primary item_ID {} has duplicate cmpC properties",
+                        resolved.primary_item.item_id
+                    ),
+                });
+            }
+            cmpc = Some(parse_primary_uncompressed_cmpc_property(
+                &property.property,
+            )?);
+        } else if property_type == ICEF_PROPERTY_TYPE {
+            if icef.is_some() {
+                return Err(DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "primary item_ID {} has duplicate icef properties",
+                        resolved.primary_item.item_id
+                    ),
+                });
+            }
+            icef = Some(parse_primary_uncompressed_icef_property(
+                &property.property,
+            )?);
+        }
+    }
+
+    let Some(config) = cmpc else {
+        return Ok(None);
+    };
+
+    Ok(Some(PrimaryUncompressedGenericCompression {
+        config,
+        units: icef.unwrap_or_default(),
     }))
+}
+
+fn parse_primary_uncompressed_cmpc_property(
+    property: &isobmff::ParsedBox<'_>,
+) -> Result<PrimaryUncompressedGenericCompressionConfig, DecodeUncompressedError> {
+    let payload = property.payload;
+    if payload.len() < 9 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "cmpC payload too small at offset {} (available: {}, required: 9)",
+                property.offset,
+                payload.len()
+            ),
+        });
+    }
+    let version = payload[0];
+    if version != 0 {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported cmpC full box version {version} at offset {}",
+                property.offset
+            ),
+        });
+    }
+
+    let compression_type = [payload[4], payload[5], payload[6], payload[7]];
+    let compressed_unit_type = payload[8];
+    if compressed_unit_type > GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported cmpC compressed_unit_type {compressed_unit_type} at offset {}",
+                property.offset
+            ),
+        });
+    }
+
+    Ok(PrimaryUncompressedGenericCompressionConfig {
+        compression_type,
+        compressed_unit_type,
+    })
+}
+
+fn parse_primary_uncompressed_icef_property(
+    property: &isobmff::ParsedBox<'_>,
+) -> Result<Vec<GenericCompressedUnit>, DecodeUncompressedError> {
+    let payload = property.payload;
+    if payload.len() < 9 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef payload too small at offset {} (available: {}, required: 9)",
+                property.offset,
+                payload.len()
+            ),
+        });
+    }
+
+    let version = payload[0];
+    if version != 0 {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported icef full box version {version} at offset {}",
+                property.offset
+            ),
+        });
+    }
+
+    let codes = payload[4];
+    let unit_offset_code = usize::from((codes & 0b1110_0000) >> 5);
+    let unit_size_code = usize::from((codes & 0b0001_1100) >> 2);
+    if unit_offset_code >= ICEF_OFFSET_BITS_TABLE.len() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "unsupported icef unit_offset_code {unit_offset_code} at offset {}",
+                property.offset
+            ),
+        });
+    }
+    if unit_size_code >= ICEF_SIZE_BITS_TABLE.len() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "unsupported icef unit_size_code {unit_size_code} at offset {}",
+                property.offset
+            ),
+        });
+    }
+
+    let unit_count = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
+    let unit_count =
+        usize::try_from(unit_count).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef unit_count {} at offset {} cannot be represented on this platform",
+                unit_count, property.offset
+            ),
+        })?;
+    let offset_bytes = usize::from(ICEF_OFFSET_BITS_TABLE[unit_offset_code] / 8);
+    let size_bytes = usize::from(ICEF_SIZE_BITS_TABLE[unit_size_code] / 8);
+    let entry_bytes = offset_bytes
+        .checked_add(size_bytes)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef entry byte-size overflow at offset {} for offset_code {unit_offset_code} and size_code {unit_size_code}",
+                property.offset
+            ),
+        })?;
+    let required = entry_bytes.checked_mul(unit_count).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef table-size overflow at offset {} for unit_count {unit_count}",
+                property.offset
+            ),
+        }
+    })?;
+    if payload.len().saturating_sub(9) < required {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef payload too small for {unit_count} unit entries at offset {} (available: {}, required: {})",
+                property.offset,
+                payload.len().saturating_sub(9),
+                required
+            ),
+        });
+    }
+
+    let mut cursor = 9usize;
+    let mut implied_offset = 0_u64;
+    let mut units = Vec::with_capacity(unit_count);
+    for unit_index in 0..unit_count {
+        let offset = if offset_bytes == 0 {
+            implied_offset
+        } else {
+            read_icef_uint(
+                payload,
+                &mut cursor,
+                offset_bytes,
+                property.offset,
+                unit_index,
+                "offset",
+            )?
+        };
+        let size = read_icef_uint(
+            payload,
+            &mut cursor,
+            size_bytes,
+            property.offset,
+            unit_index,
+            "size",
+        )?;
+        implied_offset = implied_offset.checked_add(size).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "icef implied offset overflow while parsing unit {unit_index} at offset {}",
+                    property.offset
+                ),
+            }
+        })?;
+        units.push(GenericCompressedUnit { offset, size });
+    }
+
+    Ok(units)
+}
+
+fn read_icef_uint(
+    payload: &[u8],
+    cursor: &mut usize,
+    byte_count: usize,
+    box_offset: u64,
+    unit_index: usize,
+    field_name: &'static str,
+) -> Result<u64, DecodeUncompressedError> {
+    let end = cursor
+        .checked_add(byte_count)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef {field_name} cursor overflow while parsing unit {unit_index} at offset {box_offset}"
+            ),
+        })?;
+    if end > payload.len() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "icef payload truncated while reading {field_name} for unit {unit_index} at offset {box_offset}"
+            ),
+        });
+    }
+
+    let mut value = 0_u64;
+    for byte in &payload[*cursor..end] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    *cursor = end;
+    Ok(value)
+}
+
+fn decompress_generic_compressed_unit(
+    compression_type: [u8; 4],
+    compressed_data: &[u8],
+    unit_index: usize,
+) -> Result<Vec<u8>, DecodeUncompressedError> {
+    let mut decompressed = Vec::new();
+    let compression_label = String::from_utf8_lossy(&compression_type).into_owned();
+    match compression_type {
+        GENERIC_COMPRESSION_TYPE_ZLIB => {
+            let mut decoder = ZlibDecoder::new(compressed_data);
+            decoder.read_to_end(&mut decompressed).map_err(|err| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "failed to decompress zlib generic-compressed unit {unit_index}: {err}"
+                    ),
+                }
+            })?;
+        }
+        GENERIC_COMPRESSION_TYPE_DEFLATE => {
+            let mut decoder = DeflateDecoder::new(compressed_data);
+            decoder.read_to_end(&mut decompressed).map_err(|err| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "failed to decompress deflate generic-compressed unit {unit_index}: {err}"
+                    ),
+                }
+            })?;
+        }
+        _ => {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "unsupported cmpC compression_type {compression_label} for generic-compressed uncompressed (`unci`) payload"
+                ),
+            });
+        }
+    }
+
+    Ok(decompressed)
 }
 
 fn uncompressed_channel_name(channel_index: usize) -> &'static str {
@@ -3988,6 +4379,15 @@ const META_BOX_TYPE: [u8; 4] = *b"meta";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
 const CMPC_PROPERTY_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_PROPERTY_TYPE: [u8; 4] = *b"icef";
+const GENERIC_COMPRESSION_TYPE_ZLIB: [u8; 4] = *b"zlib";
+const GENERIC_COMPRESSION_TYPE_DEFLATE: [u8; 4] = *b"defl";
+const GENERIC_COMPRESSED_UNIT_FULL_ITEM: u8 = 0;
+const GENERIC_COMPRESSED_UNIT_IMAGE: u8 = 1;
+const GENERIC_COMPRESSED_UNIT_IMAGE_TILE: u8 = 2;
+const GENERIC_COMPRESSED_UNIT_IMAGE_ROW: u8 = 3;
+const GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL: u8 = 4;
+const ICEF_OFFSET_BITS_TABLE: [u8; 5] = [0, 16, 24, 32, 64];
+const ICEF_SIZE_BITS_TABLE: [u8; 5] = [8, 16, 24, 32, 64];
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
 const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
@@ -6997,6 +7397,91 @@ mod tests {
         assert_eq!(frame_info.height, decoded.height);
         assert_eq!(frame_info.color_type, png::ColorType::Rgba);
         assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn decodes_generic_compressed_deflate_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_defl.heif");
+        let input =
+            std::fs::read(&fixture).expect("generic-compressed deflate fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("generic-compressed deflate fixture should decode");
+        assert_eq!(decoded.bit_depth, 8);
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("generic-compressed-deflate");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("generic-compressed deflate fixture should write PNG");
+    }
+
+    #[test]
+    fn decodes_generic_compressed_zlib_rows_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_zlib_rows.heif");
+        let input =
+            std::fs::read(&fixture).expect("generic-compressed zlib rows fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("generic-compressed zlib rows fixture should decode");
+        assert_eq!(decoded.bit_depth, 8);
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("generic-compressed-zlib-rows");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("generic-compressed zlib rows fixture should write PNG");
+    }
+
+    #[test]
+    fn decodes_generic_compressed_zlib_tiled_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_zlib_tiled.heif");
+        let input = std::fs::read(&fixture)
+            .expect("generic-compressed zlib tiled fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("generic-compressed zlib tiled fixture should decode");
+        assert_eq!(decoded.bit_depth, 8);
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("generic-compressed-zlib-tiled");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("generic-compressed zlib tiled fixture should write PNG");
+    }
+
+    #[test]
+    fn reports_unsupported_brotli_generic_compressed_fixture() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_brotli.heif");
+        let input =
+            std::fs::read(&fixture).expect("generic-compressed brotli fixture must be readable");
+        let err = decode_primary_uncompressed_to_image(&input)
+            .expect_err("generic-compressed brotli fixture should remain unsupported in this pass");
+        match err {
+            DecodeUncompressedError::UnsupportedFeature { detail } => {
+                assert!(
+                    detail.contains("brot"),
+                    "expected brotli unsupported error detail, got: {detail}"
+                );
+            }
+            other => panic!("unexpected decode result for brotli fixture: {other:?}"),
+        }
     }
 
     #[test]
