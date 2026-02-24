@@ -4660,8 +4660,15 @@ fn heic_layout_from_sps_chroma_array_type(
     }
 }
 
+const FTYP_BOX_TYPE: [u8; 4] = *b"ftyp";
 const META_BOX_TYPE: [u8; 4] = *b"meta";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
+const UUID_BOX_TYPE: [u8; 4] = *b"uuid";
+const BASIC_BOX_HEADER_SIZE: usize = 8;
+const LARGE_BOX_SIZE_FIELD_SIZE: usize = 8;
+const UUID_EXTENDED_TYPE_SIZE: usize = 16;
+const TOP_LEVEL_BOX_HEADER_PROBE_SIZE: usize =
+    BASIC_BOX_HEADER_SIZE + LARGE_BOX_SIZE_FIELD_SIZE + UUID_EXTENDED_TYPE_SIZE;
 const CMPC_PROPERTY_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_PROPERTY_TYPE: [u8; 4] = *b"icef";
 const GENERIC_COMPRESSION_TYPE_BROTLI: [u8; 4] = *b"brot";
@@ -5097,6 +5104,197 @@ fn has_file_brand(ftyp: &isobmff::FileTypeBox, accepted: &[[u8; 4]]) -> bool {
             .any(|brand| accepted.contains(&brand.as_bytes()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceTopLevelBoxHeader {
+    box_type: [u8; 4],
+    box_size: u64,
+    header_size: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceTopLevelBox {
+    offset: u64,
+    header: SourceTopLevelBoxHeader,
+    bytes: Vec<u8>,
+}
+
+fn read_u32_be_from(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn read_u64_be_from(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn parse_source_top_level_box_header(
+    probe: &[u8],
+    offset: u64,
+    available: u64,
+) -> Result<SourceTopLevelBoxHeader, DecodeError> {
+    if probe.len() < BASIC_BOX_HEADER_SIZE {
+        return Err(DecodeError::Unsupported(format!(
+            "truncated BMFF box header at offset {offset} (available: {} bytes, required: {BASIC_BOX_HEADER_SIZE})",
+            probe.len()
+        )));
+    }
+
+    // Provenance: mirrors libheif header/range checks in
+    // libheif/libheif/box.cc:BoxHeader::parse_header and Box::read.
+    let size32 = read_u32_be_from(&probe[0..4]);
+    let box_type = [probe[4], probe[5], probe[6], probe[7]];
+
+    let mut header_size = BASIC_BOX_HEADER_SIZE;
+    let box_size = if size32 == 1 {
+        let needed = BASIC_BOX_HEADER_SIZE + LARGE_BOX_SIZE_FIELD_SIZE;
+        if probe.len() < needed {
+            return Err(DecodeError::Unsupported(format!(
+                "truncated BMFF largesize field at offset {offset} (available: {} bytes, required: {needed})",
+                probe.len()
+            )));
+        }
+        header_size = needed;
+        read_u64_be_from(&probe[BASIC_BOX_HEADER_SIZE..needed])
+    } else if size32 == 0 {
+        available
+    } else {
+        u64::from(size32)
+    };
+
+    if box_type == UUID_BOX_TYPE {
+        let needed = header_size + UUID_EXTENDED_TYPE_SIZE;
+        if probe.len() < needed {
+            return Err(DecodeError::Unsupported(format!(
+                "truncated BMFF uuid extended type at offset {offset} (available: {} bytes, required: {needed})",
+                probe.len()
+            )));
+        }
+        header_size = needed;
+    }
+
+    let header_size_u8 = u8::try_from(header_size).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "BMFF header size {header_size} at offset {offset} does not fit in u8"
+        ))
+    })?;
+    let header_size_u64 = u64::from(header_size_u8);
+    if box_size < header_size_u64 {
+        return Err(DecodeError::Unsupported(format!(
+            "invalid BMFF box size at offset {offset}: box_size={box_size}, header_size={header_size_u8}"
+        )));
+    }
+    if box_size > available {
+        return Err(DecodeError::Unsupported(format!(
+            "BMFF box at offset {offset} exceeds available bytes: box_size={box_size}, available={available}"
+        )));
+    }
+
+    Ok(SourceTopLevelBoxHeader {
+        box_type,
+        box_size,
+        header_size: header_size_u8,
+    })
+}
+
+fn read_selected_top_level_boxes_from_source<S: RandomAccessSource>(
+    source: &mut S,
+    selected_types: &[[u8; 4]],
+) -> Result<Vec<SourceTopLevelBox>, DecodeError> {
+    if selected_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut selected = Vec::new();
+    let mut found = vec![false; selected_types.len()];
+    let source_len = source.len();
+    let mut cursor = 0_u64;
+
+    while cursor < source_len {
+        let available = source_len - cursor;
+        let probe_len_u64 = available.min(TOP_LEVEL_BOX_HEADER_PROBE_SIZE as u64);
+        let probe_len = usize::try_from(probe_len_u64).map_err(|_| {
+            DecodeError::Unsupported(format!(
+                "top-level box probe size {probe_len_u64} at offset {cursor} does not fit in usize"
+            ))
+        })?;
+        let probe = source
+            .read_range(cursor, probe_len)
+            .map_err(decode_error_from_source_read_error)?;
+        let header = parse_source_top_level_box_header(&probe, cursor, available)?;
+        let box_size_usize = usize::try_from(header.box_size).map_err(|_| {
+            DecodeError::Unsupported(format!(
+                "top-level box {} at offset {cursor} has size {} that does not fit in usize",
+                String::from_utf8_lossy(&header.box_type),
+                header.box_size
+            ))
+        })?;
+
+        if let Some(selected_index) = selected_types
+            .iter()
+            .position(|kind| *kind == header.box_type)
+        {
+            if !found[selected_index] {
+                let box_bytes = source
+                    .read_range(cursor, box_size_usize)
+                    .map_err(decode_error_from_source_read_error)?;
+                selected.push(SourceTopLevelBox {
+                    offset: cursor,
+                    header,
+                    bytes: box_bytes,
+                });
+                found[selected_index] = true;
+                if found.iter().all(|value| *value) {
+                    break;
+                }
+            }
+        }
+
+        cursor = cursor.checked_add(header.box_size).ok_or_else(|| {
+            DecodeError::Unsupported(format!(
+                "top-level box offset overflow while scanning source at offset {cursor} (size {})",
+                header.box_size
+            ))
+        })?;
+    }
+
+    Ok(selected)
+}
+
+fn detect_input_family_from_source<S: RandomAccessSource>(
+    source: &mut S,
+) -> Result<Option<HeifInputFamily>, DecodeError> {
+    let selected = read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE])?;
+    let Some(ftyp_box) = selected
+        .iter()
+        .find(|candidate| candidate.header.box_type == FTYP_BOX_TYPE)
+    else {
+        return Ok(None);
+    };
+    let parsed = isobmff::parse_boxes(&ftyp_box.bytes).map_err(|err| {
+        DecodeError::Unsupported(format!(
+            "failed to parse top-level ftyp box from source at offset {}: {err}",
+            ftyp_box.offset
+        ))
+    })?;
+    let Some(parsed_ftyp_box) = parsed.first() else {
+        return Ok(None);
+    };
+    let ftyp = parsed_ftyp_box.parse_ftyp().map_err(|err| {
+        DecodeError::Unsupported(format!(
+            "failed to parse ftyp payload from source at offset {}: {err}",
+            ftyp_box.offset
+        ))
+    })?;
+    if has_file_brand(&ftyp, &AVIF_FILE_BRANDS) {
+        return Ok(Some(HeifInputFamily::Avif));
+    }
+    if has_file_brand(&ftyp, &HEIF_FILE_BRANDS) {
+        return Ok(Some(HeifInputFamily::Heif));
+    }
+    Ok(None)
+}
+
 fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
     let boxes = isobmff::parse_boxes(input).ok()?;
     let ftyp_box = boxes
@@ -5174,8 +5372,9 @@ fn decode_source_to_rgba_with_hint<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    let source_family_hint = detect_input_family_from_source(source)?;
     let input = read_all_from_source(source)?;
-    decode_bytes_to_rgba_with_hint(&input, hint)
+    decode_bytes_to_rgba_with_hint(&input, source_family_hint.or(hint))
 }
 
 fn decode_source_to_png_with_hint<S: RandomAccessSource>(
@@ -5183,8 +5382,9 @@ fn decode_source_to_png_with_hint<S: RandomAccessSource>(
     hint: Option<HeifInputFamily>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
+    let source_family_hint = detect_input_family_from_source(source)?;
     let input = read_all_from_source(source)?;
-    decode_bytes_to_png_with_hint(&input, hint, output_path)
+    decode_bytes_to_png_with_hint(&input, source_family_hint.or(hint), output_path)
 }
 
 fn read_all_from_reader<R: Read>(mut input_reader: R) -> Result<Vec<u8>, DecodeError> {
@@ -7841,14 +8041,15 @@ mod tests {
         decode_path_to_rgba, decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
         decode_read_to_rgba, decode_uncompressed_multi_y_interleave,
-        parse_length_prefixed_hevc_nal_units, stitch_decoded_heic_grid_tiles,
+        detect_input_family_from_source, parse_length_prefixed_hevc_nal_units,
+        read_selected_top_level_boxes_from_source, stitch_decoded_heic_grid_tiles,
         validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
         AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
         DecodeErrorCategory, DecodeHeicError, DecodeUncompressedError, DecodedAvifImage,
-        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
-        TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
+        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HeifInputFamily,
+        HevcNalClass, TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
         UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
-        YCbCrRange, CMPC_PROPERTY_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
+        YCbCrRange, CMPC_PROPERTY_TYPE, FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
         GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
         ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
         UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
@@ -8058,6 +8259,52 @@ mod tests {
 
         let png = std::fs::read(&output).expect("decoded output PNG should be readable");
         assert!(!png.is_empty(), "decoded PNG output should not be empty");
+    }
+
+    #[test]
+    fn source_top_level_scan_skips_large_unselected_payloads() {
+        let ftyp_payload = make_ftyp_payload(*b"heic");
+        let ftyp = make_basic_box(FTYP_BOX_TYPE, &ftyp_payload);
+        let mdat = make_basic_box(*b"mdat", &vec![0x7B_u8; 256 * 1024]);
+        let meta = make_basic_box(META_BOX_TYPE, &[0x00, 0x00, 0x00, 0x00]);
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&ftyp);
+        input.extend_from_slice(&mdat);
+        input.extend_from_slice(&meta);
+
+        let mut source = TrackingSliceSource::new(input);
+        let selected =
+            read_selected_top_level_boxes_from_source(&mut source, &[FTYP_BOX_TYPE, META_BOX_TYPE])
+                .expect("source scanner should parse top-level boxes");
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].header.box_type, FTYP_BOX_TYPE);
+        assert_eq!(selected[1].header.box_type, META_BOX_TYPE);
+        assert!(
+            source.bytes_requested < 256 * 1024,
+            "scanner should not read full mdat payload for unselected box types"
+        );
+    }
+
+    #[test]
+    fn detects_input_family_from_source_ftyp_scan() {
+        let ftyp_payload = make_ftyp_payload(*b"avif");
+        let ftyp = make_basic_box(FTYP_BOX_TYPE, &ftyp_payload);
+        let mdat = make_basic_box(*b"mdat", &vec![0x55_u8; 128 * 1024]);
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&ftyp);
+        input.extend_from_slice(&mdat);
+
+        let mut source = TrackingSliceSource::new(input);
+        let family = detect_input_family_from_source(&mut source)
+            .expect("source ftyp scan should not fail for valid payload");
+        assert_eq!(family, Some(HeifInputFamily::Avif));
+        assert!(
+            source.bytes_requested < 128 * 1024,
+            "ftyp source scan should not materialize the full file"
+        );
     }
 
     #[test]
@@ -9562,6 +9809,80 @@ mod tests {
                 available: 1,
             }
         ));
+    }
+
+    #[derive(Debug)]
+    struct TrackingSliceSource {
+        data: Vec<u8>,
+        bytes_requested: usize,
+    }
+
+    impl TrackingSliceSource {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                bytes_requested: 0,
+            }
+        }
+    }
+
+    impl super::source::RandomAccessSource for TrackingSliceSource {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_exact_at(
+            &mut self,
+            offset: u64,
+            output: &mut [u8],
+        ) -> Result<(), super::source::SourceReadError> {
+            let requested = output.len();
+            let end = offset
+                .checked_add(requested as u64)
+                .ok_or(super::source::SourceReadError::RangeOverflow { offset, requested })?;
+            if end > self.len() {
+                return Err(super::source::SourceReadError::OutOfBounds {
+                    offset,
+                    requested,
+                    source_len: self.len(),
+                });
+            }
+            let start = usize::try_from(offset).map_err(|_| {
+                super::source::SourceReadError::OutOfBounds {
+                    offset,
+                    requested,
+                    source_len: self.len(),
+                }
+            })?;
+            let end = start + requested;
+            output.copy_from_slice(&self.data[start..end]);
+            self.bytes_requested = self
+                .bytes_requested
+                .checked_add(requested)
+                .expect("tracking byte counter should not overflow in tests");
+            Ok(())
+        }
+    }
+
+    fn make_basic_box(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let box_size = 8_usize
+            .checked_add(payload.len())
+            .expect("BMFF test box size should not overflow");
+        let box_size_u32 =
+            u32::try_from(box_size).expect("BMFF test box size should fit 32-bit header");
+        let mut out = Vec::with_capacity(box_size);
+        out.extend_from_slice(&box_size_u32.to_be_bytes());
+        out.extend_from_slice(&box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_ftyp_payload(major_brand: [u8; 4]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&major_brand);
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&major_brand);
+        payload
     }
 
     struct TempFileGuard(PathBuf);
