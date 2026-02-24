@@ -1115,6 +1115,17 @@ struct UncompressedDecodeTileRegion {
     origin_y: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UncompressedTileDecodeLayout {
+    tile_rows: usize,
+    tile_cols: usize,
+    tile_width: usize,
+    tile_height: usize,
+    image_width: usize,
+    row_align_size: u32,
+    tile_align_size: u32,
+}
+
 struct UncompressedBitReader<'a> {
     data: &'a [u8],
     bit_offset: usize,
@@ -1477,10 +1488,11 @@ pub fn decode_primary_uncompressed_to_image(
         UNCOMPRESSED_INTERLEAVE_COMPONENT
             | UNCOMPRESSED_INTERLEAVE_PIXEL
             | UNCOMPRESSED_INTERLEAVE_ROW
+            | UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT
     ) {
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
-                "unsupported uncC interleave_type {interleave_type}; baseline supports component/pixel/row interleave"
+                "unsupported uncC interleave_type {interleave_type}; baseline supports component/pixel/row/tile-component interleave"
             ),
         });
     }
@@ -1618,57 +1630,77 @@ pub fn decode_primary_uncompressed_to_image(
     }
 
     let payload = isobmff::extract_primary_uncompressed_item_data(input)?;
-    let mut reader = UncompressedBitReader::new(&payload.payload);
-    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_decoder.cc:
-    // unc_decoder::decode_image tile iteration order (row-major grid traversal).
-    for tile_row in 0..tile_rows_usize {
-        let tile_origin_y = tile_row.checked_mul(tile_height_usize).ok_or_else(|| {
-            DecodeUncompressedError::InvalidInput {
-                detail: format!("uncompressed tile y-origin overflow for tile row {tile_row}"),
-            }
-        })?;
-        for tile_column in 0..tile_cols_usize {
-            let tile_origin_x = tile_column.checked_mul(tile_width_usize).ok_or_else(|| {
+    if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
+        let tile_layout = UncompressedTileDecodeLayout {
+            tile_rows: tile_rows_usize,
+            tile_cols: tile_cols_usize,
+            tile_width: tile_width_usize,
+            tile_height: tile_height_usize,
+            image_width: width_usize,
+            row_align_size: properties.unc_c.row_align_size,
+            tile_align_size: properties.unc_c.tile_align_size,
+        };
+        decode_uncompressed_tile_component_interleave(
+            &payload.payload,
+            &component_specs,
+            tile_layout,
+            &mut channel_samples,
+        )?;
+    } else {
+        let mut reader = UncompressedBitReader::new(&payload.payload);
+        // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_decoder.cc:
+        // unc_decoder::decode_image tile iteration order (row-major grid traversal).
+        for tile_row in 0..tile_rows_usize {
+            let tile_origin_y = tile_row.checked_mul(tile_height_usize).ok_or_else(|| {
                 DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "uncompressed tile x-origin overflow for tile column {tile_column}"
-                    ),
+                    detail: format!("uncompressed tile y-origin overflow for tile row {tile_row}"),
                 }
             })?;
-            let tile_region = UncompressedDecodeTileRegion {
-                image_width: width_usize,
-                width: tile_width_usize,
-                height: tile_height_usize,
-                origin_x: tile_origin_x,
-                origin_y: tile_origin_y,
-            };
-            reader.mark_tile_start();
-            match interleave_type {
-                UNCOMPRESSED_INTERLEAVE_COMPONENT => decode_uncompressed_component_interleave(
-                    &mut reader,
-                    &component_specs,
-                    tile_region,
-                    properties.unc_c.row_align_size,
-                    &mut channel_samples,
-                )?,
-                UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
-                    &mut reader,
-                    &component_specs,
-                    tile_region,
-                    properties.unc_c.pixel_size,
-                    properties.unc_c.row_align_size,
-                    &mut channel_samples,
-                )?,
-                UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
-                    &mut reader,
-                    &component_specs,
-                    tile_region,
-                    properties.unc_c.row_align_size,
-                    &mut channel_samples,
-                )?,
-                _ => unreachable!(),
+            for tile_column in 0..tile_cols_usize {
+                let tile_origin_x = tile_column.checked_mul(tile_width_usize).ok_or_else(|| {
+                    DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed tile x-origin overflow for tile column {tile_column}"
+                        ),
+                    }
+                })?;
+                let tile_region = UncompressedDecodeTileRegion {
+                    image_width: width_usize,
+                    width: tile_width_usize,
+                    height: tile_height_usize,
+                    origin_x: tile_origin_x,
+                    origin_y: tile_origin_y,
+                };
+                reader.mark_tile_start();
+                match interleave_type {
+                    UNCOMPRESSED_INTERLEAVE_COMPONENT => decode_uncompressed_component_interleave(
+                        &mut reader,
+                        &component_specs,
+                        tile_region,
+                        properties.unc_c.row_align_size,
+                        properties.unc_c.tile_align_size,
+                        false,
+                        &mut channel_samples,
+                    )?,
+                    UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
+                        &mut reader,
+                        &component_specs,
+                        tile_region,
+                        properties.unc_c.pixel_size,
+                        properties.unc_c.row_align_size,
+                        &mut channel_samples,
+                    )?,
+                    UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
+                        &mut reader,
+                        &component_specs,
+                        tile_region,
+                        properties.unc_c.row_align_size,
+                        &mut channel_samples,
+                    )?,
+                    _ => unreachable!(),
+                }
+                reader.handle_tile_alignment(properties.unc_c.tile_align_size)?;
             }
-            reader.handle_tile_alignment(properties.unc_c.tile_align_size)?;
         }
     }
 
@@ -1777,6 +1809,8 @@ fn decode_uncompressed_component_interleave(
     specs: &[UncompressedComponentDecodeSpec],
     tile_region: UncompressedDecodeTileRegion,
     row_align_size: u32,
+    tile_align_size: u32,
+    per_component_tile_alignment: bool,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
     for spec in specs {
@@ -1804,9 +1838,259 @@ fn decode_uncompressed_component_interleave(
             }
             reader.handle_row_alignment(row_align_size)?;
         }
+        if per_component_tile_alignment {
+            reader.handle_tile_alignment(tile_align_size)?;
+        }
     }
 
     Ok(())
+}
+
+fn decode_uncompressed_tile_component_interleave(
+    payload: &[u8],
+    specs: &[UncompressedComponentDecodeSpec],
+    tile_layout: UncompressedTileDecodeLayout,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    // Provenance: mirrors libheif tile-component handling in
+    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:unc_decoder::fetch_tile_data
+    // and libheif/libheif/codecs/uncompressed/unc_decoder_component_interleave.cc:
+    // {unc_decoder_component_interleave::get_tile_data_sizes,decode_tile}
+    // by re-addressing per-component tile payload segments from the full item
+    // payload into per-tile component streams.
+    let tile_count = tile_layout
+        .tile_rows
+        .checked_mul(tile_layout.tile_cols)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed tile-count overflow for tile grid {}x{}",
+                tile_layout.tile_cols, tile_layout.tile_rows
+            ),
+        })?;
+
+    let mut component_tile_sizes = Vec::with_capacity(specs.len());
+    let mut per_tile_size = 0_usize;
+    for (component_index, spec) in specs.iter().copied().enumerate() {
+        let component_tile_size = uncompressed_component_tile_size_bytes(
+            spec,
+            tile_layout.tile_width,
+            tile_layout.tile_height,
+            tile_layout.row_align_size,
+            tile_layout.tile_align_size,
+        )?;
+        component_tile_sizes.push(component_tile_size);
+        per_tile_size = per_tile_size
+            .checked_add(component_tile_size)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "tile-component payload-size overflow while accumulating component {component_index}"
+                ),
+            })?;
+    }
+
+    let mut component_base_offsets = Vec::with_capacity(specs.len());
+    let mut full_layout_size = 0_usize;
+    for (component_index, component_tile_size) in component_tile_sizes.iter().copied().enumerate() {
+        component_base_offsets.push(full_layout_size);
+        let component_region_size = component_tile_size.checked_mul(tile_count).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "tile-component payload-size overflow for component {component_index} across {tile_count} tiles"
+                ),
+            }
+        })?;
+        full_layout_size = full_layout_size
+            .checked_add(component_region_size)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "tile-component payload-size overflow while accumulating component {component_index} region"
+                ),
+            })?;
+    }
+
+    if full_layout_size > payload.len() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "tile-component payload is truncated: need {full_layout_size} bytes, have {} bytes",
+                payload.len()
+            ),
+        });
+    }
+
+    for tile_row in 0..tile_layout.tile_rows {
+        let tile_origin_y = tile_row
+            .checked_mul(tile_layout.tile_height)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!("uncompressed tile y-origin overflow for tile row {tile_row}"),
+            })?;
+        for tile_column in 0..tile_layout.tile_cols {
+            let tile_origin_x =
+                tile_column
+                    .checked_mul(tile_layout.tile_width)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed tile x-origin overflow for tile column {tile_column}"
+                        ),
+                    })?;
+            let tile_index = tile_row
+                .checked_mul(tile_layout.tile_cols)
+                .and_then(|index| index.checked_add(tile_column))
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed tile index overflow at row={tile_row}, column={tile_column}"
+                    ),
+                })?;
+
+            let mut tile_payload = Vec::with_capacity(per_tile_size);
+            for (component_index, component_tile_size) in
+                component_tile_sizes.iter().copied().enumerate()
+            {
+                let component_tile_offset = component_base_offsets[component_index]
+                    .checked_add(component_tile_size.checked_mul(tile_index).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: format!(
+                                "tile-component offset overflow for component {component_index} tile index {tile_index}"
+                            ),
+                        }
+                    })?)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "tile-component base offset overflow for component {component_index} tile index {tile_index}"
+                        ),
+                    })?;
+                let component_tile_end = component_tile_offset
+                    .checked_add(component_tile_size)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "tile-component range overflow for component {component_index} tile index {tile_index}"
+                        ),
+                    })?;
+                if component_tile_end > payload.len() {
+                    return Err(DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "tile-component payload is truncated for component {component_index} tile index {tile_index}: end offset {component_tile_end} exceeds payload size {}",
+                            payload.len()
+                        ),
+                    });
+                }
+                tile_payload.extend_from_slice(&payload[component_tile_offset..component_tile_end]);
+            }
+
+            let tile_region = UncompressedDecodeTileRegion {
+                image_width: tile_layout.image_width,
+                width: tile_layout.tile_width,
+                height: tile_layout.tile_height,
+                origin_x: tile_origin_x,
+                origin_y: tile_origin_y,
+            };
+            let mut tile_reader = UncompressedBitReader::new(&tile_payload);
+            decode_uncompressed_component_interleave(
+                &mut tile_reader,
+                specs,
+                tile_region,
+                tile_layout.row_align_size,
+                tile_layout.tile_align_size,
+                true,
+                channel_samples,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn uncompressed_component_tile_size_bytes(
+    spec: UncompressedComponentDecodeSpec,
+    tile_width: usize,
+    tile_height: usize,
+    row_align_size: u32,
+    tile_align_size: u32,
+) -> Result<usize, DecodeUncompressedError> {
+    let mut bits_per_component = usize::from(spec.bit_depth);
+    if spec.component_align_size != 0 {
+        let component_alignment = usize::from(spec.component_align_size);
+        let component_bytes = bits_per_component.checked_add(7).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "component bit-size overflow while computing alignment for {}-bit uncompressed samples",
+                    spec.bit_depth
+                ),
+            }
+        })? / 8;
+        let aligned_component_bytes =
+            align_up_uncompressed_bytes(component_bytes, component_alignment, "component")?;
+        bits_per_component = aligned_component_bytes.checked_mul(8).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "component bit-size overflow after alignment expansion".to_string(),
+            }
+        })?;
+    }
+
+    let bits_per_row = bits_per_component
+        .checked_mul(tile_width)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "component row bit-size overflow for tile width {tile_width} and component bit-size {bits_per_component}"
+            ),
+        })?;
+    let mut bytes_per_row =
+        bits_per_row
+            .checked_add(7)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: "component row byte-size overflow".to_string(),
+            })?
+            / 8;
+    if row_align_size != 0 {
+        bytes_per_row = align_up_uncompressed_bytes(
+            bytes_per_row,
+            usize::try_from(row_align_size).map_err(|_| DecodeUncompressedError::InvalidInput {
+                detail: format!("uncC row_align_size {row_align_size} cannot be represented"),
+            })?,
+            "row",
+        )?;
+    }
+
+    let mut bytes_per_tile =
+        bytes_per_row
+            .checked_mul(tile_height)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "component tile byte-size overflow for {bytes_per_row} bytes/row and tile height {tile_height}"
+                ),
+            })?;
+    if tile_align_size != 0 {
+        bytes_per_tile = align_up_uncompressed_bytes(
+            bytes_per_tile,
+            usize::try_from(tile_align_size).map_err(|_| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!("uncC tile_align_size {tile_align_size} cannot be represented"),
+                }
+            })?,
+            "tile",
+        )?;
+    }
+    Ok(bytes_per_tile)
+}
+
+fn align_up_uncompressed_bytes(
+    value: usize,
+    alignment: usize,
+    target: &'static str,
+) -> Result<usize, DecodeUncompressedError> {
+    if alignment == 0 {
+        return Ok(value);
+    }
+    let residual = value % alignment;
+    if residual == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(alignment - residual)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "{target} alignment overflow while aligning {value} bytes to {alignment} bytes"
+            ),
+        })
 }
 
 fn decode_uncompressed_pixel_interleave(
@@ -2960,6 +3244,7 @@ const UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING: u8 = 0;
 const UNCOMPRESSED_INTERLEAVE_COMPONENT: u8 = 0;
 const UNCOMPRESSED_INTERLEAVE_PIXEL: u8 = 1;
 const UNCOMPRESSED_INTERLEAVE_ROW: u8 = 3;
+const UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT: u8 = 4;
 const UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED: u8 = 0;
 const UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME: u16 = 0;
 const UNCOMPRESSED_COMPONENT_TYPE_RED: u16 = 4;

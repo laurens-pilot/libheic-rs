@@ -170,6 +170,79 @@ fn parses_and_decodes_tiled_rgb_non_zero_pixel_size_fixture() {
 }
 
 #[test]
+fn decodes_tile_component_rgb_fixture() {
+    let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_tile_RGB_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("tile-component RGB fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 4,
+        "expected tile-component"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tile-component RGB fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 8);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+}
+
+#[test]
+fn decodes_tile_component_b16r16g16_fixture() {
+    let input =
+        read_fixture("../libheif/fuzzing/data/corpus/uncompressed_tile_B16R16G16_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("tile-component B16R16G16 fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 4,
+        "expected tile-component"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tile-component B16R16G16 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 16);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+}
+
+#[test]
+fn decodes_tile_component_r7_plus_1_fixture() {
+    let input =
+        read_fixture("../libheif/fuzzing/data/corpus/uncompressed_tile_R7+1G7+1B7+1_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("tile-component R7+1 fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 4,
+        "expected tile-component"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+    assert!(
+        properties
+            .unc_c
+            .components
+            .iter()
+            .all(|component| component.component_align_size == 1),
+        "fixture should keep one-byte component alignment"
+    );
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tile-component R7+1 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 7);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+}
+
+#[test]
 fn decodes_tiled_r5g6b5_component_fixture_without_mixed_depth_double_scaling() {
     let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_comp_R5G6B5_tiled.heic");
     let decoded = decode_primary_uncompressed_to_image(&input)
