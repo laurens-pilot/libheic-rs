@@ -3632,8 +3632,9 @@ fn decode_primary_heic_grid_to_image(
     for tile in &grid_data.tiles {
         let stream = assemble_heic_hevc_stream_from_components(&tile.hvcc, &tile.payload)?;
         let metadata = decode_hevc_stream_metadata_from_sps(&stream)?;
-        let decoded = decode_hevc_stream_to_image(&stream)?;
+        let mut decoded = decode_hevc_stream_to_image(&stream)?;
         validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+        decoded = apply_heic_grid_tile_transforms(decoded, &tile.transforms)?;
         decoded_tiles.push(decoded);
     }
 
@@ -3873,6 +3874,174 @@ fn stitch_decoded_heic_grid_tiles(
     }
 
     Ok(output)
+}
+
+fn apply_heic_grid_tile_transforms(
+    mut decoded: DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    // Provenance: mirrors libheif grid tile decode behavior where each tile
+    // item is decoded with its own item transforms before pasting into the
+    // grid canvas (libheif/libheif/image-items/grid.cc:
+    // ImageItem_Grid::decode_and_paste_tile_image, which calls tile image-item
+    // decode flow applying clap/irot/imir transforms).
+    for transform in transforms {
+        if let isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) = transform {
+            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+        }
+    }
+    Ok(decoded)
+}
+
+fn crop_heic_by_clean_aperture(
+    decoded: DecodedHeicImage,
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    if decoded.width == 0 || decoded.height == 0 {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile clean-aperture input geometry must be non-zero, got {}x{}",
+                decoded.width, decoded.height
+            ),
+        });
+    }
+
+    let mut left = clap_left_rounded(clean_aperture, decoded.width);
+    let mut right = clap_right_rounded(clean_aperture, decoded.width);
+    let mut top = clap_top_rounded(clean_aperture, decoded.height);
+    let mut bottom = clap_bottom_rounded(clean_aperture, decoded.height);
+
+    left = left.max(0);
+    top = top.max(0);
+    let max_x = i128::from(decoded.width) - 1;
+    let max_y = i128::from(decoded.height) - 1;
+    right = right.min(max_x);
+    bottom = bottom.min(max_y);
+
+    if left > right || top > bottom {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile clean-aperture crop is empty after clamp (left={left}, right={right}, top={top}, bottom={bottom}, tile={}x{})",
+                decoded.width, decoded.height
+            ),
+        });
+    }
+
+    let crop_width =
+        u32::try_from(right - left + 1).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile clean-aperture width is out of range: {}",
+                right - left + 1
+            ),
+        })?;
+    let crop_height =
+        u32::try_from(bottom - top + 1).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile clean-aperture height is out of range: {}",
+                bottom - top + 1
+            ),
+        })?;
+    let crop_left = u32::try_from(left).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!("grid tile clean-aperture left bound is out of range: {left}"),
+    })?;
+    let crop_top = u32::try_from(top).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+        detail: format!("grid tile clean-aperture top bound is out of range: {top}"),
+    })?;
+
+    validate_heic_plane_dimensions(
+        &decoded.y_plane,
+        decoded.width,
+        decoded.height,
+        "grid tile Y",
+    )?;
+    let y_stride = usize::try_from(decoded.y_plane.width).map_err(|_| {
+        DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile Y width {} cannot be represented for clap crop",
+                decoded.y_plane.width
+            ),
+        }
+    })?;
+    let y_plane = extract_cropped_heic_plane(
+        &decoded.y_plane.samples,
+        y_stride,
+        crop_left,
+        crop_top,
+        crop_width,
+        crop_height,
+        "grid tile Y",
+    )?;
+
+    if decoded.layout == HeicPixelLayout::Yuv400 {
+        return Ok(DecodedHeicImage {
+            width: crop_width,
+            height: crop_height,
+            y_plane,
+            ..decoded
+        });
+    }
+
+    let (u_plane, v_plane, expected_chroma_width, expected_chroma_height) =
+        require_heic_chroma_planes(&decoded)?;
+    validate_heic_plane_dimensions(
+        u_plane,
+        expected_chroma_width,
+        expected_chroma_height,
+        "grid tile U",
+    )?;
+    validate_heic_plane_dimensions(
+        v_plane,
+        expected_chroma_width,
+        expected_chroma_height,
+        "grid tile V",
+    )?;
+
+    let (subsample_x, subsample_y) = heic_chroma_subsampling(decoded.layout);
+    let chroma_crop_left = crop_left / subsample_x;
+    let chroma_crop_top = crop_top / subsample_y;
+    let chroma_crop_width = crop_width.div_ceil(subsample_x);
+    let chroma_crop_height = crop_height.div_ceil(subsample_y);
+    let u_stride =
+        usize::try_from(u_plane.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile U width {} cannot be represented for clap crop",
+                u_plane.width
+            ),
+        })?;
+    let v_stride =
+        usize::try_from(v_plane.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "grid tile V width {} cannot be represented for clap crop",
+                v_plane.width
+            ),
+        })?;
+    let cropped_u = extract_cropped_heic_plane(
+        &u_plane.samples,
+        u_stride,
+        chroma_crop_left,
+        chroma_crop_top,
+        chroma_crop_width,
+        chroma_crop_height,
+        "grid tile U",
+    )?;
+    let cropped_v = extract_cropped_heic_plane(
+        &v_plane.samples,
+        v_stride,
+        chroma_crop_left,
+        chroma_crop_top,
+        chroma_crop_width,
+        chroma_crop_height,
+        "grid tile V",
+    )?;
+
+    Ok(DecodedHeicImage {
+        width: crop_width,
+        height: crop_height,
+        y_plane,
+        u_plane: Some(cropped_u),
+        v_plane: Some(cropped_v),
+        ..decoded
+    })
 }
 
 fn paste_heic_plane_with_clip(
