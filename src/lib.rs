@@ -369,6 +369,15 @@ pub struct AvifPlane {
     pub samples: AvifPlaneSamples,
 }
 
+/// Decoded AVIF auxiliary alpha samples.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvifAuxiliaryAlphaPlane {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub samples: AvifPlaneSamples,
+}
+
 /// Decoded AVIF image in planar YUV form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedAvifImage {
@@ -381,6 +390,7 @@ pub struct DecodedAvifImage {
     pub y_plane: AvifPlane,
     pub u_plane: Option<AvifPlane>,
     pub v_plane: Option<AvifPlane>,
+    pub alpha_plane: Option<AvifAuxiliaryAlphaPlane>,
 }
 
 /// Decoded HEIC chroma layout.
@@ -1026,6 +1036,9 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
             });
         }
     }
+
+    decoded.alpha_plane =
+        decode_primary_avif_auxiliary_alpha_plane(input, decoded.width, decoded.height);
 
     Ok(decoded)
 }
@@ -4569,10 +4582,12 @@ const GENERIC_COMPRESSED_UNIT_IMAGE_ROW: u8 = 3;
 const GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL: u8 = 4;
 const ICEF_OFFSET_BITS_TABLE: [u8; 5] = [0, 16, 24, 32, 64];
 const ICEF_SIZE_BITS_TABLE: [u8; 5] = [8, 16, 24, 32, 64];
+const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
 const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
 const AUXC_PROPERTY_TYPE: [u8; 4] = *b"auxC";
+const AV1C_PROPERTY_TYPE: [u8; 4] = *b"av1C";
 const HVCC_PROPERTY_TYPE: [u8; 4] = *b"hvcC";
 const UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING: u8 = 0;
 const UNCOMPRESSED_SAMPLING_422: u8 = 1;
@@ -4607,6 +4622,108 @@ const ALPHA_AUX_TYPES: [&[u8]; 3] = [
     b"urn:mpeg:hevc:2015:auxid:1",
     b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
 ];
+
+fn decode_primary_avif_auxiliary_alpha_plane(
+    input: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Option<AvifAuxiliaryAlphaPlane> {
+    // Provenance: mirrors libheif auxiliary alpha linkage in
+    // libheif/libheif/context.cc (`auxl` reference direction and aux-type
+    // filtering) and ImageItem alpha composition flow in
+    // libheif/libheif/image-items/image_item.cc (`decode_image`).
+    let top_level = isobmff::parse_boxes(input).ok()?;
+    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
+    let meta = meta_box.parse_meta().ok()?;
+    let resolved = meta.resolve_primary_item().ok()?;
+    let iref = resolved.iref.as_ref()?;
+    let primary_item_id = resolved.primary_item.item_id;
+
+    for reference in &iref.references {
+        if reference.reference_type.as_bytes() != AUXL_REFERENCE_TYPE {
+            continue;
+        }
+        if !reference.to_item_ids.contains(&primary_item_id) {
+            continue;
+        }
+
+        let Some(alpha_plane) = decode_auxiliary_alpha_avif_item_candidate(
+            input,
+            &meta,
+            &resolved,
+            reference.from_item_id,
+        ) else {
+            continue;
+        };
+        if alpha_plane.width != expected_width || alpha_plane.height != expected_height {
+            continue;
+        }
+        return Some(alpha_plane);
+    }
+
+    None
+}
+
+fn decode_auxiliary_alpha_avif_item_candidate<'a>(
+    input: &[u8],
+    meta: &isobmff::MetaBox<'a>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    item_id: u32,
+) -> Option<AvifAuxiliaryAlphaPlane> {
+    let item_info = resolved
+        .iinf
+        .entries
+        .iter()
+        .find(|entry| entry.item_id == item_id)?;
+    let item_type = item_info.item_type?;
+    if item_type.as_bytes() != AV01_ITEM_TYPE {
+        return None;
+    }
+
+    let location = resolved
+        .iloc
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)?;
+    if location.data_reference_index != 0 {
+        return None;
+    }
+
+    let properties = resolved_item_properties_for_item(resolved, item_id)?;
+    if !properties
+        .iter()
+        .any(property_is_alpha_auxiliary_type_property)
+    {
+        return None;
+    }
+
+    let av1c = properties
+        .iter()
+        .find(|property| property.header.box_type.as_bytes() == AV1C_PROPERTY_TYPE)?
+        .parse_av1c()
+        .ok()?;
+    let payload = extract_heic_item_payload(input, meta, location)?;
+    let mut elementary_stream = av1c.config_obus;
+    elementary_stream.extend_from_slice(&payload);
+
+    let decoded = decode_av1_bitstream_to_image(&elementary_stream).ok()?;
+    let expected_alpha_samples = sample_count(decoded.width, decoded.height, "alpha").ok()?;
+    let alpha_samples = decoded.y_plane.samples;
+    let actual_alpha_samples = match &alpha_samples {
+        AvifPlaneSamples::U8(samples) => samples.len(),
+        AvifPlaneSamples::U16(samples) => samples.len(),
+    };
+    if actual_alpha_samples != expected_alpha_samples {
+        return None;
+    }
+
+    Some(AvifAuxiliaryAlphaPlane {
+        width: decoded.width,
+        height: decoded.height,
+        bit_depth: decoded.bit_depth,
+        samples: alpha_samples,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HeicAuxiliaryAlphaPlane {
@@ -6077,6 +6194,7 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_chroma_u8(decoded)?;
+    let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
     let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
 
     for y in 0..height {
@@ -6125,7 +6243,11 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
             out.push(scale_sample_to_u8(r, decoded.bit_depth));
             out.push(scale_sample_to_u8(g, decoded.bit_depth));
             out.push(scale_sample_to_u8(b, decoded.bit_depth));
-            out.push(u8::MAX);
+            let alpha_sample = alpha
+                .as_ref()
+                .map(|plane| avif_auxiliary_alpha_sample_to_u8(plane, y_index))
+                .unwrap_or(u8::MAX);
+            out.push(alpha_sample);
         }
     }
 
@@ -6173,6 +6295,7 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
     let mut out = Vec::with_capacity(output_len);
 
     let chroma = prepare_chroma_u16(decoded)?;
+    let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
     let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
 
     for y in 0..height {
@@ -6221,7 +6344,11 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
             out.push(scale_sample_to_u16(r, decoded.bit_depth));
             out.push(scale_sample_to_u16(g, decoded.bit_depth));
             out.push(scale_sample_to_u16(b, decoded.bit_depth));
-            out.push(u16::MAX);
+            let alpha_sample = alpha
+                .as_ref()
+                .map(|plane| avif_auxiliary_alpha_sample_to_u16(plane, y_index))
+                .unwrap_or(u16::MAX);
+            out.push(alpha_sample);
         }
     }
 
@@ -6416,6 +6543,90 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
     }
 
     Ok(out)
+}
+
+enum AvifAuxiliaryAlphaSamples<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+struct AvifAuxiliaryAlpha<'a> {
+    bit_depth: u8,
+    samples: AvifAuxiliaryAlphaSamples<'a>,
+}
+
+fn prepare_avif_auxiliary_alpha(
+    decoded: &DecodedAvifImage,
+    expected_samples: usize,
+) -> Result<Option<AvifAuxiliaryAlpha<'_>>, DecodeAvifError> {
+    let Some(alpha_plane) = decoded.alpha_plane.as_ref() else {
+        return Ok(None);
+    };
+
+    if alpha_plane.width != decoded.width || alpha_plane.height != decoded.height {
+        return Err(DecodeAvifError::PlaneDimensionsMismatch {
+            plane: "A",
+            expected_width: decoded.width,
+            expected_height: decoded.height,
+            actual_width: alpha_plane.width,
+            actual_height: alpha_plane.height,
+        });
+    }
+    if alpha_plane.bit_depth == 0 || alpha_plane.bit_depth > 16 {
+        return Err(DecodeAvifError::UnsupportedBitDepth {
+            bit_depth: i32::from(alpha_plane.bit_depth),
+        });
+    }
+
+    let samples = match &alpha_plane.samples {
+        AvifPlaneSamples::U8(samples) => {
+            if samples.len() != expected_samples {
+                return Err(DecodeAvifError::PlaneSampleCountMismatch {
+                    plane: "A",
+                    expected: expected_samples,
+                    actual: samples.len(),
+                });
+            }
+            AvifAuxiliaryAlphaSamples::U8(samples)
+        }
+        AvifPlaneSamples::U16(samples) => {
+            if samples.len() != expected_samples {
+                return Err(DecodeAvifError::PlaneSampleCountMismatch {
+                    plane: "A",
+                    expected: expected_samples,
+                    actual: samples.len(),
+                });
+            }
+            AvifAuxiliaryAlphaSamples::U16(samples)
+        }
+    };
+
+    Ok(Some(AvifAuxiliaryAlpha {
+        bit_depth: alpha_plane.bit_depth,
+        samples,
+    }))
+}
+
+fn avif_auxiliary_alpha_sample_to_u8(alpha: &AvifAuxiliaryAlpha<'_>, index: usize) -> u8 {
+    match alpha.samples {
+        AvifAuxiliaryAlphaSamples::U8(samples) => {
+            scale_sample_to_u8(u16::from(samples[index]), alpha.bit_depth)
+        }
+        AvifAuxiliaryAlphaSamples::U16(samples) => {
+            scale_sample_to_u8(samples[index], alpha.bit_depth)
+        }
+    }
+}
+
+fn avif_auxiliary_alpha_sample_to_u16(alpha: &AvifAuxiliaryAlpha<'_>, index: usize) -> u16 {
+    match alpha.samples {
+        AvifAuxiliaryAlphaSamples::U8(samples) => {
+            scale_sample_to_u16(u16::from(samples[index]), alpha.bit_depth)
+        }
+        AvifAuxiliaryAlphaSamples::U16(samples) => {
+            scale_sample_to_u16(samples[index], alpha.bit_depth)
+        }
+    }
 }
 
 enum HeicChromaPlanes<'a> {
@@ -7129,6 +7340,7 @@ fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage,
         y_plane,
         u_plane,
         v_plane,
+        alpha_plane: None,
     })
 }
 
@@ -7264,21 +7476,22 @@ fn copy_plane_samples(
 mod tests {
     use super::{
         append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
-        assemble_primary_heic_hevc_stream, convert_avif_to_rgba8, convert_heic_to_rgba8,
-        decode_file_to_png, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
-        decode_primary_avif_to_image, decode_primary_heic_to_image,
+        assemble_primary_heic_hevc_stream, convert_avif_to_rgba16, convert_avif_to_rgba8,
+        convert_heic_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
+        decode_hevc_stream_to_image, decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image,
         decode_uncompressed_multi_y_interleave, parse_length_prefixed_hevc_nal_units,
         stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
-        write_rgba8_png, AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError,
-        DecodeError, DecodeErrorCategory, DecodeHeicError, DecodeUncompressedError,
-        DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane,
-        HevcNalClass, TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
-        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
-        YCbCrRange, CMPC_PROPERTY_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
-        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
-        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
-        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
+        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
+        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
+        HeicPixelLayout, HeicPlane, HevcNalClass, TransformGuardError, UncompressedBitReader,
+        UncompressedChannelRole, UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion,
+        YCbCrMatrixCoefficients, YCbCrRange, CMPC_PROPERTY_TYPE,
+        GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL, GENERIC_COMPRESSED_UNIT_IMAGE_ROW,
+        ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE, ICEF_SIZE_BITS_TABLE, META_BOX_TYPE,
+        UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
+        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -8156,10 +8369,105 @@ mod tests {
             },
             u_plane: None,
             v_plane: None,
+            alpha_plane: None,
         };
 
         let rgba = convert_avif_to_rgba8(&image).expect("YUV400 should convert to RGBA8");
         assert_eq!(rgba, vec![32, 32, 32, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn converts_avif_auxiliary_alpha_to_rgba8() {
+        let image = DecodedAvifImage {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
+            y_plane: AvifPlane {
+                width: 2,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![32, 200]),
+            },
+            u_plane: None,
+            v_plane: None,
+            alpha_plane: Some(AvifAuxiliaryAlphaPlane {
+                width: 2,
+                height: 1,
+                bit_depth: 8,
+                samples: AvifPlaneSamples::U8(vec![0, 128]),
+            }),
+        };
+
+        let rgba = convert_avif_to_rgba8(&image).expect("auxiliary alpha should map into RGBA8");
+        assert_eq!(rgba, vec![32, 32, 32, 0, 200, 200, 200, 128]);
+    }
+
+    #[test]
+    fn converts_avif_auxiliary_alpha_to_rgba16() {
+        let image = DecodedAvifImage {
+            width: 2,
+            height: 1,
+            bit_depth: 10,
+            layout: AvifPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
+            y_plane: AvifPlane {
+                width: 2,
+                height: 1,
+                samples: AvifPlaneSamples::U16(vec![0, 1023]),
+            },
+            u_plane: None,
+            v_plane: None,
+            alpha_plane: Some(AvifAuxiliaryAlphaPlane {
+                width: 2,
+                height: 1,
+                bit_depth: 8,
+                samples: AvifPlaneSamples::U8(vec![0, 255]),
+            }),
+        };
+
+        let rgba = convert_avif_to_rgba16(&image).expect("auxiliary alpha should map into RGBA16");
+        assert_eq!(rgba, vec![0, 0, 0, 0, 65535, 65535, 65535, 65535]);
+    }
+
+    #[test]
+    fn rejects_avif_auxiliary_alpha_with_mismatched_dimensions() {
+        let image = DecodedAvifImage {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            layout: AvifPixelLayout::Yuv400,
+            ycbcr_range: YCbCrRange::Full,
+            ycbcr_matrix: YCbCrMatrixCoefficients::default(),
+            y_plane: AvifPlane {
+                width: 2,
+                height: 1,
+                samples: AvifPlaneSamples::U8(vec![64, 128]),
+            },
+            u_plane: None,
+            v_plane: None,
+            alpha_plane: Some(AvifAuxiliaryAlphaPlane {
+                width: 1,
+                height: 1,
+                bit_depth: 8,
+                samples: AvifPlaneSamples::U8(vec![255]),
+            }),
+        };
+
+        let err = convert_avif_to_rgba8(&image)
+            .expect_err("auxiliary alpha dimensions should match primary image");
+        assert!(matches!(
+            err,
+            DecodeAvifError::PlaneDimensionsMismatch {
+                plane: "A",
+                expected_width: 2,
+                expected_height: 1,
+                actual_width: 1,
+                actual_height: 1,
+            }
+        ));
     }
 
     #[test]
@@ -8178,6 +8486,7 @@ mod tests {
             },
             u_plane: None,
             v_plane: None,
+            alpha_plane: None,
         };
 
         let rgba = convert_avif_to_rgba8(&image)
@@ -8236,6 +8545,7 @@ mod tests {
                 height: 1,
                 samples: AvifPlaneSamples::U8(vec![40]),
             }),
+            alpha_plane: None,
         };
 
         let rgba = convert_avif_to_rgba8(&image).expect("matrix=0 should map channels as GBR->RGB");
@@ -8269,6 +8579,7 @@ mod tests {
                 height: 1,
                 samples: AvifPlaneSamples::U8(vec![128]),
             }),
+            alpha_plane: None,
         };
 
         let err = convert_avif_to_rgba8(&image)
