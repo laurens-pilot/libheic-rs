@@ -8781,6 +8781,64 @@ mod tests {
     }
 
     #[test]
+    fn decode_read_guardrail_rejects_inputs_larger_than_max_input_bytes() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let input_bytes =
+            u64::try_from(input.len()).expect("input byte length should fit in u64 on this host");
+        assert!(input_bytes > 0);
+
+        let err = decode_read_to_rgba_with_guardrails(
+            Cursor::new(input),
+            DecodeGuardrails {
+                max_input_bytes: Some(input_bytes - 1),
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: None,
+            },
+        )
+        .expect_err("Read decode should fail when max_input_bytes is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes
+            }) if actual_bytes == input_bytes && max_input_bytes == input_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn decode_bufread_guardrail_rejects_inputs_larger_than_max_input_bytes() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let input_bytes =
+            u64::try_from(input.len()).expect("input byte length should fit in u64 on this host");
+        assert!(input_bytes > 0);
+
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(input)),
+            DecodeGuardrails {
+                max_input_bytes: Some(input_bytes - 1),
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: None,
+            },
+        )
+        .expect_err("BufRead decode should fail when max_input_bytes is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes
+            }) if actual_bytes == input_bytes && max_input_bytes == input_bytes - 1
+        ));
+    }
+
+    #[test]
     fn decode_read_guardrail_rejects_inputs_that_exceed_max_temp_spool_bytes() {
         let err = decode_read_to_rgba_with_guardrails(
             Cursor::new(vec![0xB6_u8; 17]),
@@ -8906,6 +8964,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn decode_bufread_guardrail_reports_temp_spool_directory_create_failures() {
+        let spool_directory =
+            test_output_png_path("guardrail-spool-dir-create-bufread").with_extension("dir");
+        std::fs::write(&spool_directory, b"not-a-directory")
+            .expect("fixture file should be writable for create-dir failure");
+        let _guard = TempFileGuard(spool_directory.clone());
+
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(vec![0x89_u8; 8])),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err(
+            "non-seek BufRead decode should report configured temp_spool_directory create errors",
+        );
+
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolDirectoryCreateFailed {
+                directory,
+                io_error_kind,
+            }) if directory == spool_directory && io_error_kind == std::io::ErrorKind::AlreadyExists
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn decode_read_guardrail_reports_temp_spool_directory_open_failures() {
@@ -8951,6 +9040,53 @@ mod tests {
             .expect("spool directory fixture should be removable after open failure test");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn decode_bufread_guardrail_reports_temp_spool_directory_open_failures() {
+        let spool_directory =
+            test_output_png_path("guardrail-spool-dir-open-bufread").with_extension("dir");
+        std::fs::create_dir_all(&spool_directory)
+            .expect("spool directory fixture should be created");
+
+        let mut read_only = std::fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(&spool_directory, read_only)
+            .expect("spool directory should be set to read-only");
+
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(vec![0x73_u8; 8])),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err(
+            "non-seek BufRead decode should report configured temp_spool_directory open errors",
+        );
+
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolDirectoryOpenFailed {
+                directory,
+                io_error_kind,
+            }) if directory == spool_directory && io_error_kind == std::io::ErrorKind::PermissionDenied
+        ));
+
+        let mut writable = std::fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        writable.set_mode(0o700);
+        std::fs::set_permissions(&spool_directory, writable)
+            .expect("spool directory permissions should be restorable for cleanup");
+        std::fs::remove_dir_all(&spool_directory)
+            .expect("spool directory fixture should be removable after open failure test");
+    }
+
     #[test]
     fn decode_bytes_guardrail_rejects_avif_images_larger_than_max_pixels() {
         let fixture =
@@ -8967,6 +9103,66 @@ mod tests {
             },
         )
         .expect_err("bytes decode should fail when max_pixels is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            }) if max_pixels == 1
+                && actual_pixels == u64::from(width) * u64::from(height)
+                && actual_pixels > max_pixels
+        ));
+    }
+
+    #[test]
+    fn decode_read_guardrail_rejects_avif_images_larger_than_max_pixels() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+
+        let err = decode_read_to_rgba_with_guardrails(
+            Cursor::new(input),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+                temp_spool_directory: None,
+            },
+        )
+        .expect_err("Read decode should fail when max_pixels is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded {
+                width,
+                height,
+                actual_pixels,
+                max_pixels,
+            }) if max_pixels == 1
+                && actual_pixels == u64::from(width) * u64::from(height)
+                && actual_pixels > max_pixels
+        ));
+    }
+
+    #[test]
+    fn decode_bufread_guardrail_rejects_avif_images_larger_than_max_pixels() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(input)),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+                temp_spool_directory: None,
+            },
+        )
+        .expect_err("BufRead decode should fail when max_pixels is too small");
         assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
         assert!(matches!(
             err,
