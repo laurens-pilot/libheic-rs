@@ -1672,17 +1672,7 @@ pub fn decode_primary_uncompressed_to_image(
         }
     }
 
-    let mut output_bit_depth = 0_u8;
-    for (is_present, bit_depth) in has_channel.iter().zip(channel_bit_depths) {
-        if *is_present {
-            output_bit_depth = output_bit_depth.max(bit_depth);
-        }
-    }
-    if output_bit_depth == 0 {
-        return Err(DecodeUncompressedError::InvalidInput {
-            detail: "uncompressed primary item has zero output bit depth".to_string(),
-        });
-    }
+    let output_bit_depth = select_uncompressed_output_bit_depth(&has_channel, &channel_bit_depths)?;
     let alpha_default = max_sample_for_bit_depth(output_bit_depth)?;
 
     let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4).ok_or_else(|| {
@@ -1971,6 +1961,50 @@ fn uncompressed_role_from_component_type(
     }
 }
 
+fn select_uncompressed_output_bit_depth(
+    has_channel: &[bool; UNCOMPRESSED_CHANNEL_COUNT],
+    channel_bit_depths: &[u8; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<u8, DecodeUncompressedError> {
+    let mut min_bit_depth = u8::MAX;
+    let mut max_bit_depth = 0_u8;
+    let mut has_any_channel = false;
+
+    for (is_present, bit_depth) in has_channel.iter().zip(channel_bit_depths.iter().copied()) {
+        if !*is_present {
+            continue;
+        }
+        if bit_depth == 0 || bit_depth > 16 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!("invalid uncompressed channel bit depth {bit_depth}"),
+            });
+        }
+        has_any_channel = true;
+        min_bit_depth = min_bit_depth.min(bit_depth);
+        max_bit_depth = max_bit_depth.max(bit_depth);
+    }
+
+    if !has_any_channel {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: "uncompressed primary item has zero output bit depth".to_string(),
+        });
+    }
+
+    if min_bit_depth == max_bit_depth {
+        return Ok(max_bit_depth);
+    }
+
+    // Provenance: mirrors libheif output conversion behavior for mixed RGB
+    // channel bit depths via heifio/encoder_png.h:PngEncoder::chroma (8-bit
+    // interleaved output for <=8-bit content, 16-bit for >8-bit) and
+    // libheif/libheif/color-conversion/hdr_sdr.cc:Op_to_sdr_planes::convert_colorspace
+    // (channel-wise normalization before interleaving).
+    if max_bit_depth <= 8 {
+        Ok(8)
+    } else {
+        Ok(16)
+    }
+}
+
 fn max_sample_for_bit_depth(bit_depth: u8) -> Result<u16, DecodeUncompressedError> {
     if bit_depth == 0 || bit_depth > 16 {
         return Err(DecodeUncompressedError::InvalidInput {
@@ -2008,6 +2042,36 @@ fn scale_uncompressed_sample_bit_depth(
     }
 
     let source_max = (1_u32 << source_bit_depth) - 1;
+    let sample_u32 = u32::from(sample);
+    if sample_u32 > source_max {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "{channel_name} sample {sample} exceeds source bit depth {source_bit_depth}"
+            ),
+        });
+    }
+    if source_bit_depth < target_bit_depth {
+        // Provenance: mirrors libheif/libheif/color-conversion/hdr_sdr.cc:
+        // Op_to_sdr_planes::convert_colorspace bit-pattern expansion for
+        // source bit depths below the output bit depth.
+        let source_bits = u32::from(source_bit_depth);
+        let target_bits = u32::from(target_bit_depth);
+        let mut expanded = sample_u32;
+        let mut produced_bits = source_bits;
+        while produced_bits < target_bits {
+            expanded = (expanded << source_bits) | sample_u32;
+            produced_bits += source_bits;
+        }
+        if produced_bits > target_bits {
+            expanded >>= produced_bits - target_bits;
+        }
+        return u16::try_from(expanded).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "scaled {channel_name} sample overflow while expanding {source_bit_depth}-bit to {target_bit_depth}-bit"
+            ),
+        });
+    }
+
     let target_max = (1_u32 << target_bit_depth) - 1;
     let scaled = (u32::from(sample)
         .saturating_mul(target_max)

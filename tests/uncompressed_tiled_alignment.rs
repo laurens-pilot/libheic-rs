@@ -169,8 +169,53 @@ fn parses_and_decodes_tiled_rgb_non_zero_pixel_size_fixture() {
     );
 }
 
+#[test]
+fn decodes_tiled_r5g6b5_component_fixture_without_mixed_depth_double_scaling() {
+    let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_comp_R5G6B5_tiled.heic");
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tiled component-interleave R5G6B5 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(
+        decoded.bit_depth, 8,
+        "mixed 5/6/5 channels should normalize directly to 8-bit output"
+    );
+
+    let pixel = rgba_pixel_at(&decoded.rgba, decoded.width, 28, 0);
+    assert_eq!(pixel, [123, 125, 123, 255]);
+    let high_pixel = rgba_pixel_at(&decoded.rgba, decoded.width, 28, 8);
+    assert_eq!(high_pixel, [231, 130, 231, 255]);
+}
+
+#[test]
+fn decodes_tiled_r5g6b5_pixel_fixture_without_mixed_depth_double_scaling() {
+    let input = read_fixture("../libheif/tests/data/uncompressed_pix_R5G6B5_tiled.heif");
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tiled pixel-interleave R5G6B5 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(
+        decoded.bit_depth, 8,
+        "mixed 5/6/5 channels should normalize directly to 8-bit output"
+    );
+
+    let pixel = rgba_pixel_at(&decoded.rgba, decoded.width, 28, 0);
+    assert_eq!(pixel, [123, 125, 123, 255]);
+    let high_pixel = rgba_pixel_at(&decoded.rgba, decoded.width, 28, 8);
+    assert_eq!(high_pixel, [231, 130, 231, 255]);
+}
+
 fn read_fixture(relative: &str) -> Vec<u8> {
     std::fs::read(fixture_path(relative)).expect("fixture must be readable")
+}
+
+fn rgba_pixel_at(rgba: &[u16], width: u32, x: usize, y: usize) -> [u16; 4] {
+    let width = width as usize;
+    let offset = (y * width + x) * 4;
+    [
+        rgba[offset],
+        rgba[offset + 1],
+        rgba[offset + 2],
+        rgba[offset + 3],
+    ]
 }
 
 fn fixture_path(relative: &str) -> PathBuf {
