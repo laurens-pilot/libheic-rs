@@ -8661,25 +8661,39 @@ mod tests {
 
     #[test]
     fn decode_rgba_entry_points_match_for_example_avif() {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
-        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        assert_decode_rgba_entry_points_match_for_fixture("../libheif/examples/example.avif");
+    }
 
-        let expected = decode_bytes_to_rgba(&input).expect("bytes entry point should decode AVIF");
+    #[test]
+    fn decode_rgba_entry_points_match_for_example_heic() {
+        assert_decode_rgba_entry_points_match_for_fixture("../libheif/examples/example.heic");
+    }
 
-        let via_path = decode_path_to_rgba(&fixture).expect("path entry point should decode AVIF");
+    #[test]
+    fn decode_rgba_entry_points_match_for_uncompressed_heif() {
+        assert_decode_rgba_entry_points_match_for_fixture(
+            "../libheif/tests/data/uncompressed_pix_ABGR.heif",
+        );
+    }
+
+    fn assert_decode_rgba_entry_points_match_for_fixture(relative_fixture_path: &str) {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_fixture_path);
+        let input = std::fs::read(&fixture).expect("fixture must be readable");
+
+        let expected = decode_bytes_to_rgba(&input).expect("bytes entry point should decode");
+
+        let via_path = decode_path_to_rgba(&fixture).expect("path entry point should decode");
         assert_eq!(via_path, expected);
 
         let via_file_alias =
-            decode_file_to_rgba(&fixture).expect("decode_file_to_rgba alias should decode AVIF");
+            decode_file_to_rgba(&fixture).expect("decode_file_to_rgba alias should decode");
         assert_eq!(via_file_alias, expected);
 
-        let via_read = decode_read_to_rgba(Cursor::new(input.clone()))
-            .expect("Read entry point should decode AVIF");
+        let via_read = decode_read_to_rgba(Cursor::new(input.clone())).expect("Read should decode");
         assert_eq!(via_read, expected);
 
         let via_bufread = decode_bufread_to_rgba(BufReader::new(Cursor::new(input)))
-            .expect("BufRead entry point should decode AVIF");
+            .expect("BufRead should decode");
         assert_eq!(via_bufread, expected);
     }
 
