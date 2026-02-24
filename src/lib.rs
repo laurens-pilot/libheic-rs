@@ -8478,27 +8478,27 @@ mod tests {
     use super::{
         append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
         assemble_primary_heic_hevc_stream, convert_avif_to_rgba16, convert_avif_to_rgba8,
-        convert_heic_to_rgba8, decode_bufread_to_png, decode_bufread_to_rgba, decode_bytes_to_png,
-        decode_bytes_to_rgba, decode_bytes_to_rgba_with_guardrails, decode_file_to_png,
-        decode_file_to_rgba, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
-        decode_path_to_png, decode_path_to_rgba, decode_path_to_rgba_with_guardrails,
-        decode_primary_avif_to_image, decode_primary_heic_to_image,
-        decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
-        decode_read_to_rgba, decode_read_to_rgba_with_guardrails,
-        decode_source_to_rgba_with_hint_and_guardrails, decode_uncompressed_multi_y_interleave,
-        detect_input_family_from_source, parse_length_prefixed_hevc_nal_units,
-        read_selected_top_level_boxes_from_source, stitch_decoded_heic_grid_tiles,
-        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
-        AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
-        DecodeErrorCategory, DecodeGuardrailError, DecodeGuardrails, DecodeHeicError,
-        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
-        HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass, TransformGuardError,
-        UncompressedBitReader, UncompressedChannelRole, UncompressedComponentDecodeSpec,
-        UncompressedDecodeTileRegion, YCbCrMatrixCoefficients, YCbCrRange, CMPC_PROPERTY_TYPE,
-        FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL, GENERIC_COMPRESSED_UNIT_IMAGE_ROW,
-        ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE, ICEF_SIZE_BITS_TABLE, META_BOX_TYPE,
-        UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
-        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        convert_heic_to_rgba8, decode_bufread_to_png, decode_bufread_to_rgba,
+        decode_bufread_to_rgba_with_guardrails, decode_bytes_to_png, decode_bytes_to_rgba,
+        decode_bytes_to_rgba_with_guardrails, decode_file_to_png, decode_file_to_rgba,
+        decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image, decode_path_to_png,
+        decode_path_to_rgba, decode_path_to_rgba_with_guardrails, decode_primary_avif_to_image,
+        decode_primary_heic_to_image, decode_primary_heic_to_metadata,
+        decode_primary_uncompressed_to_image, decode_read_to_png, decode_read_to_rgba,
+        decode_read_to_rgba_with_guardrails, decode_source_to_rgba_with_hint_and_guardrails,
+        decode_uncompressed_multi_y_interleave, detect_input_family_from_source,
+        parse_length_prefixed_hevc_nal_units, read_selected_top_level_boxes_from_source,
+        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
+        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
+        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeGuardrailError, DecodeGuardrails,
+        DecodeHeicError, DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage,
+        DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass,
+        TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
+        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
+        YCbCrRange, CMPC_PROPERTY_TYPE, FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
+        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
+        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
+        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::{BufReader, Cursor};
@@ -8786,6 +8786,59 @@ mod tests {
                 max_temp_spool_bytes
             }) if attempted_bytes == 17 && max_temp_spool_bytes == 16
         ));
+    }
+
+    #[test]
+    fn decode_read_cleans_up_temp_spool_files_after_successful_decode() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let spool_directory =
+            test_output_png_path("guardrail-spool-cleanup-success").with_extension("dir");
+        let _guard = TempPathGuard(spool_directory.clone());
+
+        let decoded = decode_read_to_rgba_with_guardrails(
+            Cursor::new(input),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect("read decode should succeed with configured temp spool directory");
+
+        assert!(decoded.width > 0 && decoded.height > 0);
+        assert_directory_empty(&spool_directory);
+    }
+
+    #[test]
+    fn decode_bufread_cleans_up_temp_spool_files_after_guardrail_failure() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let spool_directory =
+            test_output_png_path("guardrail-spool-cleanup-failure").with_extension("dir");
+        let _guard = TempPathGuard(spool_directory.clone());
+
+        let err = decode_bufread_to_rgba_with_guardrails(
+            BufReader::new(Cursor::new(input)),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: Some(1),
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err("BufRead decode should fail max_pixels guardrail after spooling");
+
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::PixelCountExceeded { max_pixels, .. })
+                if max_pixels == 1
+        ));
+        assert_directory_empty(&spool_directory);
     }
 
     #[test]
@@ -10677,6 +10730,15 @@ mod tests {
         }
     }
 
+    struct TempPathGuard(PathBuf);
+
+    impl Drop for TempPathGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn test_output_png_path(label: &str) -> PathBuf {
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10686,6 +10748,21 @@ mod tests {
             "libheic-rs-{label}-{}-{nanos}.png",
             std::process::id()
         ))
+    }
+
+    fn assert_directory_empty(path: &PathBuf) {
+        assert!(
+            path.is_dir(),
+            "expected temp spool directory {} to exist",
+            path.display()
+        );
+        let mut entries = std::fs::read_dir(path)
+            .unwrap_or_else(|_| panic!("expected to read spool directory {}", path.display()));
+        assert!(
+            entries.next().is_none(),
+            "expected temp spool directory {} to be empty after decode",
+            path.display()
+        );
     }
 
     fn png_alpha_range(path: &PathBuf) -> (u16, u16, u16) {
