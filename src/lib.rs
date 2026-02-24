@@ -2892,6 +2892,7 @@ fn decode_uncompressed_tile_component_interleave(
         });
     }
 
+    let mut tile_payload_scratch = Vec::with_capacity(per_tile_size);
     for tile_row in 0..tile_layout.tile_rows {
         let tile_origin_y = tile_row
             .checked_mul(tile_layout.tile_height)
@@ -2916,7 +2917,7 @@ fn decode_uncompressed_tile_component_interleave(
                     ),
                 })?;
 
-            let mut tile_payload = Vec::with_capacity(per_tile_size);
+            tile_payload_scratch.clear();
             for (component_index, component_tile_size) in
                 component_tile_sizes.iter().copied().enumerate()
             {
@@ -2948,7 +2949,8 @@ fn decode_uncompressed_tile_component_interleave(
                         ),
                     });
                 }
-                tile_payload.extend_from_slice(&payload[component_tile_offset..component_tile_end]);
+                tile_payload_scratch
+                    .extend_from_slice(&payload[component_tile_offset..component_tile_end]);
             }
 
             let tile_region = UncompressedDecodeTileRegion {
@@ -2958,7 +2960,7 @@ fn decode_uncompressed_tile_component_interleave(
                 origin_x: tile_origin_x,
                 origin_y: tile_origin_y,
             };
-            let mut tile_reader = UncompressedBitReader::new(&tile_payload);
+            let mut tile_reader = UncompressedBitReader::new(&tile_payload_scratch);
             decode_uncompressed_component_interleave(
                 &mut tile_reader,
                 specs,
