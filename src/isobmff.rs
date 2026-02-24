@@ -24,6 +24,8 @@ const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
 const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
 const CMPD_BOX_TYPE: [u8; 4] = *b"cmpd";
 const UNCC_BOX_TYPE: [u8; 4] = *b"uncC";
+const CMPC_BOX_TYPE: [u8; 4] = *b"cmpC";
+const ICEF_BOX_TYPE: [u8; 4] = *b"icef";
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
 const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
@@ -991,7 +993,22 @@ pub struct UncompressedPrimaryItemProperties {
 pub struct UncompressedPrimaryItemData {
     pub item_id: u32,
     pub construction_method: u8,
+    pub generic_compression_properties: UncompressedGenericCompressionProperties,
     pub payload: Vec<u8>,
+}
+
+/// Raw associated-property payload for uncompressed generic-compression metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenericCompressionPropertyPayload {
+    pub offset: u64,
+    pub payload: Vec<u8>,
+}
+
+/// Associated generic-compression properties linked to the primary uncompressed item.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UncompressedGenericCompressionProperties {
+    pub cmpc: Vec<GenericCompressionPropertyPayload>,
+    pub icef: Vec<GenericCompressionPropertyPayload>,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -4023,6 +4040,26 @@ fn extract_primary_uncompressed_item_data_internal(
         );
     }
 
+    let mut generic_compression_properties = UncompressedGenericCompressionProperties::default();
+    for property in &resolved.primary_item.properties {
+        let property_type = property.property.header.box_type.as_bytes();
+        if property_type == CMPC_BOX_TYPE {
+            generic_compression_properties
+                .cmpc
+                .push(GenericCompressionPropertyPayload {
+                    offset: property.property.offset,
+                    payload: property.property.payload.to_vec(),
+                });
+        } else if property_type == ICEF_BOX_TYPE {
+            generic_compression_properties
+                .icef
+                .push(GenericCompressionPropertyPayload {
+                    offset: property.property.offset,
+                    payload: property.property.payload.to_vec(),
+                });
+        }
+    }
+
     let location = &resolved.primary_item.location;
     if location.data_reference_index != 0 {
         return Err(
@@ -4096,6 +4133,7 @@ fn extract_primary_uncompressed_item_data_internal(
     Ok(UncompressedPrimaryItemData {
         item_id,
         construction_method: location.construction_method,
+        generic_compression_properties,
         payload,
     })
 }

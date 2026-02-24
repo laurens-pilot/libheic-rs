@@ -2058,8 +2058,11 @@ fn decode_primary_uncompressed_to_image_internal(
     } else {
         isobmff::extract_primary_uncompressed_item_data(input)?
     };
-    let payload =
-        maybe_decode_primary_uncompressed_generic_compression_payload(input, &item_data.payload)?;
+    let payload = maybe_decode_primary_uncompressed_generic_compression_payload(
+        item_data.item_id,
+        &item_data.generic_compression_properties,
+        &item_data.payload,
+    )?;
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
         let tile_layout = UncompressedTileDecodeLayout {
             tile_rows: tile_rows_usize,
@@ -3394,7 +3397,8 @@ struct PrimaryUncompressedGenericCompression {
 }
 
 fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
-    input: &[u8],
+    item_id: u32,
+    generic_compression_properties: &isobmff::UncompressedGenericCompressionProperties,
     payload: &'a [u8],
 ) -> Result<Cow<'a, [u8]>, DecodeUncompressedError> {
     // Provenance: generic compression handling mirrors libheif
@@ -3403,7 +3407,9 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     // unc_decoder::{get_compressed_image_data_uncompressed,do_decompress_data}
     // and libheif/libheif/codecs/uncompressed/unc_boxes.cc:
     // {Box_cmpC::parse,Box_icef::parse}.
-    let Some(generic_compression) = parse_primary_uncompressed_generic_compression(input)? else {
+    let Some(generic_compression) =
+        parse_primary_uncompressed_generic_compression(item_id, generic_compression_properties)?
+    else {
         return Ok(Cow::Borrowed(payload));
     };
 
@@ -3506,66 +3512,32 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
 }
 
 fn parse_primary_uncompressed_generic_compression(
-    input: &[u8],
+    item_id: u32,
+    generic_compression_properties: &isobmff::UncompressedGenericCompressionProperties,
 ) -> Result<Option<PrimaryUncompressedGenericCompression>, DecodeUncompressedError> {
-    let top_level =
-        isobmff::parse_boxes(input).map_err(|err| DecodeUncompressedError::InvalidInput {
-            detail: format!("failed to inspect primary uncompressed properties: {err}"),
-        })?;
-    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE).ok_or_else(|| {
-        DecodeUncompressedError::InvalidInput {
-            detail: "required top-level meta box is missing".to_string(),
-        }
-    })?;
-    let meta = meta_box
-        .parse_meta()
-        .map_err(|err| DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "failed to parse meta box while inspecting uncompressed properties: {err}"
-            ),
-        })?;
-    let resolved =
-        meta.resolve_primary_item()
-            .map_err(|err| DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "failed to resolve primary item while inspecting uncompressed properties: {err}"
-                ),
-            })?;
-
-    let mut cmpc = None;
-    let mut icef = None;
-    for property in &resolved.primary_item.properties {
-        let property_type = property.property.header.box_type.as_bytes();
-        if property_type == CMPC_PROPERTY_TYPE {
-            if cmpc.is_some() {
-                return Err(DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "primary item_ID {} has duplicate cmpC properties",
-                        resolved.primary_item.item_id
-                    ),
-                });
-            }
-            cmpc = Some(parse_primary_uncompressed_cmpc_property(
-                &property.property,
-            )?);
-        } else if property_type == ICEF_PROPERTY_TYPE {
-            if icef.is_some() {
-                return Err(DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "primary item_ID {} has duplicate icef properties",
-                        resolved.primary_item.item_id
-                    ),
-                });
-            }
-            icef = Some(parse_primary_uncompressed_icef_property(
-                &property.property,
-            )?);
-        }
+    if generic_compression_properties.cmpc.len() > 1 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!("primary item_ID {item_id} has duplicate cmpC properties"),
+        });
+    }
+    if generic_compression_properties.icef.len() > 1 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!("primary item_ID {item_id} has duplicate icef properties"),
+        });
     }
 
-    let Some(config) = cmpc else {
+    let Some(cmpc_property) = generic_compression_properties.cmpc.first() else {
         return Ok(None);
     };
+    let config =
+        parse_primary_uncompressed_cmpc_property(cmpc_property.offset, &cmpc_property.payload)?;
+    let icef = generic_compression_properties
+        .icef
+        .first()
+        .map(|property| {
+            parse_primary_uncompressed_icef_property(property.offset, &property.payload)
+        })
+        .transpose()?;
 
     Ok(Some(PrimaryUncompressedGenericCompression {
         config,
@@ -3574,14 +3546,14 @@ fn parse_primary_uncompressed_generic_compression(
 }
 
 fn parse_primary_uncompressed_cmpc_property(
-    property: &isobmff::ParsedBox<'_>,
+    property_offset: u64,
+    payload: &[u8],
 ) -> Result<PrimaryUncompressedGenericCompressionConfig, DecodeUncompressedError> {
-    let payload = property.payload;
     if payload.len() < 9 {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "cmpC payload too small at offset {} (available: {}, required: 9)",
-                property.offset,
+                property_offset,
                 payload.len()
             ),
         });
@@ -3591,7 +3563,7 @@ fn parse_primary_uncompressed_cmpc_property(
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
                 "unsupported cmpC full box version {version} at offset {}",
-                property.offset
+                property_offset
             ),
         });
     }
@@ -3602,7 +3574,7 @@ fn parse_primary_uncompressed_cmpc_property(
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
                 "unsupported cmpC compressed_unit_type {compressed_unit_type} at offset {}",
-                property.offset
+                property_offset
             ),
         });
     }
@@ -3614,14 +3586,14 @@ fn parse_primary_uncompressed_cmpc_property(
 }
 
 fn parse_primary_uncompressed_icef_property(
-    property: &isobmff::ParsedBox<'_>,
+    property_offset: u64,
+    payload: &[u8],
 ) -> Result<Vec<GenericCompressedUnit>, DecodeUncompressedError> {
-    let payload = property.payload;
     if payload.len() < 9 {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "icef payload too small at offset {} (available: {}, required: 9)",
-                property.offset,
+                property_offset,
                 payload.len()
             ),
         });
@@ -3632,7 +3604,7 @@ fn parse_primary_uncompressed_icef_property(
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
                 "unsupported icef full box version {version} at offset {}",
-                property.offset
+                property_offset
             ),
         });
     }
@@ -3644,7 +3616,7 @@ fn parse_primary_uncompressed_icef_property(
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "unsupported icef unit_offset_code {unit_offset_code} at offset {}",
-                property.offset
+                property_offset
             ),
         });
     }
@@ -3652,7 +3624,7 @@ fn parse_primary_uncompressed_icef_property(
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "unsupported icef unit_size_code {unit_size_code} at offset {}",
-                property.offset
+                property_offset
             ),
         });
     }
@@ -3662,7 +3634,7 @@ fn parse_primary_uncompressed_icef_property(
         usize::try_from(unit_count).map_err(|_| DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "icef unit_count {} at offset {} cannot be represented on this platform",
-                unit_count, property.offset
+                unit_count, property_offset
             ),
         })?;
     let offset_bytes = usize::from(ICEF_OFFSET_BITS_TABLE[unit_offset_code] / 8);
@@ -3672,14 +3644,14 @@ fn parse_primary_uncompressed_icef_property(
         .ok_or_else(|| DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "icef entry byte-size overflow at offset {} for offset_code {unit_offset_code} and size_code {unit_size_code}",
-                property.offset
+                property_offset
             ),
         })?;
     let required = entry_bytes.checked_mul(unit_count).ok_or_else(|| {
         DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "icef table-size overflow at offset {} for unit_count {unit_count}",
-                property.offset
+                property_offset
             ),
         }
     })?;
@@ -3687,7 +3659,7 @@ fn parse_primary_uncompressed_icef_property(
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "icef payload too small for {unit_count} unit entries at offset {} (available: {}, required: {})",
-                property.offset,
+                property_offset,
                 payload.len().saturating_sub(9),
                 required
             ),
@@ -3705,7 +3677,7 @@ fn parse_primary_uncompressed_icef_property(
                 payload,
                 &mut cursor,
                 offset_bytes,
-                property.offset,
+                property_offset,
                 unit_index,
                 "offset",
             )?
@@ -3714,7 +3686,7 @@ fn parse_primary_uncompressed_icef_property(
             payload,
             &mut cursor,
             size_bytes,
-            property.offset,
+            property_offset,
             unit_index,
             "size",
         )?;
@@ -3722,7 +3694,7 @@ fn parse_primary_uncompressed_icef_property(
             DecodeUncompressedError::InvalidInput {
                 detail: format!(
                     "icef implied offset overflow while parsing unit {unit_index} at offset {}",
-                    property.offset
+                    property_offset
                 ),
             }
         })?;
@@ -4832,7 +4804,9 @@ const LARGE_BOX_SIZE_FIELD_SIZE: usize = 8;
 const UUID_EXTENDED_TYPE_SIZE: usize = 16;
 const TOP_LEVEL_BOX_HEADER_PROBE_SIZE: usize =
     BASIC_BOX_HEADER_SIZE + LARGE_BOX_SIZE_FIELD_SIZE + UUID_EXTENDED_TYPE_SIZE;
+#[cfg(test)]
 const CMPC_PROPERTY_TYPE: [u8; 4] = *b"cmpC";
+#[cfg(test)]
 const ICEF_PROPERTY_TYPE: [u8; 4] = *b"icef";
 const GENERIC_COMPRESSION_TYPE_BROTLI: [u8; 4] = *b"brot";
 const GENERIC_COMPRESSION_TYPE_ZLIB: [u8; 4] = *b"zlib";
