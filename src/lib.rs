@@ -14,7 +14,9 @@ use rav1d::src::lib::{
 };
 use rav1d::Dav1dResult;
 use scuffle_h265::{NALUnitType, SpsNALUnit};
-use source::{FileSource, RandomAccessSource, SourceReadError, TempFileSpoolSource};
+use source::{
+    FileSource, RandomAccessSource, SourceReadError, TempFileSpoolOptions, TempFileSpoolSource,
+};
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::c_void;
@@ -39,6 +41,7 @@ pub enum DecodeErrorCategory {
     Parse,
     MalformedInput,
     UnsupportedFeature,
+    ResourceLimit,
     DecoderBackend,
     OutputEncoding,
 }
@@ -51,6 +54,7 @@ impl DecodeErrorCategory {
             DecodeErrorCategory::Parse => "parse",
             DecodeErrorCategory::MalformedInput => "malformed-input",
             DecodeErrorCategory::UnsupportedFeature => "unsupported-feature",
+            DecodeErrorCategory::ResourceLimit => "resource-limit",
             DecodeErrorCategory::DecoderBackend => "decoder-backend",
             DecodeErrorCategory::OutputEncoding => "output-encoding",
         }
@@ -63,10 +67,51 @@ impl Display for DecodeErrorCategory {
     }
 }
 
+/// Structured decode guardrail failures for bounded ingestion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodeGuardrailError {
+    InputTooLarge {
+        actual_bytes: u64,
+        max_input_bytes: u64,
+    },
+    TempSpoolLimitExceeded {
+        attempted_bytes: u64,
+        max_temp_spool_bytes: u64,
+    },
+}
+
+impl DecodeGuardrailError {
+    fn category(&self) -> DecodeErrorCategory {
+        DecodeErrorCategory::ResourceLimit
+    }
+}
+
+impl Display for DecodeGuardrailError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes,
+            } => write!(
+                f,
+                "input exceeds configured max_input_bytes: got {actual_bytes} bytes, max is {max_input_bytes}"
+            ),
+            DecodeGuardrailError::TempSpoolLimitExceeded {
+                attempted_bytes,
+                max_temp_spool_bytes,
+            } => write!(
+                f,
+                "non-seek input exceeds configured max_temp_spool_bytes while spooling: attempted {attempted_bytes} bytes, max is {max_temp_spool_bytes}"
+            ),
+        }
+    }
+}
+
 /// Errors returned by the decoder entry points.
 #[derive(Debug)]
 pub enum DecodeError {
     Io(std::io::Error),
+    Guardrail(DecodeGuardrailError),
     AvifDecode(DecodeAvifError),
     HeicDecode(DecodeHeicError),
     UncompressedDecode(DecodeUncompressedError),
@@ -248,6 +293,7 @@ impl DecodeError {
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
             DecodeError::Io(_) => DecodeErrorCategory::Io,
+            DecodeError::Guardrail(err) => err.category(),
             DecodeError::AvifDecode(err) => err.category(),
             DecodeError::HeicDecode(err) => err.category(),
             DecodeError::UncompressedDecode(err) => err.category(),
@@ -263,6 +309,7 @@ impl Display for DecodeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::Io(err) => write!(f, "I/O error: {err}"),
+            DecodeError::Guardrail(err) => write!(f, "{err}"),
             DecodeError::AvifDecode(err) => write!(f, "{err}"),
             DecodeError::HeicDecode(err) => write!(f, "{err}"),
             DecodeError::UncompressedDecode(err) => write!(f, "{err}"),
@@ -285,6 +332,7 @@ impl Error for DecodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             DecodeError::Io(err) => Some(err),
+            DecodeError::Guardrail(_) => None,
             DecodeError::AvifDecode(err) => Some(err),
             DecodeError::HeicDecode(err) => Some(err),
             DecodeError::UncompressedDecode(err) => Some(err),
@@ -299,6 +347,12 @@ impl Error for DecodeError {
 impl From<std::io::Error> for DecodeError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<DecodeGuardrailError> for DecodeError {
+    fn from(value: DecodeGuardrailError) -> Self {
+        Self::Guardrail(value)
     }
 }
 
@@ -5478,10 +5532,42 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
     None
 }
 
-fn decode_bytes_to_rgba_with_hint(
+/// Configurable decode guardrails for bounded ingestion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecodeGuardrails {
+    /// Optional maximum accepted input size in bytes for all decode entry points.
+    pub max_input_bytes: Option<u64>,
+    /// Optional cap for bytes spooled from non-seek `Read`/`BufRead` inputs.
+    pub max_temp_spool_bytes: Option<u64>,
+}
+
+impl DecodeGuardrails {
+    fn enforce_input_bytes(self, actual_bytes: u64) -> Result<(), DecodeError> {
+        if let Some(max_input_bytes) = self.max_input_bytes {
+            if actual_bytes > max_input_bytes {
+                return Err(DecodeGuardrailError::InputTooLarge {
+                    actual_bytes,
+                    max_input_bytes,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn temp_spool_options(self) -> TempFileSpoolOptions {
+        TempFileSpoolOptions {
+            max_spool_bytes: self.max_temp_spool_bytes,
+        }
+    }
+}
+
+fn decode_bytes_to_rgba_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
     let family = detect_input_family_from_ftyp(input)
         .or(hint)
         .ok_or_else(|| {
@@ -5496,11 +5582,13 @@ fn decode_bytes_to_rgba_with_hint(
     }
 }
 
-fn decode_bytes_to_png_with_hint(
+fn decode_bytes_to_png_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
     output_path: &Path,
+    guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
     let family = detect_input_family_from_ftyp(input)
         .or(hint)
         .ok_or_else(|| {
@@ -5518,16 +5606,26 @@ fn decode_bytes_to_png_with_hint(
 fn decode_error_from_source_read_error(err: SourceReadError) -> DecodeError {
     match err {
         SourceReadError::Io { source, .. } => DecodeError::Io(source),
+        SourceReadError::SpoolLimitExceeded {
+            attempted,
+            max_allowed,
+        } => DecodeGuardrailError::TempSpoolLimitExceeded {
+            attempted_bytes: attempted,
+            max_temp_spool_bytes: max_allowed,
+        }
+        .into(),
         SourceReadError::RangeOverflow { .. } | SourceReadError::OutOfBounds { .. } => {
             DecodeError::Unsupported(err.to_string())
         }
     }
 }
 
-fn decode_source_to_rgba_with_hint<S: RandomAccessSource>(
+fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    guardrails.enforce_input_bytes(source.len())?;
     let selected =
         read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
@@ -5544,32 +5642,41 @@ fn decode_source_to_rgba_with_hint<S: RandomAccessSource>(
     }
 }
 
-fn decode_source_to_png_with_hint<S: RandomAccessSource>(
+fn decode_source_to_png_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
     output_path: &Path,
+    guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
-    let decoded = decode_source_to_rgba_with_hint(source, hint)?;
+    let decoded = decode_source_to_rgba_with_hint_and_guardrails(source, hint, guardrails)?;
     write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
-fn decode_read_to_rgba_with_hint<R: Read>(
+fn decode_read_to_rgba_with_hint_and_guardrails<R: Read>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let mut source = TempFileSpoolSource::from_reader(input_reader)
-        .map_err(decode_error_from_source_read_error)?;
-    decode_source_to_rgba_with_hint(&mut source, hint)
+    let mut source = TempFileSpoolSource::from_reader_with_options(
+        input_reader,
+        guardrails.temp_spool_options(),
+    )
+    .map_err(decode_error_from_source_read_error)?;
+    decode_source_to_rgba_with_hint_and_guardrails(&mut source, hint, guardrails)
 }
 
-fn decode_read_to_png_with_hint<R: Read>(
+fn decode_read_to_png_with_hint_and_guardrails<R: Read>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
     output_path: &Path,
+    guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
-    let mut source = TempFileSpoolSource::from_reader(input_reader)
-        .map_err(decode_error_from_source_read_error)?;
-    decode_source_to_png_with_hint(&mut source, hint, output_path)
+    let mut source = TempFileSpoolSource::from_reader_with_options(
+        input_reader,
+        guardrails.temp_spool_options(),
+    )
+    .map_err(decode_error_from_source_read_error)?;
+    decode_source_to_png_with_hint_and_guardrails(&mut source, hint, output_path, guardrails)
 }
 
 #[cfg(feature = "image-integration")]
@@ -5577,30 +5684,70 @@ fn decode_seekable_to_rgba_with_hint<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_seekable_to_rgba_with_hint_and_guardrails(
+        input_reader,
+        hint,
+        DecodeGuardrails::default(),
+    )
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_seekable_to_rgba_with_hint_and_guardrails<R: Read + Seek>(
+    input_reader: R,
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
     let mut source =
         source::SeekableSource::new(input_reader).map_err(decode_error_from_source_read_error)?;
-    decode_source_to_rgba_with_hint(&mut source, hint)
+    decode_source_to_rgba_with_hint_and_guardrails(&mut source, hint, guardrails)
+}
+
+/// Decode bytes with configurable guardrails into an owned RGBA buffer.
+pub fn decode_bytes_to_rgba_with_guardrails(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_bytes_to_rgba_with_hint_and_guardrails(input, None, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_bytes_to_rgba_with_hint(input, None)
+    decode_bytes_to_rgba_with_guardrails(input, DecodeGuardrails::default())
+}
+
+/// Decode a `Read` source with configurable guardrails into an owned RGBA buffer.
+pub fn decode_read_to_rgba_with_guardrails<R: Read>(
+    input_reader: R,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input into an owned RGBA buffer.
 pub fn decode_read_to_rgba<R: Read>(input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_read_to_rgba_with_hint(input_reader, None)
+    decode_read_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
+}
+
+/// Decode a `BufRead` source with configurable guardrails into an owned RGBA buffer.
+pub fn decode_bufread_to_rgba_with_guardrails<R: BufRead>(
+    input_reader: R,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `BufRead` input into an owned RGBA buffer.
 pub fn decode_bufread_to_rgba<R: BufRead>(
     input_reader: R,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_read_to_rgba_with_hint(input_reader, None)
+    decode_bufread_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
 }
 
-/// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
-pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
+/// Decode `input_path` with configurable guardrails into an owned RGBA buffer.
+pub fn decode_path_to_rgba_with_guardrails(
+    input_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
             "Input file does not exist: {}",
@@ -5608,7 +5755,16 @@ pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, Decode
         )));
     }
     let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
-    decode_source_to_rgba_with_hint(&mut source, extension_family_hint(input_path))
+    decode_source_to_rgba_with_hint_and_guardrails(
+        &mut source,
+        extension_family_hint(input_path),
+        guardrails,
+    )
+}
+
+/// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
+pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_path_to_rgba_with_guardrails(input_path, DecodeGuardrails::default())
 }
 
 /// Backward-compatible alias for [`decode_path_to_rgba`].
@@ -5616,14 +5772,41 @@ pub fn decode_file_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, Decode
     decode_path_to_rgba(input_path)
 }
 
+/// Decode bytes with configurable guardrails and write a PNG to `output_path`.
+pub fn decode_bytes_to_png_with_guardrails(
+    input: &[u8],
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    decode_bytes_to_png_with_hint_and_guardrails(input, None, output_path, guardrails)
+}
+
 /// Decode a HEIF/HEIC/AVIF image from bytes and write a PNG to `output_path`.
 pub fn decode_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
-    decode_bytes_to_png_with_hint(input, None, output_path)
+    decode_bytes_to_png_with_guardrails(input, output_path, DecodeGuardrails::default())
+}
+
+/// Decode a `Read` source with configurable guardrails and write a PNG.
+pub fn decode_read_to_png_with_guardrails<R: Read>(
+    input_reader: R,
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input and write a PNG to `output_path`.
 pub fn decode_read_to_png<R: Read>(input_reader: R, output_path: &Path) -> Result<(), DecodeError> {
-    decode_read_to_png_with_hint(input_reader, None, output_path)
+    decode_read_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
+}
+
+/// Decode a `BufRead` source with configurable guardrails and write a PNG.
+pub fn decode_bufread_to_png_with_guardrails<R: BufRead>(
+    input_reader: R,
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
+    decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `BufRead` input and write a PNG to `output_path`.
@@ -5631,11 +5814,15 @@ pub fn decode_bufread_to_png<R: BufRead>(
     input_reader: R,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
-    decode_read_to_png_with_hint(input_reader, None, output_path)
+    decode_bufread_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
 }
 
-/// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
-pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+/// Decode `input_path` with configurable guardrails and write a PNG to `output_path`.
+pub fn decode_path_to_png_with_guardrails(
+    input_path: &Path,
+    output_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<(), DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
             "Input file does not exist: {}",
@@ -5643,7 +5830,17 @@ pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
         )));
     }
     let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
-    decode_source_to_png_with_hint(&mut source, extension_family_hint(input_path), output_path)
+    decode_source_to_png_with_hint_and_guardrails(
+        &mut source,
+        extension_family_hint(input_path),
+        output_path,
+        guardrails,
+    )
+}
+
+/// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
+pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+    decode_path_to_png_with_guardrails(input_path, output_path, DecodeGuardrails::default())
 }
 
 /// Backward-compatible alias for [`decode_path_to_png`].
@@ -8198,16 +8395,18 @@ mod tests {
         append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
         assemble_primary_heic_hevc_stream, convert_avif_to_rgba16, convert_avif_to_rgba8,
         convert_heic_to_rgba8, decode_bufread_to_png, decode_bufread_to_rgba, decode_bytes_to_png,
-        decode_bytes_to_rgba, decode_file_to_png, decode_file_to_rgba,
-        decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image, decode_path_to_png,
-        decode_path_to_rgba, decode_primary_avif_to_image, decode_primary_heic_to_image,
+        decode_bytes_to_rgba, decode_bytes_to_rgba_with_guardrails, decode_file_to_png,
+        decode_file_to_rgba, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
+        decode_path_to_png, decode_path_to_rgba, decode_path_to_rgba_with_guardrails,
+        decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
-        decode_read_to_rgba, decode_source_to_rgba_with_hint,
-        decode_uncompressed_multi_y_interleave, detect_input_family_from_source,
-        parse_length_prefixed_hevc_nal_units, read_selected_top_level_boxes_from_source,
-        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
-        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
+        decode_read_to_rgba, decode_read_to_rgba_with_guardrails,
+        decode_source_to_rgba_with_hint_and_guardrails, decode_uncompressed_multi_y_interleave,
+        detect_input_family_from_source, parse_length_prefixed_hevc_nal_units,
+        read_selected_top_level_boxes_from_source, stitch_decoded_heic_grid_tiles,
+        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
+        AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
+        DecodeErrorCategory, DecodeGuardrailError, DecodeGuardrails, DecodeHeicError,
         DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
         HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass, TransformGuardError,
         UncompressedBitReader, UncompressedChannelRole, UncompressedComponentDecodeSpec,
@@ -8425,6 +8624,79 @@ mod tests {
     }
 
     #[test]
+    fn decode_bytes_guardrail_rejects_inputs_larger_than_max_input_bytes() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let input_bytes =
+            u64::try_from(input.len()).expect("input byte length should fit in u64 on this host");
+        assert!(input_bytes > 0);
+
+        let err = decode_bytes_to_rgba_with_guardrails(
+            &input,
+            DecodeGuardrails {
+                max_input_bytes: Some(input_bytes - 1),
+                max_temp_spool_bytes: None,
+            },
+        )
+        .expect_err("bytes decode should fail when max_input_bytes is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes
+            }) if actual_bytes == input_bytes && max_input_bytes == input_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn decode_path_guardrail_rejects_inputs_larger_than_max_input_bytes() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let metadata = std::fs::metadata(&fixture).expect("example.heic metadata should exist");
+        let input_bytes = metadata.len();
+        assert!(input_bytes > 0);
+
+        let err = decode_path_to_rgba_with_guardrails(
+            &fixture,
+            DecodeGuardrails {
+                max_input_bytes: Some(input_bytes - 1),
+                max_temp_spool_bytes: None,
+            },
+        )
+        .expect_err("seekable path decode should fail when max_input_bytes is too small");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::InputTooLarge {
+                actual_bytes,
+                max_input_bytes
+            }) if actual_bytes == input_bytes && max_input_bytes == input_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn decode_read_guardrail_rejects_inputs_that_exceed_max_temp_spool_bytes() {
+        let err = decode_read_to_rgba_with_guardrails(
+            Cursor::new(vec![0xB6_u8; 17]),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_temp_spool_bytes: Some(16),
+            },
+        )
+        .expect_err("non-seek decode should fail when max_temp_spool_bytes is exceeded");
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolLimitExceeded {
+                attempted_bytes,
+                max_temp_spool_bytes
+            }) if attempted_bytes == 17 && max_temp_spool_bytes == 16
+        ));
+    }
+
+    #[test]
     fn source_top_level_scan_skips_large_unselected_payloads() {
         let ftyp_payload = make_ftyp_payload(*b"heic");
         let ftyp = make_basic_box(FTYP_BOX_TYPE, &ftyp_payload);
@@ -8489,8 +8761,12 @@ mod tests {
         let with_tail_len = with_tail.len();
         let mut source = TrackingSliceSource::new(with_tail);
 
-        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Avif))
-            .expect("seekable AVIF decode should succeed with trailing unselected payload");
+        let decoded = decode_source_to_rgba_with_hint_and_guardrails(
+            &mut source,
+            Some(HeifInputFamily::Avif),
+            DecodeGuardrails::default(),
+        )
+        .expect("seekable AVIF decode should succeed with trailing unselected payload");
         assert_eq!(decoded, expected);
         assert!(
             source.bytes_requested < with_tail_len - (256 * 1024),
@@ -8511,8 +8787,12 @@ mod tests {
         let with_tail_len = with_tail.len();
         let mut source = TrackingSliceSource::new(with_tail);
 
-        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Heif))
-            .expect("seekable HEIC decode should succeed with trailing unselected payload");
+        let decoded = decode_source_to_rgba_with_hint_and_guardrails(
+            &mut source,
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("seekable HEIC decode should succeed with trailing unselected payload");
         assert_eq!(decoded, expected);
         assert!(
             source.bytes_requested < with_tail_len - (256 * 1024),
@@ -8534,8 +8814,12 @@ mod tests {
         let with_tail_len = with_tail.len();
         let mut source = TrackingSliceSource::new(with_tail);
 
-        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Heif))
-            .expect("seekable uncompressed decode should succeed with trailing unselected payload");
+        let decoded = decode_source_to_rgba_with_hint_and_guardrails(
+            &mut source,
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("seekable uncompressed decode should succeed with trailing unselected payload");
         assert_eq!(decoded, expected);
         assert!(
             source.bytes_requested < with_tail_len - (256 * 1024),
@@ -9255,6 +9539,12 @@ mod tests {
             unsupported.category(),
             DecodeErrorCategory::UnsupportedFeature
         );
+
+        let guardrail = DecodeError::Guardrail(DecodeGuardrailError::InputTooLarge {
+            actual_bytes: 2048,
+            max_input_bytes: 1024,
+        });
+        assert_eq!(guardrail.category(), DecodeErrorCategory::ResourceLimit);
     }
 
     #[test]
@@ -9268,6 +9558,10 @@ mod tests {
         assert_eq!(
             DecodeErrorCategory::UnsupportedFeature.as_str(),
             "unsupported-feature"
+        );
+        assert_eq!(
+            DecodeErrorCategory::ResourceLimit.as_str(),
+            "resource-limit"
         );
         assert_eq!(
             DecodeErrorCategory::DecoderBackend.as_str(),

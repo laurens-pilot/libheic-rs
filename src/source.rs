@@ -54,6 +54,10 @@ pub enum SourceReadError {
         requested: usize,
         source: std::io::Error,
     },
+    SpoolLimitExceeded {
+        attempted: u64,
+        max_allowed: u64,
+    },
 }
 
 impl Display for SourceReadError {
@@ -82,6 +86,13 @@ impl Display for SourceReadError {
                 f,
                 "source {operation} failed for {requested} bytes at offset {offset}: {source}"
             ),
+            SourceReadError::SpoolLimitExceeded {
+                attempted,
+                max_allowed,
+            } => write!(
+                f,
+                "temp spool limit exceeded while ingesting non-seek input: attempted {attempted} bytes, max allowed is {max_allowed}"
+            ),
         }
     }
 }
@@ -93,6 +104,13 @@ impl Error for SourceReadError {
             _ => None,
         }
     }
+}
+
+/// Limits applied while spooling non-seek inputs into a temporary file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TempFileSpoolOptions {
+    /// Optional upper bound for total spooled bytes.
+    pub max_spool_bytes: Option<u64>,
 }
 
 fn checked_range_end(offset: u64, requested: usize) -> Result<u64, SourceReadError> {
@@ -278,7 +296,16 @@ pub struct TempFileSpoolSource {
 impl TempFileSpoolSource {
     /// Spool all bytes from a non-seek `Read` into one temp file and reopen it
     /// as a seek-backed random-access source.
-    pub fn from_reader<R: Read>(mut input_reader: R) -> Result<Self, SourceReadError> {
+    pub fn from_reader<R: Read>(input_reader: R) -> Result<Self, SourceReadError> {
+        Self::from_reader_with_options(input_reader, TempFileSpoolOptions::default())
+    }
+
+    /// Spool all bytes from a non-seek `Read` into one temp file and reopen it
+    /// as a seek-backed random-access source while enforcing configured limits.
+    pub fn from_reader_with_options<R: Read>(
+        mut input_reader: R,
+        options: TempFileSpoolOptions,
+    ) -> Result<Self, SourceReadError> {
         let (path, mut spool_file) = create_temp_spool_file()?;
         let spool_result = (|| {
             let mut bytes_written = 0_u64;
@@ -296,6 +323,20 @@ impl TempFileSpoolSource {
                 if bytes_read == 0 {
                     break;
                 }
+                let attempted = bytes_written.checked_add(bytes_read as u64).ok_or(
+                    SourceReadError::RangeOverflow {
+                        offset: bytes_written,
+                        requested: bytes_read,
+                    },
+                )?;
+                if let Some(max_allowed) = options.max_spool_bytes {
+                    if attempted > max_allowed {
+                        return Err(SourceReadError::SpoolLimitExceeded {
+                            attempted,
+                            max_allowed,
+                        });
+                    }
+                }
                 spool_file
                     .write_all(&buffer[..bytes_read])
                     .map_err(|source| SourceReadError::Io {
@@ -304,12 +345,7 @@ impl TempFileSpoolSource {
                         requested: bytes_read,
                         source,
                     })?;
-                bytes_written = bytes_written.checked_add(bytes_read as u64).ok_or(
-                    SourceReadError::RangeOverflow {
-                        offset: bytes_written,
-                        requested: bytes_read,
-                    },
-                )?;
+                bytes_written = attempted;
             }
 
             spool_file.flush().map_err(|source| SourceReadError::Io {
@@ -374,7 +410,7 @@ impl Drop for TempFileSpoolSource {
 mod tests {
     use super::{
         FileSource, RandomAccessSource, SeekableSource, SliceSource, SourceReadError,
-        TempFileSpoolSource,
+        TempFileSpoolOptions, TempFileSpoolSource,
     };
     use std::fs;
     use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -599,6 +635,27 @@ mod tests {
                 assert_eq!(requested, 64 * 1024);
             }
             other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn temp_file_spool_source_enforces_max_spool_bytes() {
+        let err = TempFileSpoolSource::from_reader_with_options(
+            Cursor::new(vec![0xA5_u8; 17]),
+            TempFileSpoolOptions {
+                max_spool_bytes: Some(16),
+            },
+        )
+        .expect_err("spool source should reject inputs that exceed max_spool_bytes");
+        match err {
+            SourceReadError::SpoolLimitExceeded {
+                attempted,
+                max_allowed,
+            } => {
+                assert_eq!(attempted, 17);
+                assert_eq!(max_allowed, 16);
+            }
+            other => panic!("expected SpoolLimitExceeded error, got {other:?}"),
         }
     }
 }
