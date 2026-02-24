@@ -207,7 +207,7 @@ impl FileSource {
 mod tests {
     use super::{FileSource, RandomAccessSource, SeekableSource, SliceSource, SourceReadError};
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -256,6 +256,78 @@ mod tests {
     }
 
     #[test]
+    fn slice_source_reports_range_overflow() {
+        let mut source = SliceSource::new(b"abcd");
+        let mut output = [0_u8; 2];
+        let err = source
+            .read_exact_at(u64::MAX, &mut output)
+            .expect_err("slice source should reject range-overflow reads");
+        match err {
+            SourceReadError::RangeOverflow { offset, requested } => {
+                assert_eq!(offset, u64::MAX);
+                assert_eq!(requested, 2);
+            }
+            other => panic!("expected RangeOverflow error, got {other:?}"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct TruncatedSeekReader {
+        data: Vec<u8>,
+        position: u64,
+        reported_len: u64,
+    }
+
+    impl TruncatedSeekReader {
+        fn new(data: &[u8], reported_len: u64) -> Self {
+            Self {
+                data: data.to_vec(),
+                position: 0,
+                reported_len,
+            }
+        }
+    }
+
+    impl Read for TruncatedSeekReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let start = usize::try_from(self.position).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read position does not fit in usize",
+                )
+            })?;
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let available = self.data.len() - start;
+            let count = available.min(buf.len());
+            buf[..count].copy_from_slice(&self.data[start..start + count]);
+            self.position = self.position.checked_add(count as u64).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "position overflow")
+            })?;
+            Ok(count)
+        }
+    }
+
+    impl Seek for TruncatedSeekReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let next = match pos {
+                SeekFrom::Start(offset) => offset,
+                SeekFrom::End(0) => self.reported_len,
+                SeekFrom::Current(0) => self.position,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unsupported seek",
+                    ))
+                }
+            };
+            self.position = next;
+            Ok(next)
+        }
+    }
+
+    #[test]
     fn seekable_source_reads_non_contiguous_ranges() {
         let cursor = Cursor::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
         let mut source = SeekableSource::new(cursor).expect("cursor should initialize source");
@@ -271,6 +343,31 @@ mod tests {
             .read_exact_at(20, &mut second)
             .expect("second seek-backed read should succeed");
         assert_eq!(&second, b"uvwx");
+    }
+
+    #[test]
+    fn seekable_source_reports_truncated_read_as_io_error() {
+        let reader = TruncatedSeekReader::new(b"abc", 8);
+        let mut source = SeekableSource::new(reader).expect("source should initialize");
+        let mut output = [0_u8; 4];
+
+        let err = source
+            .read_exact_at(2, &mut output)
+            .expect_err("truncated seek-backed reads should fail");
+        match err {
+            SourceReadError::Io {
+                operation,
+                offset,
+                requested,
+                source,
+            } => {
+                assert_eq!(operation, "read-exact");
+                assert_eq!(offset, 2);
+                assert_eq!(requested, 4);
+                assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
     }
 
     #[test]

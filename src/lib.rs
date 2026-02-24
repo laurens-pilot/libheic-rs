@@ -7835,22 +7835,23 @@ mod tests {
     use super::{
         append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
         assemble_primary_heic_hevc_stream, convert_avif_to_rgba16, convert_avif_to_rgba8,
-        convert_heic_to_rgba8, decode_bufread_to_png, decode_bytes_to_png, decode_file_to_png,
+        convert_heic_to_rgba8, decode_bufread_to_png, decode_bufread_to_rgba, decode_bytes_to_png,
+        decode_bytes_to_rgba, decode_file_to_png, decode_file_to_rgba,
         decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image, decode_path_to_png,
-        decode_primary_avif_to_image, decode_primary_heic_to_image,
+        decode_path_to_rgba, decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
-        decode_uncompressed_multi_y_interleave, parse_length_prefixed_hevc_nal_units,
-        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
-        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
-        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
-        HeicPixelLayout, HeicPlane, HevcNalClass, TransformGuardError, UncompressedBitReader,
-        UncompressedChannelRole, UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion,
-        YCbCrMatrixCoefficients, YCbCrRange, CMPC_PROPERTY_TYPE,
-        GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL, GENERIC_COMPRESSED_UNIT_IMAGE_ROW,
-        ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE, ICEF_SIZE_BITS_TABLE, META_BOX_TYPE,
-        UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
-        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        decode_read_to_rgba, decode_uncompressed_multi_y_interleave,
+        parse_length_prefixed_hevc_nal_units, stitch_decoded_heic_grid_tiles,
+        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
+        AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
+        DecodeErrorCategory, DecodeHeicError, DecodeUncompressedError, DecodedAvifImage,
+        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass,
+        TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
+        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
+        YCbCrRange, CMPC_PROPERTY_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
+        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
+        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
+        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::{BufReader, Cursor};
@@ -8007,6 +8008,30 @@ mod tests {
             std::fs::read(&output_via_bufread).expect("BufRead output PNG should be readable"),
             expected_png
         );
+    }
+
+    #[test]
+    fn decode_rgba_entry_points_match_for_example_avif() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+
+        let expected = decode_bytes_to_rgba(&input).expect("bytes entry point should decode AVIF");
+
+        let via_path = decode_path_to_rgba(&fixture).expect("path entry point should decode AVIF");
+        assert_eq!(via_path, expected);
+
+        let via_file_alias =
+            decode_file_to_rgba(&fixture).expect("decode_file_to_rgba alias should decode AVIF");
+        assert_eq!(via_file_alias, expected);
+
+        let via_read = decode_read_to_rgba(Cursor::new(input.clone()))
+            .expect("Read entry point should decode AVIF");
+        assert_eq!(via_read, expected);
+
+        let via_bufread = decode_bufread_to_rgba(BufReader::new(Cursor::new(input)))
+            .expect("BufRead entry point should decode AVIF");
+        assert_eq!(via_bufread, expected);
     }
 
     #[test]
