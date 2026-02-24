@@ -1,6 +1,9 @@
 use image::codecs::png::PngDecoder;
-use image::{ColorType, ImageDecoder, ImageFormat, ImageReader};
-use libheic_rs::{decode_file_to_png, decode_primary_avif_to_image, decode_primary_heic_to_image};
+use image::{ColorType, ImageBuffer, ImageDecoder, ImageFormat, ImageReader, Rgba};
+use libheic_rs::{
+    decode_file_to_png, decode_path_to_rgba, decode_primary_avif_to_image,
+    decode_primary_heic_to_image, DecodedRgbaPixels,
+};
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
 use std::path::PathBuf;
@@ -70,6 +73,29 @@ fn image_decoder_trait_reads_heic_output_png() {
         .read_image(&mut buf)
         .expect("ImageDecoder::read_image should decode HEIC-derived PNG");
     assert!(buf.iter().any(|sample| *sample != 0));
+}
+
+#[test]
+fn decode_path_to_rgba_hands_off_owned_pixels_to_image_buffer() {
+    let fixture = fixture_path("../libheif/examples/example.heic");
+    let decoded = decode_path_to_rgba(&fixture)
+        .expect("decode_path_to_rgba should decode HEIC fixture into RGBA samples");
+    assert!(decoded.source_bit_depth > 0);
+    let width = decoded.width;
+    let height = decoded.height;
+
+    match decoded.pixels {
+        DecodedRgbaPixels::U8(pixels) => {
+            let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, pixels)
+                .expect("RGBA8 Vec should transfer directly into image::ImageBuffer");
+            assert_eq!(image.dimensions(), (width, height));
+        }
+        DecodedRgbaPixels::U16(pixels) => {
+            let image = ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(width, height, pixels)
+                .expect("RGBA16 Vec should transfer directly into image::ImageBuffer");
+            assert_eq!(image.dimensions(), (width, height));
+        }
+    }
 }
 
 fn fixture_path(relative: &str) -> PathBuf {

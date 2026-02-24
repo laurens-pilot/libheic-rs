@@ -435,6 +435,92 @@ pub struct DecodedUncompressedImage {
     pub icc_profile: Option<Vec<u8>>,
 }
 
+/// Stable decoded RGBA pixel storage for image-crate handoff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodedRgbaPixels {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl DecodedRgbaPixels {
+    /// Return the storage bit depth of this RGBA buffer (8 or 16).
+    pub fn storage_bit_depth(&self) -> u8 {
+        match self {
+            DecodedRgbaPixels::U8(_) => 8,
+            DecodedRgbaPixels::U16(_) => 16,
+        }
+    }
+
+    /// Borrow RGBA8 samples when this buffer is 8-bit.
+    pub fn as_rgba8(&self) -> Option<&[u8]> {
+        match self {
+            DecodedRgbaPixels::U8(pixels) => Some(pixels.as_slice()),
+            DecodedRgbaPixels::U16(_) => None,
+        }
+    }
+
+    /// Borrow RGBA16 samples when this buffer is 16-bit.
+    pub fn as_rgba16(&self) -> Option<&[u16]> {
+        match self {
+            DecodedRgbaPixels::U8(_) => None,
+            DecodedRgbaPixels::U16(pixels) => Some(pixels.as_slice()),
+        }
+    }
+
+    /// Consume this buffer and return owned RGBA8 samples when present.
+    pub fn into_rgba8(self) -> Option<Vec<u8>> {
+        match self {
+            DecodedRgbaPixels::U8(pixels) => Some(pixels),
+            DecodedRgbaPixels::U16(_) => None,
+        }
+    }
+
+    /// Consume this buffer and return owned RGBA16 samples when present.
+    pub fn into_rgba16(self) -> Option<Vec<u16>> {
+        match self {
+            DecodedRgbaPixels::U8(_) => None,
+            DecodedRgbaPixels::U16(pixels) => Some(pixels),
+        }
+    }
+}
+
+/// Decoded RGBA image buffer with metadata suitable for zero-copy handoff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedRgbaImage {
+    pub width: u32,
+    pub height: u32,
+    pub source_bit_depth: u8,
+    pub pixels: DecodedRgbaPixels,
+    pub icc_profile: Option<Vec<u8>>,
+}
+
+impl DecodedRgbaImage {
+    /// Return the storage bit depth of the RGBA pixel buffer (8 or 16).
+    pub fn storage_bit_depth(&self) -> u8 {
+        self.pixels.storage_bit_depth()
+    }
+
+    /// Borrow RGBA8 samples when this image stores 8-bit pixels.
+    pub fn as_rgba8(&self) -> Option<&[u8]> {
+        self.pixels.as_rgba8()
+    }
+
+    /// Borrow RGBA16 samples when this image stores 16-bit pixels.
+    pub fn as_rgba16(&self) -> Option<&[u16]> {
+        self.pixels.as_rgba16()
+    }
+
+    /// Consume this image and return owned RGBA8 samples when present.
+    pub fn into_rgba8(self) -> Option<Vec<u8>> {
+        self.pixels.into_rgba8()
+    }
+
+    /// Consume this image and return owned RGBA16 samples when present.
+    pub fn into_rgba16(self) -> Option<Vec<u16>> {
+        self.pixels.into_rgba16()
+    }
+}
+
 /// Parsed HEIC image metadata extracted from the primary HEVC SPS.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedHeicImageMetadata {
@@ -4941,26 +5027,20 @@ const HEIF_FILE_BRANDS: [[u8; 4]; 9] = [
     *b"mif1", *b"msf1", *b"miaf", *b"heic", *b"heix", *b"hevc", *b"hevx", *b"heim", *b"heis",
 ];
 
-fn decode_avif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+fn decode_avif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_avif(input);
     let decoded = decode_primary_avif_to_image(input)?;
-    write_decoded_avif_to_png(
-        &decoded,
-        &transforms.transforms,
-        icc_profile.as_deref(),
-        output_path,
-    )
+    decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
 
-fn decode_heif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     match decode_primary_uncompressed_to_image(input) {
         Ok(decoded) => {
             let transforms = isobmff::parse_primary_item_transform_properties(input)
                 .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
-            write_decoded_uncompressed_to_png(&decoded, &transforms.transforms, output_path)?;
-            return Ok(());
+            return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
         }
         Err(DecodeUncompressedError::ParsePrimaryProperties(
             isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
@@ -4974,13 +5054,22 @@ fn decode_heif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), Deco
     let decoded = decode_primary_heic_to_image(input)?;
     let auxiliary_alpha =
         decode_primary_heic_auxiliary_alpha_plane(input, decoded.width, decoded.height);
-    write_decoded_heic_to_png(
+    decoded_heic_to_rgba_image(
         &decoded,
         &transforms.transforms,
         auxiliary_alpha.as_ref(),
-        icc_profile.as_deref(),
-        output_path,
+        icc_profile,
     )
+}
+
+fn decode_avif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+    let decoded = decode_avif_bytes_to_rgba(input)?;
+    write_decoded_rgba_image_to_png(&decoded, output_path)
+}
+
+fn decode_heif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+    let decoded = decode_heif_bytes_to_rgba(input)?;
+    write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
 fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
@@ -5017,6 +5106,24 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
     None
 }
 
+fn decode_bytes_to_rgba_with_hint(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let family = detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(|| {
+            DecodeError::Unsupported(
+                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                    .to_string(),
+            )
+        })?;
+    match family {
+        HeifInputFamily::Avif => decode_avif_bytes_to_rgba(input),
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba(input),
+    }
+}
+
 fn decode_bytes_to_png_with_hint(
     input: &[u8],
     hint: Option<HeifInputFamily>,
@@ -5034,6 +5141,42 @@ fn decode_bytes_to_png_with_hint(
         HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path),
         HeifInputFamily::Heif => decode_heif_bytes_to_png(input, output_path),
     }
+}
+
+/// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
+pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_bytes_to_rgba_with_hint(input, None)
+}
+
+/// Decode a HEIF/HEIC/AVIF image from a `Read` input into an owned RGBA buffer.
+pub fn decode_read_to_rgba<R: Read>(mut input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
+    let mut input = Vec::new();
+    input_reader.read_to_end(&mut input)?;
+    decode_bytes_to_rgba(&input)
+}
+
+/// Decode a HEIF/HEIC/AVIF image from a `BufRead` input into an owned RGBA buffer.
+pub fn decode_bufread_to_rgba<R: BufRead>(
+    input_reader: R,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_read_to_rgba(input_reader)
+}
+
+/// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
+pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
+    if !input_path.exists() {
+        return Err(DecodeError::Unsupported(format!(
+            "Input file does not exist: {}",
+            input_path.display()
+        )));
+    }
+    let input = std::fs::read(input_path)?;
+    decode_bytes_to_rgba_with_hint(&input, extension_family_hint(input_path))
+}
+
+/// Backward-compatible alias for [`decode_path_to_rgba`].
+pub fn decode_file_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_path_to_rgba(input_path)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from bytes and write a PNG to `output_path`.
@@ -5387,40 +5530,57 @@ fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
     }
 }
 
-fn write_decoded_avif_to_png(
+fn decoded_avif_to_rgba_image(
     decoded: &DecodedAvifImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
-    icc_profile: Option<&[u8]>,
-    output_path: &Path,
-) -> Result<(), DecodeError> {
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbaImage, DecodeError> {
     if decoded.bit_depth <= 8 {
         let pixels = convert_avif_to_rgba8(decoded)?;
         let (width, height, transformed) =
             apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-        return write_rgba8_png(width, height, &transformed, icc_profile, output_path);
+        return Ok(DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth: decoded.bit_depth,
+            pixels: DecodedRgbaPixels::U8(transformed),
+            icc_profile,
+        });
     }
 
     let pixels = convert_avif_to_rgba16(decoded)?;
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-    write_rgba16_png(width, height, &transformed, icc_profile, output_path)
+    Ok(DecodedRgbaImage {
+        width,
+        height,
+        source_bit_depth: decoded.bit_depth,
+        pixels: DecodedRgbaPixels::U16(transformed),
+        icc_profile,
+    })
 }
 
-fn write_decoded_heic_to_png(
+fn decoded_heic_to_rgba_image(
     decoded: &DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
-    icc_profile: Option<&[u8]>,
-    output_path: &Path,
-) -> Result<(), DecodeError> {
-    if decoded.bit_depth_luma <= 8 {
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let source_bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
+    if source_bit_depth <= 8 {
         let mut pixels = convert_heic_to_rgba8(decoded)?;
         if let Some(alpha) = auxiliary_alpha {
             apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
         }
         let (width, height, transformed) =
             apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-        return write_rgba8_png(width, height, &transformed, icc_profile, output_path);
+        return Ok(DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth,
+            pixels: DecodedRgbaPixels::U8(transformed),
+            icc_profile,
+        });
     }
 
     let mut pixels = convert_heic_to_rgba16(decoded)?;
@@ -5429,66 +5589,113 @@ fn write_decoded_heic_to_png(
     }
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
-    write_rgba16_png(width, height, &transformed, icc_profile, output_path)
+    Ok(DecodedRgbaImage {
+        width,
+        height,
+        source_bit_depth,
+        pixels: DecodedRgbaPixels::U16(transformed),
+        icc_profile,
+    })
 }
 
-fn write_decoded_uncompressed_to_png(
-    decoded: &DecodedUncompressedImage,
+fn decoded_uncompressed_to_rgba_image(
+    decoded: DecodedUncompressedImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
-    output_path: &Path,
-) -> Result<(), DecodeError> {
-    if decoded.bit_depth == 0 || decoded.bit_depth > 16 {
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let DecodedUncompressedImage {
+        width,
+        height,
+        bit_depth,
+        rgba,
+        icc_profile,
+    } = decoded;
+
+    if bit_depth == 0 || bit_depth > 16 {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
                 "uncompressed output bit depth {} is outside supported range 1..=16",
-                decoded.bit_depth
+                bit_depth
             ),
         }
         .into());
     }
 
-    let expected_sample_count = checked_rgba_sample_count(decoded.width, decoded.height)?;
-    if decoded.rgba.len() != expected_sample_count {
+    let expected_sample_count = checked_rgba_sample_count(width, height)?;
+    if rgba.len() != expected_sample_count {
         return Err(DecodeError::TransformGuard(
             TransformGuardError::RgbaSampleCountMismatch {
                 stage: "uncompressed RGBA input",
-                actual: decoded.rgba.len(),
+                actual: rgba.len(),
                 expected: expected_sample_count,
-                width: decoded.width,
-                height: decoded.height,
+                width,
+                height,
             },
         ));
     }
 
-    if decoded.bit_depth <= 8 {
-        let mut rgba8 = Vec::with_capacity(decoded.rgba.len());
-        for sample in &decoded.rgba {
-            rgba8.push(scale_sample_to_u8(*sample, decoded.bit_depth));
+    if bit_depth <= 8 {
+        let mut rgba8 = Vec::with_capacity(rgba.len());
+        for sample in rgba {
+            rgba8.push(scale_sample_to_u8(sample, bit_depth));
         }
         let (width, height, transformed) =
-            apply_primary_item_transforms_rgba(decoded.width, decoded.height, rgba8, transforms)?;
-        return write_rgba8_png(
+            apply_primary_item_transforms_rgba(width, height, rgba8, transforms)?;
+        return Ok(DecodedRgbaImage {
             width,
             height,
-            &transformed,
-            decoded.icc_profile.as_deref(),
-            output_path,
-        );
+            source_bit_depth: bit_depth,
+            pixels: DecodedRgbaPixels::U8(transformed),
+            icc_profile,
+        });
     }
 
-    let mut rgba16 = Vec::with_capacity(decoded.rgba.len());
-    for sample in &decoded.rgba {
-        rgba16.push(scale_sample_to_u16(*sample, decoded.bit_depth));
+    if bit_depth == 16 {
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(width, height, rgba, transforms)?;
+        return Ok(DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth: bit_depth,
+            pixels: DecodedRgbaPixels::U16(transformed),
+            icc_profile,
+        });
+    }
+
+    let mut rgba16 = Vec::with_capacity(rgba.len());
+    for sample in rgba {
+        rgba16.push(scale_sample_to_u16(sample, bit_depth));
     }
     let (width, height, transformed) =
-        apply_primary_item_transforms_rgba(decoded.width, decoded.height, rgba16, transforms)?;
-    write_rgba16_png(
+        apply_primary_item_transforms_rgba(width, height, rgba16, transforms)?;
+    Ok(DecodedRgbaImage {
         width,
         height,
-        &transformed,
-        decoded.icc_profile.as_deref(),
-        output_path,
-    )
+        source_bit_depth: bit_depth,
+        pixels: DecodedRgbaPixels::U16(transformed),
+        icc_profile,
+    })
+}
+
+fn write_decoded_rgba_image_to_png(
+    decoded: &DecodedRgbaImage,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    match &decoded.pixels {
+        DecodedRgbaPixels::U8(pixels) => write_rgba8_png(
+            decoded.width,
+            decoded.height,
+            pixels,
+            decoded.icc_profile.as_deref(),
+            output_path,
+        ),
+        DecodedRgbaPixels::U16(pixels) => write_rgba16_png(
+            decoded.width,
+            decoded.height,
+            pixels,
+            decoded.icc_profile.as_deref(),
+            output_path,
+        ),
+    }
 }
 
 fn apply_auxiliary_alpha_to_rgba8(
