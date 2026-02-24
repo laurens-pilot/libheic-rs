@@ -1,3 +1,4 @@
+use brotli::Decompressor as BrotliDecompressor;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use heic_decoder::DecodedFrame as HeicDecoderFrame;
 use rav1d::include::dav1d::data::Dav1dData;
@@ -3510,6 +3511,16 @@ fn decompress_generic_compressed_unit(
     let mut decompressed = Vec::new();
     let compression_label = String::from_utf8_lossy(&compression_type).into_owned();
     match compression_type {
+        GENERIC_COMPRESSION_TYPE_BROTLI => {
+            let mut decoder = BrotliDecompressor::new(compressed_data, 4096);
+            decoder.read_to_end(&mut decompressed).map_err(|err| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "failed to decompress brotli generic-compressed unit {unit_index}: {err}"
+                    ),
+                }
+            })?;
+        }
         GENERIC_COMPRESSION_TYPE_ZLIB => {
             let mut decoder = ZlibDecoder::new(compressed_data);
             decoder.read_to_end(&mut decompressed).map_err(|err| {
@@ -4379,6 +4390,7 @@ const META_BOX_TYPE: [u8; 4] = *b"meta";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
 const CMPC_PROPERTY_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_PROPERTY_TYPE: [u8; 4] = *b"icef";
+const GENERIC_COMPRESSION_TYPE_BROTLI: [u8; 4] = *b"brot";
 const GENERIC_COMPRESSION_TYPE_ZLIB: [u8; 4] = *b"zlib";
 const GENERIC_COMPRESSION_TYPE_DEFLATE: [u8; 4] = *b"defl";
 const GENERIC_COMPRESSED_UNIT_FULL_ITEM: u8 = 0;
@@ -7466,22 +7478,25 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_brotli_generic_compressed_fixture() {
+    fn decodes_generic_compressed_brotli_fixture_to_png() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../libheif/tests/data/rgb_generic_compressed_brotli.heif");
         let input =
             std::fs::read(&fixture).expect("generic-compressed brotli fixture must be readable");
-        let err = decode_primary_uncompressed_to_image(&input)
-            .expect_err("generic-compressed brotli fixture should remain unsupported in this pass");
-        match err {
-            DecodeUncompressedError::UnsupportedFeature { detail } => {
-                assert!(
-                    detail.contains("brot"),
-                    "expected brotli unsupported error detail, got: {detail}"
-                );
-            }
-            other => panic!("unexpected decode result for brotli fixture: {other:?}"),
-        }
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("generic-compressed brotli fixture should decode");
+        assert_eq!(decoded.bit_depth, 8);
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("generic-compressed-brotli");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("generic-compressed brotli fixture should write PNG");
     }
 
     #[test]
