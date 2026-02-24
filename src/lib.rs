@@ -1267,36 +1267,41 @@ fn decode_primary_heic_to_image_internal(
     } else {
         isobmff::extract_primary_heic_item_data_with_grid(input)?
     };
-    if let isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) = primary_with_grid {
-        return decode_primary_heic_grid_to_image(&grid_data);
+    match primary_with_grid {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            decode_primary_heic_grid_to_image(&grid_data)
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+            let mut decoded = decode_hevc_stream_to_image(&stream)?;
+            if let Some(ycbcr_range) = ycbcr_range_override {
+                decoded.ycbcr_range = ycbcr_range;
+            }
+            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
+                decoded.ycbcr_matrix = ycbcr_matrix;
+            }
+            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+            Ok(decoded)
+        }
     }
-
-    let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-        decode_primary_heic_stream_and_metadata_internal(input, source)?;
-    let mut decoded = decode_hevc_stream_to_image(&stream)?;
-    if let Some(ycbcr_range) = ycbcr_range_override {
-        decoded.ycbcr_range = ycbcr_range;
-    }
-    if let Some(ycbcr_matrix) = ycbcr_matrix_override {
-        decoded.ycbcr_matrix = ycbcr_matrix;
-    }
-    validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
-    Ok(decoded)
 }
 
 /// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    if let isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) =
-        isobmff::extract_primary_heic_item_data_with_grid(input)?
-    {
-        let decoded = decode_primary_heic_grid_to_image(&grid_data)?;
-        return Ok(decoded_heic_image_to_metadata(&decoded));
+    match isobmff::extract_primary_heic_item_data_with_grid(input)? {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            let decoded = decode_primary_heic_grid_to_image(&grid_data)?;
+            Ok(decoded_heic_image_to_metadata(&decoded))
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let (_, metadata, _, _) =
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+            Ok(metadata)
+        }
     }
-
-    let (_, metadata, _, _) = decode_primary_heic_stream_and_metadata(input)?;
-    Ok(metadata)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3807,23 +3812,19 @@ type PrimaryHeicStreamDecodeContext = (
     Option<YCbCrMatrixCoefficients>,
 );
 
-fn decode_primary_heic_stream_and_metadata(
+fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
     input: &[u8],
-) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
-    let mut source: Option<&mut dyn RandomAccessSource> = None;
-    decode_primary_heic_stream_and_metadata_internal(input, &mut source)
-}
-
-fn decode_primary_heic_stream_and_metadata_internal(
-    input: &[u8],
-    source: &mut Option<&mut dyn RandomAccessSource>,
+    item_data: &isobmff::HeicPrimaryItemData,
 ) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
-    let item_data = if let Some(source) = source.as_mut() {
-        isobmff::extract_primary_heic_item_data_from_source(source, input)?
-    } else {
-        isobmff::extract_primary_heic_item_data(input)?
-    };
+    if properties.item_id != item_data.item_id {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "primary item_ID mismatch between HEIC property parse ({}) and extracted payload ({})",
+                properties.item_id, item_data.item_id
+            ),
+        });
+    }
     let ycbcr_range_override = ycbcr_range_override_from_primary_colr(&properties.colr);
     let ycbcr_matrix_override = ycbcr_matrix_override_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
