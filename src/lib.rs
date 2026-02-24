@@ -2174,6 +2174,8 @@ fn decode_primary_uncompressed_to_image_internal(
     } else {
         None
     };
+    let ycbcr_converter = ycbcr_transform
+        .map(|transform| PreparedYcbcrToRgb::new(output_bit_depth, ycbcr_range, transform));
 
     let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4).ok_or_else(|| {
         DecodeUncompressedError::InvalidInput {
@@ -2234,17 +2236,14 @@ fn decode_primary_uncompressed_to_image_internal(
                 output_bit_depth,
                 "Cr",
             )?;
-            let transform =
-                ycbcr_transform.ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            let converter =
+                ycbcr_converter.ok_or_else(|| DecodeUncompressedError::InvalidInput {
                     detail: "missing YCbCr transform for decoded YCbCr channel set".to_string(),
                 })?;
-            ycbcr_to_rgb_components(
+            converter.convert(
                 i32::from(y_sample),
                 i32::from(cb_sample),
                 i32::from(cr_sample),
-                output_bit_depth,
-                ycbcr_range,
-                transform,
             )
         } else {
             let red = channel_samples[UNCOMPRESSED_CHANNEL_RED]
@@ -7189,29 +7188,20 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
                 width: decoded.width,
                 height: decoded.height,
             })?;
-    let mut out = Vec::with_capacity(output_len);
+    let mut out = vec![0_u8; output_len];
 
     let chroma = prepare_chroma_u8(decoded)?;
     let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
     let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
+    let converter =
+        PreparedYcbcrToRgb::new(decoded.bit_depth, decoded.ycbcr_range, ycbcr_transform);
 
     for y in 0..height {
-        let row_start = y
-            .checked_mul(width)
-            .ok_or(DecodeAvifError::PlaneSizeOverflow {
-                plane: "RGBA",
-                width: decoded.width,
-                height: decoded.height,
-            })?;
+        let row_start = y * width;
+        let out_row_start = row_start * 4;
 
         for x in 0..width {
-            let y_index = row_start
-                .checked_add(x)
-                .ok_or(DecodeAvifError::PlaneSizeOverflow {
-                    plane: "RGBA",
-                    width: decoded.width,
-                    height: decoded.height,
-                })?;
+            let y_index = row_start + x;
             let y_sample = i32::from(y_samples[y_index]);
 
             let (cb_sample, cr_sample) = match &chroma {
@@ -7230,22 +7220,16 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(
-                y_sample,
-                cb_sample,
-                cr_sample,
-                decoded.bit_depth,
-                decoded.ycbcr_range,
-                ycbcr_transform,
-            );
-            out.push(scale_sample_to_u8(r, decoded.bit_depth));
-            out.push(scale_sample_to_u8(g, decoded.bit_depth));
-            out.push(scale_sample_to_u8(b, decoded.bit_depth));
+            let (r, g, b) = converter.convert(y_sample, cb_sample, cr_sample);
+            let out_index = out_row_start + (x * 4);
+            out[out_index] = scale_sample_to_u8(r, decoded.bit_depth);
+            out[out_index + 1] = scale_sample_to_u8(g, decoded.bit_depth);
+            out[out_index + 2] = scale_sample_to_u8(b, decoded.bit_depth);
             let alpha_sample = alpha
                 .as_ref()
                 .map(|plane| avif_auxiliary_alpha_sample_to_u8(plane, y_index))
                 .unwrap_or(u8::MAX);
-            out.push(alpha_sample);
+            out[out_index + 3] = alpha_sample;
         }
     }
 
@@ -7290,29 +7274,20 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
                 width: decoded.width,
                 height: decoded.height,
             })?;
-    let mut out = Vec::with_capacity(output_len);
+    let mut out = vec![0_u16; output_len];
 
     let chroma = prepare_chroma_u16(decoded)?;
     let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
     let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
+    let converter =
+        PreparedYcbcrToRgb::new(decoded.bit_depth, decoded.ycbcr_range, ycbcr_transform);
 
     for y in 0..height {
-        let row_start = y
-            .checked_mul(width)
-            .ok_or(DecodeAvifError::PlaneSizeOverflow {
-                plane: "RGBA",
-                width: decoded.width,
-                height: decoded.height,
-            })?;
+        let row_start = y * width;
+        let out_row_start = row_start * 4;
 
         for x in 0..width {
-            let y_index = row_start
-                .checked_add(x)
-                .ok_or(DecodeAvifError::PlaneSizeOverflow {
-                    plane: "RGBA",
-                    width: decoded.width,
-                    height: decoded.height,
-                })?;
+            let y_index = row_start + x;
             let y_sample = i32::from(y_samples[y_index]);
 
             let (cb_sample, cr_sample) = match &chroma {
@@ -7331,22 +7306,16 @@ fn convert_avif_to_rgba16(decoded: &DecodedAvifImage) -> Result<Vec<u16>, Decode
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(
-                y_sample,
-                cb_sample,
-                cr_sample,
-                decoded.bit_depth,
-                decoded.ycbcr_range,
-                ycbcr_transform,
-            );
-            out.push(scale_sample_to_u16(r, decoded.bit_depth));
-            out.push(scale_sample_to_u16(g, decoded.bit_depth));
-            out.push(scale_sample_to_u16(b, decoded.bit_depth));
+            let (r, g, b) = converter.convert(y_sample, cb_sample, cr_sample);
+            let out_index = out_row_start + (x * 4);
+            out[out_index] = scale_sample_to_u16(r, decoded.bit_depth);
+            out[out_index + 1] = scale_sample_to_u16(g, decoded.bit_depth);
+            out[out_index + 2] = scale_sample_to_u16(b, decoded.bit_depth);
             let alpha_sample = alpha
                 .as_ref()
                 .map(|plane| avif_auxiliary_alpha_sample_to_u16(plane, y_index))
                 .unwrap_or(u16::MAX);
-            out.push(alpha_sample);
+            out[out_index + 3] = alpha_sample;
         }
     }
 
@@ -7391,27 +7360,18 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                     decoded.width, decoded.height
                 ),
             })?;
-    let mut out = Vec::with_capacity(output_len);
+    let mut out = vec![0_u8; output_len];
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);
+    let converter = PreparedYcbcrToRgb::new(bit_depth, decoded.ycbcr_range, ycbcr_transform);
 
     for y in 0..height {
-        let row_start =
-            y.checked_mul(width)
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: format!(
-                        "row offset overflow while converting HEIC at row {y} (width={width})"
-                    ),
-                })?;
+        let row_start = y * width;
+        let out_row_start = row_start * 4;
 
         for x in 0..width {
-            let y_index =
-                row_start
-                    .checked_add(x)
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: format!("luma index overflow while converting HEIC at ({x}, {y})"),
-                    })?;
+            let y_index = row_start + x;
             let y_sample = i32::from(decoded.y_plane.samples[y_index]);
 
             let (cb_sample, cr_sample) = match &chroma {
@@ -7430,18 +7390,12 @@ fn convert_heic_to_rgba8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHe
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(
-                y_sample,
-                cb_sample,
-                cr_sample,
-                bit_depth,
-                decoded.ycbcr_range,
-                ycbcr_transform,
-            );
-            out.push(scale_sample_to_u8(r, bit_depth));
-            out.push(scale_sample_to_u8(g, bit_depth));
-            out.push(scale_sample_to_u8(b, bit_depth));
-            out.push(u8::MAX);
+            let (r, g, b) = converter.convert(y_sample, cb_sample, cr_sample);
+            let out_index = out_row_start + (x * 4);
+            out[out_index] = scale_sample_to_u8(r, bit_depth);
+            out[out_index + 1] = scale_sample_to_u8(g, bit_depth);
+            out[out_index + 2] = scale_sample_to_u8(b, bit_depth);
+            out[out_index + 3] = u8::MAX;
         }
     }
 
@@ -7486,27 +7440,18 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                     decoded.width, decoded.height
                 ),
             })?;
-    let mut out = Vec::with_capacity(output_len);
+    let mut out = vec![0_u16; output_len];
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);
+    let converter = PreparedYcbcrToRgb::new(bit_depth, decoded.ycbcr_range, ycbcr_transform);
 
     for y in 0..height {
-        let row_start =
-            y.checked_mul(width)
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: format!(
-                        "row offset overflow while converting HEIC at row {y} (width={width})"
-                    ),
-                })?;
+        let row_start = y * width;
+        let out_row_start = row_start * 4;
 
         for x in 0..width {
-            let y_index =
-                row_start
-                    .checked_add(x)
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: format!("luma index overflow while converting HEIC at ({x}, {y})"),
-                    })?;
+            let y_index = row_start + x;
             let y_sample = i32::from(decoded.y_plane.samples[y_index]);
 
             let (cb_sample, cr_sample) = match &chroma {
@@ -7525,18 +7470,12 @@ fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, Decode
                 }
             };
 
-            let (r, g, b) = ycbcr_to_rgb_components(
-                y_sample,
-                cb_sample,
-                cr_sample,
-                bit_depth,
-                decoded.ycbcr_range,
-                ycbcr_transform,
-            );
-            out.push(scale_sample_to_u16(r, bit_depth));
-            out.push(scale_sample_to_u16(g, bit_depth));
-            out.push(scale_sample_to_u16(b, bit_depth));
-            out.push(u16::MAX);
+            let (r, g, b) = converter.convert(y_sample, cb_sample, cr_sample);
+            let out_index = out_row_start + (x * 4);
+            out[out_index] = scale_sample_to_u16(r, bit_depth);
+            out[out_index + 1] = scale_sample_to_u16(g, bit_depth);
+            out[out_index + 2] = scale_sample_to_u16(b, bit_depth);
+            out[out_index + 3] = u16::MAX;
         }
     }
 
@@ -7992,64 +7931,139 @@ fn chroma_sample_index(x: usize, y: usize, chroma_width: usize, layout: AvifPixe
     }
 }
 
-fn ycbcr_to_rgb_components(
-    y_sample: i32,
-    cb_sample: i32,
-    cr_sample: i32,
-    bit_depth: u8,
-    range: YCbCrRange,
-    transform: YCbCrToRgbTransform,
-) -> (u16, u16, u16) {
-    match transform {
-        YCbCrToRgbTransform::Identity => {
-            if range == YCbCrRange::Full {
-                return (
-                    clip_to_bit_depth(i64::from(cr_sample), bit_depth),
-                    clip_to_bit_depth(i64::from(y_sample), bit_depth),
-                    clip_to_bit_depth(i64::from(cb_sample), bit_depth),
-                );
-            }
+#[derive(Clone, Copy)]
+enum PreparedYcbcrTransform {
+    IdentityFull,
+    IdentityLimited {
+        limited_offset: f64,
+    },
+    MatrixFull {
+        coeffs: YCbCrToRgbCoefficients,
+        chroma_midpoint: i32,
+    },
+    MatrixLimited {
+        coeffs: YCbCrToRgbCoefficients,
+        limited_offset: f64,
+        chroma_midpoint: f64,
+        max_value: u16,
+        apply_bt601_parity_shim: bool,
+    },
+}
 
-            // Provenance: limited-range identity handling mirrors
-            // libheif/libheif/color-conversion/yuv2rgb.cc:
-            // Op_YCbCr_to_RGB::convert_colorspace and
-            // libheif/libheif/common_utils.h:clip_f_u16.
-            // Keep libheif's float constants but evaluate with f64
-            // intermediates to reduce residual cross-backend rounding drift.
-            let limited_offset = f64::from(limited_range_offset(bit_depth));
-            let r = (f64::from(cr_sample) - limited_offset) * 1.1429_f64;
-            let g = (f64::from(y_sample) - limited_offset) * 1.1689_f64;
-            let b = (f64::from(cb_sample) - limited_offset) * 1.1429_f64;
-            (
-                clip_float_to_bit_depth(r, bit_depth),
-                clip_float_to_bit_depth(g, bit_depth),
-                clip_float_to_bit_depth(b, bit_depth),
-            )
+#[derive(Clone, Copy)]
+struct PreparedYcbcrToRgb {
+    bit_depth: u8,
+    transform: PreparedYcbcrTransform,
+}
+
+impl PreparedYcbcrToRgb {
+    fn new(bit_depth: u8, range: YCbCrRange, transform: YCbCrToRgbTransform) -> Self {
+        let transform = match (transform, range) {
+            (YCbCrToRgbTransform::Identity, YCbCrRange::Full) => {
+                PreparedYcbcrTransform::IdentityFull
+            }
+            (YCbCrToRgbTransform::Identity, YCbCrRange::Limited) => {
+                PreparedYcbcrTransform::IdentityLimited {
+                    limited_offset: f64::from(limited_range_offset(bit_depth)),
+                }
+            }
+            (YCbCrToRgbTransform::Matrix(coeffs), YCbCrRange::Full) => {
+                PreparedYcbcrTransform::MatrixFull {
+                    coeffs,
+                    chroma_midpoint: chroma_midpoint(bit_depth),
+                }
+            }
+            (YCbCrToRgbTransform::Matrix(coeffs), YCbCrRange::Limited) => {
+                PreparedYcbcrTransform::MatrixLimited {
+                    coeffs,
+                    limited_offset: f64::from(limited_range_offset(bit_depth)),
+                    chroma_midpoint: f64::from(chroma_midpoint(bit_depth)),
+                    max_value: max_u16_for_bit_depth(bit_depth),
+                    apply_bt601_parity_shim: bit_depth == 8
+                        && uses_default_bt601_matrix_coefficients(coeffs),
+                }
+            }
+        };
+
+        Self {
+            bit_depth,
+            transform,
         }
-        YCbCrToRgbTransform::Matrix(coeffs) => {
-            if range == YCbCrRange::Limited {
+    }
+
+    #[inline]
+    fn convert(self, y_sample: i32, cb_sample: i32, cr_sample: i32) -> (u16, u16, u16) {
+        match self.transform {
+            PreparedYcbcrTransform::IdentityFull => (
+                clip_to_bit_depth(i64::from(cr_sample), self.bit_depth),
+                clip_to_bit_depth(i64::from(y_sample), self.bit_depth),
+                clip_to_bit_depth(i64::from(cb_sample), self.bit_depth),
+            ),
+            PreparedYcbcrTransform::IdentityLimited { limited_offset } => {
+                // Provenance: limited-range identity handling mirrors
+                // libheif/libheif/color-conversion/yuv2rgb.cc:
+                // Op_YCbCr_to_RGB::convert_colorspace and
+                // libheif/libheif/common_utils.h:clip_f_u16.
+                // Keep libheif's float constants but evaluate with f64
+                // intermediates to reduce residual cross-backend rounding drift.
+                let r = (f64::from(cr_sample) - limited_offset) * 1.1429_f64;
+                let g = (f64::from(y_sample) - limited_offset) * 1.1689_f64;
+                let b = (f64::from(cb_sample) - limited_offset) * 1.1429_f64;
+                (
+                    clip_float_to_bit_depth(r, self.bit_depth),
+                    clip_float_to_bit_depth(g, self.bit_depth),
+                    clip_float_to_bit_depth(b, self.bit_depth),
+                )
+            }
+            PreparedYcbcrTransform::MatrixFull {
+                coeffs,
+                chroma_midpoint,
+            } => {
+                let cb_centered = cb_sample - chroma_midpoint;
+                let cr_centered = cr_sample - chroma_midpoint;
+                let r = i64::from(y_sample)
+                    + ((i64::from(coeffs.r_cr_fp8) * i64::from(cr_centered) + 128) >> 8);
+                let g = i64::from(y_sample)
+                    + ((i64::from(coeffs.g_cb_fp8) * i64::from(cb_centered)
+                        + i64::from(coeffs.g_cr_fp8) * i64::from(cr_centered)
+                        + 128)
+                        >> 8);
+                let b = i64::from(y_sample)
+                    + ((i64::from(coeffs.b_cb_fp8) * i64::from(cb_centered) + 128) >> 8);
+
+                (
+                    clip_to_bit_depth(r, self.bit_depth),
+                    clip_to_bit_depth(g, self.bit_depth),
+                    clip_to_bit_depth(b, self.bit_depth),
+                )
+            }
+            PreparedYcbcrTransform::MatrixLimited {
+                coeffs,
+                limited_offset,
+                chroma_midpoint,
+                max_value,
+                apply_bt601_parity_shim,
+            } => {
                 // Provenance: limited-range matrix conversion mirrors
                 // libheif/libheif/color-conversion/yuv2rgb.cc:
                 // Op_YCbCr_to_RGB::convert_colorspace and
                 // libheif/libheif/common_utils.h:clip_f_u16.
-                let limited_offset = f64::from(limited_range_offset(bit_depth));
-                let chroma_midpoint = f64::from(chroma_midpoint(bit_depth));
                 let yv = (f64::from(y_sample) - limited_offset) * 1.1689_f64;
                 let cb = (f64::from(cb_sample) - chroma_midpoint) * 1.1429_f64;
                 let cr = (f64::from(cr_sample) - chroma_midpoint) * 1.1429_f64;
                 let r = yv + coeffs.r_cr * cr;
                 let g = yv + coeffs.g_cb * cb + coeffs.g_cr * cr;
                 let b = yv + coeffs.b_cb * cb;
-                let mut r_out = clip_float_to_bit_depth(r, bit_depth);
-                let mut g_out = clip_float_to_bit_depth(g, bit_depth);
-                let mut b_out = clip_float_to_bit_depth(b, bit_depth);
+                let r_out = clip_float_to_bit_depth(r, self.bit_depth);
+                let mut g_out = clip_float_to_bit_depth(g, self.bit_depth);
+                let mut b_out = clip_float_to_bit_depth(b, self.bit_depth);
 
                 // Residual parity shim: after the CU-wide deblock QP fix, the
                 // remaining example.heic drift is confined to two decoded-YUV
                 // tuples where libheif's float path rounds up while this pure
                 // Rust backend+conversion combination still lands one sample
                 // lower. Keep this narrowly scoped to BT.601 defaults.
-                if bit_depth == 8 && uses_default_bt601_matrix_coefficients(coeffs) {
+                if apply_bt601_parity_shim {
                     if y_sample == 194 && cb_sample == 105 && cr_sample == 141 {
                         g_out = g_out.saturating_add(1);
                     }
@@ -8058,32 +8072,24 @@ fn ycbcr_to_rgb_components(
                     }
                 }
 
-                r_out = r_out.min((1_u16 << bit_depth) - 1);
-                g_out = g_out.min((1_u16 << bit_depth) - 1);
-                b_out = b_out.min((1_u16 << bit_depth) - 1);
-                return (r_out, g_out, b_out);
+                (
+                    r_out.min(max_value),
+                    g_out.min(max_value),
+                    b_out.min(max_value),
+                )
             }
-
-            let chroma_midpoint = chroma_midpoint(bit_depth);
-            let cb_centered = cb_sample - chroma_midpoint;
-            let cr_centered = cr_sample - chroma_midpoint;
-            let r = i64::from(y_sample)
-                + ((i64::from(coeffs.r_cr_fp8) * i64::from(cr_centered) + 128) >> 8);
-            let g = i64::from(y_sample)
-                + ((i64::from(coeffs.g_cb_fp8) * i64::from(cb_centered)
-                    + i64::from(coeffs.g_cr_fp8) * i64::from(cr_centered)
-                    + 128)
-                    >> 8);
-            let b = i64::from(y_sample)
-                + ((i64::from(coeffs.b_cb_fp8) * i64::from(cb_centered) + 128) >> 8);
-
-            (
-                clip_to_bit_depth(r, bit_depth),
-                clip_to_bit_depth(g, bit_depth),
-                clip_to_bit_depth(b, bit_depth),
-            )
         }
     }
+}
+
+fn max_u16_for_bit_depth(bit_depth: u8) -> u16 {
+    if bit_depth == 0 {
+        return 0;
+    }
+    if bit_depth >= 16 {
+        return u16::MAX;
+    }
+    ((1_u32 << u32::from(bit_depth)) - 1) as u16
 }
 
 fn clip_float_to_bit_depth(value: f64, bit_depth: u8) -> u16 {
