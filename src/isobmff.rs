@@ -958,6 +958,16 @@ pub struct AvifPrimaryItemProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
+/// Parsed primary AVIF properties needed for decoder preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvifPrimaryItemPreflightProperties {
+    pub item_id: u32,
+    pub av1c: Av1CodecConfigurationBox,
+    pub ispe: ImageSpatialExtentsProperty,
+    pub pixi: Option<PixelInformationProperty>,
+    pub colr: PrimaryItemColorProperties,
+}
+
 /// Parsed primary HEIC properties needed before decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicPrimaryItemProperties {
@@ -3373,7 +3383,12 @@ pub fn parse_primary_item_transform_properties(
     let resolved = meta
         .resolve_primary_item()
         .map_err(ParsePrimaryItemTransformPropertiesError::ResolvePrimaryItem)?;
+    parse_primary_item_transform_properties_from_resolved_graph(&resolved)
+}
 
+pub(crate) fn parse_primary_item_transform_properties_from_resolved_graph(
+    resolved: &ResolvedPrimaryItemGraph<'_>,
+) -> Result<PrimaryItemTransformProperties, ParsePrimaryItemTransformPropertiesError> {
     let mut transforms = Vec::new();
     for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type;
@@ -3411,11 +3426,10 @@ pub fn parse_primary_item_transform_properties(
 pub fn parse_primary_avif_item_properties(
     input: &[u8],
 ) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
-    // Provenance: mirrors av1C/ispe/pixi/colr parse semantics and AVIF decoder
-    // preconditions from libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
-    // libheif/libheif/box.cc:Box_ispe::parse, libheif/libheif/box.cc:Box_pixi::parse,
-    // libheif/libheif/nclx.cc:Box_colr::parse, and
-    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder.
+    // Provenance: mirrors strict av1C/ispe/pixi/colr parse semantics from
+    // libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
+    // libheif/libheif/box.cc:{Box_ispe::parse,Box_pixi::parse},
+    // and libheif/libheif/nclx.cc:Box_colr::parse.
     let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
         .ok_or(ParsePrimaryAvifPropertiesError::MissingMetaBox)?;
@@ -3428,9 +3442,32 @@ pub fn parse_primary_avif_item_properties(
     parse_primary_avif_item_properties_from_resolved_graph(&resolved)
 }
 
-pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
+/// Parse and validate primary AVIF properties used by decode preflight.
+pub fn parse_primary_avif_item_preflight_properties(
+    input: &[u8],
+) -> Result<AvifPrimaryItemPreflightProperties, ParsePrimaryAvifPropertiesError> {
+    // Provenance: AVIF preflight behavior mirrors
+    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder
+    // and property parsing from libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
+    // libheif/libheif/box.cc:{Box_ispe::parse,Box_pixi::parse},
+    // and libheif/libheif/nclx.cc:Box_colr::parse.
+    // AVIF preflight accepts missing pixi when av1C/ispe are present so decoder
+    // stream assembly can proceed, matching libheif's av1C-driven decode bootstrap.
+    let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ParsePrimaryAvifPropertiesError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ParsePrimaryAvifPropertiesError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ParsePrimaryAvifPropertiesError::ResolvePrimaryItem)?;
+    parse_primary_avif_item_preflight_properties_from_resolved_graph(&resolved)
+}
+
+pub(crate) fn parse_primary_avif_item_preflight_properties_from_resolved_graph(
     resolved: &ResolvedPrimaryItemGraph<'_>,
-) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
+) -> Result<AvifPrimaryItemPreflightProperties, ParsePrimaryAvifPropertiesError> {
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
         .primary_item
@@ -3514,10 +3551,6 @@ pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
         item_id,
         property_type: FourCc::new(ISPE_BOX_TYPE),
     })?;
-    let pixi = pixi.ok_or(ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
-        item_id,
-        property_type: FourCc::new(PIXI_BOX_TYPE),
-    })?;
 
     if ispe.width == 0 || ispe.height == 0 {
         return Err(ParsePrimaryAvifPropertiesError::InvalidImageExtent {
@@ -3526,30 +3559,52 @@ pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
             height: ispe.height,
         });
     }
-    if pixi.bits_per_channel.is_empty() {
-        return Err(ParsePrimaryAvifPropertiesError::InvalidPixiChannelCount {
-            item_id,
-            channel_count: 0,
-        });
-    }
-    if let Some((channel_index, _)) = pixi
-        .bits_per_channel
-        .iter()
-        .enumerate()
-        .find(|(_, bits)| **bits == 0)
-    {
-        return Err(ParsePrimaryAvifPropertiesError::InvalidPixiBitsPerChannel {
-            item_id,
-            channel_index,
-        });
+    if let Some(pixi) = &pixi {
+        if pixi.bits_per_channel.is_empty() {
+            return Err(ParsePrimaryAvifPropertiesError::InvalidPixiChannelCount {
+                item_id,
+                channel_count: 0,
+            });
+        }
+        if let Some((channel_index, _)) = pixi
+            .bits_per_channel
+            .iter()
+            .enumerate()
+            .find(|(_, bits)| **bits == 0)
+        {
+            return Err(ParsePrimaryAvifPropertiesError::InvalidPixiBitsPerChannel {
+                item_id,
+                channel_index,
+            });
+        }
     }
 
-    Ok(AvifPrimaryItemProperties {
+    Ok(AvifPrimaryItemPreflightProperties {
         item_id,
         av1c,
         ispe,
         pixi,
         colr,
+    })
+}
+
+pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
+    resolved: &ResolvedPrimaryItemGraph<'_>,
+) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
+    let preflight = parse_primary_avif_item_preflight_properties_from_resolved_graph(resolved)?;
+    let pixi = preflight
+        .pixi
+        .ok_or(ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
+            item_id: preflight.item_id,
+            property_type: FourCc::new(PIXI_BOX_TYPE),
+        })?;
+
+    Ok(AvifPrimaryItemProperties {
+        item_id: preflight.item_id,
+        av1c: preflight.av1c,
+        ispe: preflight.ispe,
+        pixi,
+        colr: preflight.colr,
     })
 }
 
@@ -6852,22 +6907,22 @@ mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data,
         extract_primary_heic_item_data_with_grid, extract_primary_uncompressed_item_data,
-        parse_boxes, parse_primary_avif_item_properties,
-        parse_primary_heic_item_preflight_properties, parse_primary_heic_item_properties,
-        parse_primary_item_transform_properties, parse_primary_uncompressed_item_properties,
-        BoxIter, ColorInformation, ComponentDefinition, ComponentDefinitionProperty,
-        ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc, HeicPrimaryItemDataWithGrid,
-        IccColorProfile, ImageCleanApertureProperty, ImageMirrorDirection, ImageMirrorProperty,
-        ImageRotationProperty, ItemLocationField, NclxColorProfile,
-        ParseAv1CodecConfigurationBoxError, ParseBoxError, ParseColorInformationPropertyError,
-        ParseFileTypeBoxError, ParseFullBoxError, ParseHevcDecoderConfigurationBoxError,
-        ParseImageCleanAperturePropertyError, ParseImageMirrorPropertyError,
-        ParseImageRotationPropertyError, ParseImageSpatialExtentsPropertyError,
-        ParseItemInfoBoxError, ParseItemInfoEntryBoxError, ParseItemLocationBoxError,
-        ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
-        ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
-        ParsePixelInformationPropertyError, ParsePrimaryAvifPropertiesError,
-        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
+        parse_boxes, parse_primary_avif_item_preflight_properties,
+        parse_primary_avif_item_properties, parse_primary_heic_item_preflight_properties,
+        parse_primary_heic_item_properties, parse_primary_item_transform_properties,
+        parse_primary_uncompressed_item_properties, BoxIter, ColorInformation, ComponentDefinition,
+        ComponentDefinitionProperty, ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc,
+        HeicPrimaryItemDataWithGrid, IccColorProfile, ImageCleanApertureProperty,
+        ImageMirrorDirection, ImageMirrorProperty, ImageRotationProperty, ItemLocationField,
+        NclxColorProfile, ParseAv1CodecConfigurationBoxError, ParseBoxError,
+        ParseColorInformationPropertyError, ParseFileTypeBoxError, ParseFullBoxError,
+        ParseHevcDecoderConfigurationBoxError, ParseImageCleanAperturePropertyError,
+        ParseImageMirrorPropertyError, ParseImageRotationPropertyError,
+        ParseImageSpatialExtentsPropertyError, ParseItemInfoBoxError, ParseItemInfoEntryBoxError,
+        ParseItemLocationBoxError, ParseItemPropertiesBoxError,
+        ParseItemPropertyAssociationBoxError, ParseItemPropertyContainerBoxError,
+        ParseItemReferenceBoxError, ParseMetaBoxError, ParsePixelInformationPropertyError,
+        ParsePrimaryAvifPropertiesError, ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
         ParsePrimaryUncompressedPropertiesError, PrimaryItemColorProperties,
         PrimaryItemTransformProperty, ResolvePrimaryItemGraphError, UncompressedFrameComponent,
         BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
@@ -8916,6 +8971,30 @@ mod tests {
                 property_type: FourCc::new(*b"pixi"),
             }
         );
+    }
+
+    #[test]
+    fn parses_primary_avif_preflight_properties_without_pixi() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // all size fields are zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let properties = vec![make_av1c_property(), make_ispe_property(640, 480)];
+        let meta = make_primary_avif_meta_with_properties(iloc, &properties, &[]);
+        let preflight = parse_primary_avif_item_preflight_properties(&meta)
+            .expect("missing pixi should still parse for AVIF decoder preflight");
+
+        assert_eq!(preflight.item_id, 1);
+        assert!(preflight.av1c.marker);
+        assert_eq!(preflight.ispe.width, 640);
+        assert_eq!(preflight.ispe.height, 480);
+        assert!(preflight.pixi.is_none());
+        assert_eq!(preflight.colr, PrimaryItemColorProperties::default());
     }
 
     #[test]

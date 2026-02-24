@@ -1184,11 +1184,20 @@ fn decode_primary_avif_to_image_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedAvifImage, DecodeAvifError> {
+    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)?;
+    decode_primary_avif_to_image_from_resolved_graph(input, source, &meta, &resolved)
+}
+
+fn decode_primary_avif_to_image_from_resolved_graph(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'_>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
+) -> Result<DecodedAvifImage, DecodeAvifError> {
     // Provenance: mirrors libheif configuration+payload bitstream assembly in
     // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
     // AVIF configuration extraction in
     // libheif/libheif/codecs/avif_dec.cc:Decoder_AVIF::read_bitstream_configuration_data.
-    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)?;
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
         .primary_item
@@ -1206,55 +1215,35 @@ fn decode_primary_avif_to_image_internal(
     let (_, payload) = isobmff::extract_avif_item_payload_from_location(
         input,
         source,
-        &meta,
+        meta,
         &resolved.primary_item.location,
         item_id,
     )?;
-    let mut ycbcr_range = YCbCrRange::Full;
-    let mut ycbcr_matrix = YCbCrMatrixCoefficients::default();
-    let (elementary_stream, expected_geometry) =
-        match isobmff::parse_primary_avif_item_properties_from_resolved_graph(&resolved) {
-            Ok(properties) => {
-                ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
-                ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
-                let mut stream = properties.av1c.config_obus.clone();
-                stream.extend_from_slice(&payload);
-                (
-                    stream,
-                    Some((properties.ispe.width, properties.ispe.height)),
-                )
-            }
-            Err(isobmff::ParsePrimaryAvifPropertiesError::MissingRequiredProperty {
-                property_type,
-                ..
-            }) if property_type.as_bytes() == *b"pixi" => {
-                // Some valid AVIF assets (including libheif/examples/example.avif)
-                // omit pixi; keep decode progress by feeding the coded payload
-                // directly to the AV1 decoder and deriving geometry from the frame.
-                (payload, None)
-            }
-            Err(err) => return Err(DecodeAvifError::ParsePrimaryProperties(err)),
-        };
+    let properties =
+        isobmff::parse_primary_avif_item_preflight_properties_from_resolved_graph(resolved)
+            .map_err(DecodeAvifError::ParsePrimaryProperties)?;
+    let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
+    let ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
+    let mut elementary_stream = properties.av1c.config_obus;
+    elementary_stream.extend_from_slice(&payload);
 
     let mut decoded = decode_av1_bitstream_to_image(&elementary_stream)?;
     decoded.ycbcr_range = ycbcr_range;
     decoded.ycbcr_matrix = ycbcr_matrix;
-    if let Some((expected_width, expected_height)) = expected_geometry {
-        if decoded.width != expected_width || decoded.height != expected_height {
-            return Err(DecodeAvifError::DecodedGeometryMismatch {
-                expected_width,
-                expected_height,
-                actual_width: decoded.width,
-                actual_height: decoded.height,
-            });
-        }
+    if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
+        return Err(DecodeAvifError::DecodedGeometryMismatch {
+            expected_width: properties.ispe.width,
+            expected_height: properties.ispe.height,
+            actual_width: decoded.width,
+            actual_height: decoded.height,
+        });
     }
 
     decoded.alpha_plane = decode_primary_avif_auxiliary_alpha_plane(
         input,
         source,
-        &meta,
-        &resolved,
+        meta,
+        resolved,
         decoded.width,
         decoded.height,
     );
@@ -5231,10 +5220,23 @@ fn decode_avif_bytes_to_rgba(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let transforms = isobmff::parse_primary_item_transform_properties(input)
+    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
+        .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_avif_to_rgba_from_resolved_graph(input, &mut source, &meta, &resolved, guardrails)
+}
+
+fn decode_avif_to_rgba_from_resolved_graph(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'_>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let transforms = isobmff::parse_primary_item_transform_properties_from_resolved_graph(resolved)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
-    let icc_profile = primary_icc_profile_from_avif(input);
-    let decoded = decode_primary_avif_to_image(input)?;
+    let icc_profile = primary_icc_profile_from_resolved_avif_graph(resolved);
+    let decoded = decode_primary_avif_to_image_from_resolved_graph(input, source, meta, resolved)?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
@@ -5244,13 +5246,10 @@ fn decode_avif_source_to_rgba<S: RandomAccessSource>(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let transforms = isobmff::parse_primary_item_transform_properties(input)
-        .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
-    let icc_profile = primary_icc_profile_from_avif(input);
+    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
+        .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
     let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
-    let decoded = decode_primary_avif_to_image_internal(input, &mut source)?;
-    guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-    decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
+    decode_avif_to_rgba_from_resolved_graph(input, &mut source, &meta, &resolved, guardrails)
 }
 
 fn decode_heif_bytes_to_rgba(
@@ -5928,13 +5927,23 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     decode_path_to_png(input_path, output_path)
 }
 
-fn primary_icc_profile_from_avif(input: &[u8]) -> Option<Vec<u8>> {
+fn primary_icc_profile_from_resolved_avif_graph(
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
+) -> Option<Vec<u8>> {
     // Provenance: primary-item colr extraction follows libheif item-property
     // traversal in libheif/libheif/context.cc, with colr payload parsing from
     // libheif/libheif/nclx.cc:Box_colr::parse.
-    isobmff::parse_primary_avif_item_properties(input)
-        .ok()
-        .and_then(|properties| properties.colr.icc.map(|profile| profile.profile))
+    let mut icc_profile = None;
+    for property in &resolved.primary_item.properties {
+        if property.property.header.box_type.as_bytes() != *b"colr" {
+            continue;
+        }
+        let parsed_colr = property.property.parse_colr().ok()?;
+        if let isobmff::ColorInformation::Icc(profile) = parsed_colr.information {
+            icc_profile = Some(profile.profile);
+        }
+    }
+    icc_profile
 }
 
 fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
