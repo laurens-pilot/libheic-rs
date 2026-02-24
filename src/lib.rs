@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::Seek;
 use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
 #[cfg(feature = "image-integration")]
@@ -84,6 +84,14 @@ pub enum DecodeGuardrailError {
         attempted_bytes: u64,
         max_temp_spool_bytes: u64,
     },
+    TempSpoolDirectoryCreateFailed {
+        directory: PathBuf,
+        io_error_kind: std::io::ErrorKind,
+    },
+    TempSpoolDirectoryOpenFailed {
+        directory: PathBuf,
+        io_error_kind: std::io::ErrorKind,
+    },
 }
 
 impl DecodeGuardrailError {
@@ -117,6 +125,22 @@ impl Display for DecodeGuardrailError {
             } => write!(
                 f,
                 "non-seek input exceeds configured max_temp_spool_bytes while spooling: attempted {attempted_bytes} bytes, max is {max_temp_spool_bytes}"
+            ),
+            DecodeGuardrailError::TempSpoolDirectoryCreateFailed {
+                directory,
+                io_error_kind,
+            } => write!(
+                f,
+                "failed to create configured temp_spool_directory {} while spooling non-seek input: {io_error_kind}",
+                directory.display()
+            ),
+            DecodeGuardrailError::TempSpoolDirectoryOpenFailed {
+                directory,
+                io_error_kind,
+            } => write!(
+                f,
+                "failed to open temp spool file in configured temp_spool_directory {} while spooling non-seek input: {io_error_kind}",
+                directory.display()
             ),
         }
     }
@@ -5570,7 +5594,7 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
 }
 
 /// Configurable decode guardrails for bounded ingestion.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeGuardrails {
     /// Optional maximum accepted input size in bytes for all decode entry points.
     pub max_input_bytes: Option<u64>,
@@ -5578,10 +5602,12 @@ pub struct DecodeGuardrails {
     pub max_pixels: Option<u64>,
     /// Optional cap for bytes spooled from non-seek `Read`/`BufRead` inputs.
     pub max_temp_spool_bytes: Option<u64>,
+    /// Optional directory used for non-seek temp spooling.
+    pub temp_spool_directory: Option<PathBuf>,
 }
 
 impl DecodeGuardrails {
-    fn enforce_input_bytes(self, actual_bytes: u64) -> Result<(), DecodeError> {
+    fn enforce_input_bytes(&self, actual_bytes: u64) -> Result<(), DecodeError> {
         if let Some(max_input_bytes) = self.max_input_bytes {
             if actual_bytes > max_input_bytes {
                 return Err(DecodeGuardrailError::InputTooLarge {
@@ -5594,7 +5620,7 @@ impl DecodeGuardrails {
         Ok(())
     }
 
-    fn enforce_pixel_count(self, width: u32, height: u32) -> Result<(), DecodeError> {
+    fn enforce_pixel_count(&self, width: u32, height: u32) -> Result<(), DecodeError> {
         if let Some(max_pixels) = self.max_pixels {
             let actual_pixels = u64::from(width) * u64::from(height);
             if actual_pixels > max_pixels {
@@ -5610,9 +5636,10 @@ impl DecodeGuardrails {
         Ok(())
     }
 
-    fn temp_spool_options(self) -> TempFileSpoolOptions {
+    fn temp_spool_options(&self) -> TempFileSpoolOptions {
         TempFileSpoolOptions {
             max_spool_bytes: self.max_temp_spool_bytes,
+            spool_directory: self.temp_spool_directory.clone(),
         }
     }
 }
@@ -5669,6 +5696,20 @@ fn decode_error_from_source_read_error(err: SourceReadError) -> DecodeError {
             max_temp_spool_bytes: max_allowed,
         }
         .into(),
+        SourceReadError::SpoolDirectoryCreateFailed { directory, source } => {
+            DecodeGuardrailError::TempSpoolDirectoryCreateFailed {
+                directory,
+                io_error_kind: source.kind(),
+            }
+            .into()
+        }
+        SourceReadError::SpoolDirectoryOpenFailed { directory, source } => {
+            DecodeGuardrailError::TempSpoolDirectoryOpenFailed {
+                directory,
+                io_error_kind: source.kind(),
+            }
+            .into()
+        }
         SourceReadError::RangeOverflow { .. } | SourceReadError::OutOfBounds { .. } => {
             DecodeError::Unsupported(err.to_string())
         }
@@ -8474,6 +8515,8 @@ mod tests {
     use scuffle_h265::NALUnitType;
     use std::io::{BufReader, Cursor};
     use std::ops::Range;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -8693,6 +8736,7 @@ mod tests {
                 max_input_bytes: Some(input_bytes - 1),
                 max_pixels: None,
                 max_temp_spool_bytes: None,
+                temp_spool_directory: None,
             },
         )
         .expect_err("bytes decode should fail when max_input_bytes is too small");
@@ -8720,6 +8764,7 @@ mod tests {
                 max_input_bytes: Some(input_bytes - 1),
                 max_pixels: None,
                 max_temp_spool_bytes: None,
+                temp_spool_directory: None,
             },
         )
         .expect_err("seekable path decode should fail when max_input_bytes is too small");
@@ -8741,6 +8786,7 @@ mod tests {
                 max_input_bytes: None,
                 max_pixels: None,
                 max_temp_spool_bytes: Some(16),
+                temp_spool_directory: None,
             },
         )
         .expect_err("non-seek decode should fail when max_temp_spool_bytes is exceeded");
@@ -8755,6 +8801,80 @@ mod tests {
     }
 
     #[test]
+    fn decode_read_guardrail_reports_temp_spool_directory_create_failures() {
+        let spool_directory =
+            test_output_png_path("guardrail-spool-dir-create").with_extension("dir");
+        std::fs::write(&spool_directory, b"not-a-directory")
+            .expect("fixture file should be writable for create-dir failure");
+        let _guard = TempFileGuard(spool_directory.clone());
+
+        let err = decode_read_to_rgba_with_guardrails(
+            Cursor::new(vec![0x9D_u8; 8]),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err("non-seek decode should report configured temp_spool_directory create errors");
+
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolDirectoryCreateFailed {
+                directory,
+                io_error_kind,
+            }) if directory == spool_directory && io_error_kind == std::io::ErrorKind::AlreadyExists
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_read_guardrail_reports_temp_spool_directory_open_failures() {
+        let spool_directory =
+            test_output_png_path("guardrail-spool-dir-open").with_extension("dir");
+        std::fs::create_dir_all(&spool_directory)
+            .expect("spool directory fixture should be created");
+
+        let mut read_only = std::fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(&spool_directory, read_only)
+            .expect("spool directory should be set to read-only");
+
+        let err = decode_read_to_rgba_with_guardrails(
+            Cursor::new(vec![0xA7_u8; 8]),
+            DecodeGuardrails {
+                max_input_bytes: None,
+                max_pixels: None,
+                max_temp_spool_bytes: None,
+                temp_spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err("non-seek decode should report configured temp_spool_directory open errors");
+
+        assert_eq!(err.category(), DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            err,
+            DecodeError::Guardrail(DecodeGuardrailError::TempSpoolDirectoryOpenFailed {
+                directory,
+                io_error_kind,
+            }) if directory == spool_directory && io_error_kind == std::io::ErrorKind::PermissionDenied
+        ));
+
+        let mut writable = std::fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        writable.set_mode(0o700);
+        std::fs::set_permissions(&spool_directory, writable)
+            .expect("spool directory permissions should be restorable for cleanup");
+        std::fs::remove_dir_all(&spool_directory)
+            .expect("spool directory fixture should be removable after open failure test");
+    }
+
+    #[test]
     fn decode_bytes_guardrail_rejects_avif_images_larger_than_max_pixels() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
@@ -8766,6 +8886,7 @@ mod tests {
                 max_input_bytes: None,
                 max_pixels: Some(1),
                 max_temp_spool_bytes: None,
+                temp_spool_directory: None,
             },
         )
         .expect_err("bytes decode should fail when max_pixels is too small");
@@ -8794,6 +8915,7 @@ mod tests {
                 max_input_bytes: None,
                 max_pixels: Some(1),
                 max_temp_spool_bytes: None,
+                temp_spool_directory: None,
             },
         )
         .expect_err("path decode should fail when max_pixels is too small for HEIC");
@@ -8822,6 +8944,7 @@ mod tests {
                 max_input_bytes: None,
                 max_pixels: Some(1),
                 max_temp_spool_bytes: None,
+                temp_spool_directory: None,
             },
         )
         .expect_err("path decode should fail when max_pixels is too small for uncompressed HEIF");

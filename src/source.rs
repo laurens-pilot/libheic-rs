@@ -58,6 +58,14 @@ pub enum SourceReadError {
         attempted: u64,
         max_allowed: u64,
     },
+    SpoolDirectoryCreateFailed {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
+    SpoolDirectoryOpenFailed {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl Display for SourceReadError {
@@ -93,6 +101,16 @@ impl Display for SourceReadError {
                 f,
                 "temp spool limit exceeded while ingesting non-seek input: attempted {attempted} bytes, max allowed is {max_allowed}"
             ),
+            SourceReadError::SpoolDirectoryCreateFailed { directory, source } => write!(
+                f,
+                "failed to create configured temp spool directory {}: {source}",
+                directory.display()
+            ),
+            SourceReadError::SpoolDirectoryOpenFailed { directory, source } => write!(
+                f,
+                "failed to open temp spool file in configured directory {}: {source}",
+                directory.display()
+            ),
         }
     }
 }
@@ -101,16 +119,20 @@ impl Error for SourceReadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             SourceReadError::Io { source, .. } => Some(source),
+            SourceReadError::SpoolDirectoryCreateFailed { source, .. } => Some(source),
+            SourceReadError::SpoolDirectoryOpenFailed { source, .. } => Some(source),
             _ => None,
         }
     }
 }
 
 /// Limits applied while spooling non-seek inputs into a temporary file.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TempFileSpoolOptions {
     /// Optional upper bound for total spooled bytes.
     pub max_spool_bytes: Option<u64>,
+    /// Optional directory used to create temporary spool files.
+    pub spool_directory: Option<PathBuf>,
 }
 
 fn checked_range_end(offset: u64, requested: usize) -> Result<u64, SourceReadError> {
@@ -236,22 +258,38 @@ impl FileSource {
 const TEMP_SPOOL_PREFIX: &str = "libheic-rs-spool";
 static TEMP_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn next_temp_spool_path() -> PathBuf {
+fn next_temp_spool_path(directory: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map_or(0, |duration| duration.as_nanos());
     let counter = TEMP_SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
+    directory.join(format!(
         "{TEMP_SPOOL_PREFIX}-{}-{nanos}-{counter}.bin",
         std::process::id()
     ))
 }
 
-fn create_temp_spool_file() -> Result<(PathBuf, File), SourceReadError> {
+fn create_temp_spool_file(
+    options: &TempFileSpoolOptions,
+) -> Result<(PathBuf, File), SourceReadError> {
+    let spool_directory = options
+        .spool_directory
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    let configured_directory = options.spool_directory.is_some();
+    if configured_directory {
+        std::fs::create_dir_all(&spool_directory).map_err(|source| {
+            SourceReadError::SpoolDirectoryCreateFailed {
+                directory: spool_directory.clone(),
+                source,
+            }
+        })?;
+    }
+
     let mut last_already_exists: Option<std::io::Error> = None;
     for _ in 0..32 {
-        let path = next_temp_spool_path();
+        let path = next_temp_spool_path(&spool_directory);
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -263,26 +301,41 @@ fn create_temp_spool_file() -> Result<(PathBuf, File), SourceReadError> {
                 last_already_exists = Some(source);
             }
             Err(source) => {
-                return Err(SourceReadError::Io {
-                    operation: "temp-spool-open",
-                    offset: 0,
-                    requested: 0,
-                    source,
+                return Err(if configured_directory {
+                    SourceReadError::SpoolDirectoryOpenFailed {
+                        directory: spool_directory.clone(),
+                        source,
+                    }
+                } else {
+                    SourceReadError::Io {
+                        operation: "temp-spool-open",
+                        offset: 0,
+                        requested: 0,
+                        source,
+                    }
                 });
             }
         }
     }
 
-    Err(SourceReadError::Io {
-        operation: "temp-spool-open",
-        offset: 0,
-        requested: 0,
-        source: last_already_exists.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "failed to create unique temp spool path",
-            )
-        }),
+    let source = last_already_exists.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to create unique temp spool path",
+        )
+    });
+    Err(if configured_directory {
+        SourceReadError::SpoolDirectoryOpenFailed {
+            directory: spool_directory,
+            source,
+        }
+    } else {
+        SourceReadError::Io {
+            operation: "temp-spool-open",
+            offset: 0,
+            requested: 0,
+            source,
+        }
     })
 }
 
@@ -306,7 +359,7 @@ impl TempFileSpoolSource {
         mut input_reader: R,
         options: TempFileSpoolOptions,
     ) -> Result<Self, SourceReadError> {
-        let (path, mut spool_file) = create_temp_spool_file()?;
+        let (path, mut spool_file) = create_temp_spool_file(&options)?;
         let spool_result = (|| {
             let mut bytes_written = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
@@ -414,6 +467,8 @@ mod tests {
     };
     use std::fs;
     use std::io::{Cursor, Read, Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -644,6 +699,7 @@ mod tests {
             Cursor::new(vec![0xA5_u8; 17]),
             TempFileSpoolOptions {
                 max_spool_bytes: Some(16),
+                spool_directory: None,
             },
         )
         .expect_err("spool source should reject inputs that exceed max_spool_bytes");
@@ -657,5 +713,106 @@ mod tests {
             }
             other => panic!("expected SpoolLimitExceeded error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn temp_file_spool_source_uses_configured_spool_directory() {
+        let spool_directory = unique_temp_path();
+        let mut source = TempFileSpoolSource::from_reader_with_options(
+            Cursor::new(b"spooled-heif".to_vec()),
+            TempFileSpoolOptions {
+                max_spool_bytes: None,
+                spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect("temp spool source should initialize in configured directory");
+        let path = source.spool_path().to_path_buf();
+        assert_eq!(
+            path.parent(),
+            Some(spool_directory.as_path()),
+            "spool file should be created under configured directory"
+        );
+        assert!(
+            path.exists(),
+            "spool file should exist while source is alive"
+        );
+
+        let mut output = [0_u8; 6];
+        source
+            .read_exact_at(2, &mut output)
+            .expect("temp spool source should serve random-access reads");
+        assert_eq!(&output, b"ooled-");
+
+        drop(source);
+        assert!(!path.exists(), "spool file should be removed after drop");
+        fs::remove_dir_all(&spool_directory)
+            .expect("configured spool directory should be removable after cleanup");
+    }
+
+    #[test]
+    fn temp_file_spool_source_reports_spool_directory_create_failures() {
+        let spool_directory = unique_temp_path();
+        fs::write(&spool_directory, b"not-a-directory")
+            .expect("fixture file should be writable for create-dir failure");
+
+        let err = TempFileSpoolSource::from_reader_with_options(
+            Cursor::new(vec![0x5A_u8; 8]),
+            TempFileSpoolOptions {
+                max_spool_bytes: None,
+                spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err("spool source should report configured directory create failures");
+
+        match err {
+            SourceReadError::SpoolDirectoryCreateFailed { directory, source } => {
+                assert_eq!(directory, spool_directory);
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("expected SpoolDirectoryCreateFailed error, got {other:?}"),
+        }
+
+        fs::remove_file(&spool_directory)
+            .expect("fixture file should be removable after create-dir failure test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_spool_source_reports_spool_directory_open_failures() {
+        let spool_directory = unique_temp_path();
+        fs::create_dir_all(&spool_directory).expect("spool directory fixture should be created");
+
+        let mut read_only = fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        read_only.set_mode(0o500);
+        fs::set_permissions(&spool_directory, read_only)
+            .expect("spool directory permissions should be set to read-only");
+
+        let err = TempFileSpoolSource::from_reader_with_options(
+            Cursor::new(vec![0xC3_u8; 8]),
+            TempFileSpoolOptions {
+                max_spool_bytes: None,
+                spool_directory: Some(spool_directory.clone()),
+            },
+        )
+        .expect_err("spool source should report configured directory open failures");
+
+        match err {
+            SourceReadError::SpoolDirectoryOpenFailed { directory, source } => {
+                assert_eq!(directory, spool_directory);
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected SpoolDirectoryOpenFailed error, got {other:?}"),
+        }
+
+        let mut writable = fs::metadata(&spool_directory)
+            .expect("spool directory metadata should be readable")
+            .permissions();
+        writable.set_mode(0o700);
+        fs::set_permissions(&spool_directory, writable)
+            .expect("spool directory permissions should be restorable for cleanup");
+        fs::remove_dir_all(&spool_directory)
+            .expect("spool directory fixture should be removable after open-failure test");
     }
 }
