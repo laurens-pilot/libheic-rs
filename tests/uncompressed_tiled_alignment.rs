@@ -330,6 +330,65 @@ fn decodes_tile_component_yuv_tiled_fixture() {
 }
 
 #[test]
+fn decodes_component_interleave_yuv_422_fixture() {
+    let input = read_fixture("../libheif/tests/data/uncompressed_comp_YUV_422.heif");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("component-interleave YUV 4:2:2 fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 0,
+        "expected component interleave"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 1, "expected 4:2:2 sampling");
+    assert_eq!(properties.unc_c.components.len(), 3);
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("component-interleave YUV 4:2:2 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (32, 20));
+    assert_eq!(decoded.bit_depth, 8);
+
+    let p00 = rgba_pixel_at(&decoded.rgba, decoded.width, 0, 0);
+    let p10 = rgba_pixel_at(&decoded.rgba, decoded.width, 1, 0);
+    let p01 = rgba_pixel_at(&decoded.rgba, decoded.width, 0, 1);
+    assert_eq!(p00, [253, 1, 0, 255]);
+    assert_eq!(p00, p10);
+    assert_eq!(p00, p01);
+
+    let p40 = rgba_pixel_at(&decoded.rgba, decoded.width, 4, 0);
+    let p50 = rgba_pixel_at(&decoded.rgba, decoded.width, 5, 0);
+    assert_eq!(p40, [0, 129, 0, 255]);
+    assert_eq!(p40, p50);
+}
+
+#[test]
+fn decodes_component_interleave_y16u16v16_420_fixture() {
+    let input = read_fixture("../libheif/tests/data/uncompressed_comp_Y16U16V16_420.heif");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("component-interleave Y16U16V16 4:2:0 fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 0,
+        "expected component interleave"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 2, "expected 4:2:0 sampling");
+    assert_eq!(properties.unc_c.components.len(), 3);
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("component-interleave Y16U16V16 4:2:0 fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (32, 20));
+    assert_eq!(decoded.bit_depth, 16);
+
+    let p00 = rgba_pixel_at(&decoded.rgba, decoded.width, 0, 0);
+    assert_eq!(p00, rgba_pixel_at(&decoded.rgba, decoded.width, 1, 0));
+    assert_eq!(p00, rgba_pixel_at(&decoded.rgba, decoded.width, 0, 1));
+    assert_eq!(p00, rgba_pixel_at(&decoded.rgba, decoded.width, 1, 1));
+
+    let p40 = rgba_pixel_at(&decoded.rgba, decoded.width, 4, 0);
+    assert_eq!(p40, rgba_pixel_at(&decoded.rgba, decoded.width, 5, 0));
+    assert_eq!(p40, rgba_pixel_at(&decoded.rgba, decoded.width, 4, 1));
+    assert_eq!(p40, rgba_pixel_at(&decoded.rgba, decoded.width, 5, 1));
+    assert_ne!(p00, p40);
+}
+
+#[test]
 fn decodes_tiled_r5g6b5_component_fixture_without_mixed_depth_double_scaling() {
     let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_comp_R5G6B5_tiled.heic");
     let decoded = decode_primary_uncompressed_to_image(&input)

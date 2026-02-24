@@ -1132,6 +1132,14 @@ struct UncompressedTileDecodeLayout {
     tile_align_size: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UncompressedComponentDecodeParams {
+    row_align_size: u32,
+    tile_align_size: u32,
+    sampling_type: u8,
+    per_component_tile_alignment: bool,
+}
+
 struct UncompressedBitReader<'a> {
     data: &'a [u8],
     bit_offset: usize,
@@ -1482,13 +1490,18 @@ pub fn decode_primary_uncompressed_to_image(
         }
     }
 
-    if sampling_type != UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING {
-        return Err(DecodeUncompressedError::UnsupportedFeature {
-            detail: format!(
-                "unsupported uncC sampling_type {sampling_type}; baseline supports only no-subsampling"
-            ),
-        });
-    }
+    let (ycbcr_subsample_x, ycbcr_subsample_y) = match sampling_type {
+        UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => (1_usize, 1_usize),
+        UNCOMPRESSED_SAMPLING_422 => (2_usize, 1_usize),
+        UNCOMPRESSED_SAMPLING_420 => (2_usize, 2_usize),
+        _ => {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "unsupported uncC sampling_type {sampling_type}; baseline currently supports no-subsampling, 4:2:2, and 4:2:0"
+                ),
+            });
+        }
+    };
     if !matches!(
         interleave_type,
         UNCOMPRESSED_INTERLEAVE_COMPONENT
@@ -1655,6 +1668,66 @@ pub fn decode_primary_uncompressed_to_image(
                     .to_string(),
         });
     }
+    if sampling_type != UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING {
+        if !has_full_ycbcr {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC sampling_type {sampling_type} requires full YCbCr channels (Y/Cb/Cr) in this decoder path"
+                ),
+            });
+        }
+        if !matches!(
+            interleave_type,
+            UNCOMPRESSED_INTERLEAVE_COMPONENT | UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT
+        ) {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC sampling_type {sampling_type} currently supports only component and tile-component interleave"
+                ),
+            });
+        }
+        if width_usize % ycbcr_subsample_x != 0 || height_usize % ycbcr_subsample_y != 0 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncC sampling_type {sampling_type} requires image extent {width}x{height} to be divisible by {}x{}",
+                    ycbcr_subsample_x, ycbcr_subsample_y
+                ),
+            });
+        }
+        if tile_width_usize % ycbcr_subsample_x != 0 || tile_height_usize % ycbcr_subsample_y != 0 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncC sampling_type {sampling_type} requires tile extent {tile_width}x{tile_height} to be divisible by {}x{}",
+                    ycbcr_subsample_x, ycbcr_subsample_y
+                ),
+            });
+        }
+        if properties.unc_c.row_align_size != 0 && properties.unc_c.row_align_size % 2 != 0 {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC sampling_type {sampling_type} requires even row_align_size when non-zero"
+                ),
+            });
+        }
+        if sampling_type == UNCOMPRESSED_SAMPLING_422
+            && properties.unc_c.tile_align_size != 0
+            && properties.unc_c.tile_align_size % 2 != 0
+        {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: "uncC sampling_type 1 requires tile_align_size to be a multiple of 2 when non-zero"
+                    .to_string(),
+            });
+        }
+        if sampling_type == UNCOMPRESSED_SAMPLING_420
+            && properties.unc_c.tile_align_size != 0
+            && properties.unc_c.tile_align_size % 4 != 0
+        {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: "uncC sampling_type 2 requires tile_align_size to be a multiple of 4 when non-zero"
+                    .to_string(),
+            });
+        }
+    }
 
     let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
         std::array::from_fn(|_| None);
@@ -1679,6 +1752,7 @@ pub fn decode_primary_uncompressed_to_image(
             &payload.payload,
             &component_specs,
             tile_layout,
+            sampling_type,
             &mut channel_samples,
         )?;
     } else {
@@ -1712,9 +1786,12 @@ pub fn decode_primary_uncompressed_to_image(
                         &mut reader,
                         &component_specs,
                         tile_region,
-                        properties.unc_c.row_align_size,
-                        properties.unc_c.tile_align_size,
-                        false,
+                        UncompressedComponentDecodeParams {
+                            row_align_size: properties.unc_c.row_align_size,
+                            tile_align_size: properties.unc_c.tile_align_size,
+                            sampling_type,
+                            per_component_tile_alignment: false,
+                        },
                         &mut channel_samples,
                     )?,
                     UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
@@ -1792,9 +1869,11 @@ pub fn decode_primary_uncompressed_to_image(
                 .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                     detail: "missing decoded Cr channel samples".to_string(),
                 })?;
-            // Provenance: no-subsampling uncompressed YCbCr conversion reuses
-            // libheif-aligned nclx/range-aware YCbCr->RGB conversion semantics
-            // from libheif/libheif/color-conversion/yuv2rgb.cc:
+            // Provenance: uncompressed YCbCr conversion (including 4:2:2/4:2:0
+            // component/tile-component decode after nearest-neighbor chroma
+            // expansion) reuses libheif-aligned nclx/range-aware
+            // YCbCr->RGB conversion semantics from
+            // libheif/libheif/color-conversion/yuv2rgb.cc:
             // Op_YCbCr_to_RGB::convert_colorspace.
             let y_sample = scale_uncompressed_sample_bit_depth(
                 y[pixel_index],
@@ -1898,42 +1977,140 @@ pub fn decode_primary_uncompressed_to_image(
     })
 }
 
+fn uncompressed_component_subsampling(
+    role: UncompressedChannelRole,
+    sampling_type: u8,
+) -> Result<(usize, usize), DecodeUncompressedError> {
+    match role {
+        UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
+            // Provenance: mirrors chroma plane sizing in
+            // libheif/libheif/codecs/uncompressed/unc_decoder_legacybase.cc:
+            // unc_decoder_legacybase::buildChannelListEntry.
+            match sampling_type {
+                UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => Ok((1, 1)),
+                UNCOMPRESSED_SAMPLING_422 => Ok((2, 1)),
+                UNCOMPRESSED_SAMPLING_420 => Ok((2, 2)),
+                _ => Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "unsupported uncC sampling_type {sampling_type} for Cb/Cr component decoding"
+                    ),
+                }),
+            }
+        }
+        _ => Ok((1, 1)),
+    }
+}
+
 fn decode_uncompressed_component_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
     tile_region: UncompressedDecodeTileRegion,
-    row_align_size: u32,
-    tile_align_size: u32,
-    per_component_tile_alignment: bool,
+    params: UncompressedComponentDecodeParams,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
     for spec in specs {
-        for row in 0..tile_region.height {
+        let (subsample_x, subsample_y) =
+            uncompressed_component_subsampling(spec.role, params.sampling_type)?;
+        let component_name = spec
+            .role
+            .channel_index()
+            .map(uncompressed_channel_name)
+            .unwrap_or("padded");
+        if !tile_region.width.is_multiple_of(subsample_x)
+            || !tile_region.height.is_multiple_of(subsample_y)
+        {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "{component_name} tile extent {}x{} is not divisible by subsampling {}x{}",
+                    tile_region.width, tile_region.height, subsample_x, subsample_y
+                ),
+            });
+        }
+        let component_width = tile_region.width / subsample_x;
+        let component_height = tile_region.height / subsample_y;
+        for row in 0..component_height {
             reader.mark_row_start();
-            for column in 0..tile_region.width {
+            for column in 0..component_width {
                 let sample = read_uncompressed_component_sample(reader, *spec)?;
-                let pixel_index = tile_region
-                    .origin_y
-                    .checked_add(row)
-                    .and_then(|y| y.checked_mul(tile_region.image_width))
-                    .and_then(|offset| {
-                        tile_region
-                            .origin_x
-                            .checked_add(column)
-                            .and_then(|x| offset.checked_add(x))
-                    })
+                let sample_origin_x = tile_region
+                    .origin_x
+                    .checked_add(column.checked_mul(subsample_x).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: format!(
+                                "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                tile_region.origin_x, tile_region.origin_y
+                            ),
+                        }
+                    })?)
                     .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                         detail: format!(
-                            "uncompressed component-interleave pixel index overflow at tile origin ({},{}), row={row}, column={column}",
-                            tile_region.origin_x, tile_region.origin_y,
+                            "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                            tile_region.origin_x, tile_region.origin_y
                         ),
                     })?;
-                write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
+                let sample_origin_y = tile_region
+                    .origin_y
+                    .checked_add(row.checked_mul(subsample_y).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: format!(
+                                "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                tile_region.origin_x, tile_region.origin_y
+                            ),
+                        }
+                    })?)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                            tile_region.origin_x, tile_region.origin_y
+                        ),
+                    })?;
+                for subsample_row in 0..subsample_y {
+                    let output_y = sample_origin_y.checked_add(subsample_row).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: format!(
+                                "uncompressed {component_name} sample y overflow at tile origin ({},{}), row={row}, column={column}",
+                                tile_region.origin_x, tile_region.origin_y
+                            ),
+                        }
+                    })?;
+                    let row_offset = output_y.checked_mul(tile_region.image_width).ok_or_else(
+                        || DecodeUncompressedError::InvalidInput {
+                            detail: format!(
+                                "uncompressed {component_name} row offset overflow for y={output_y} and image width {}",
+                                tile_region.image_width
+                            ),
+                        },
+                    )?;
+                    for subsample_column in 0..subsample_x {
+                        let output_x =
+                            sample_origin_x
+                                .checked_add(subsample_column)
+                                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                    detail: format!(
+                                        "uncompressed {component_name} sample x overflow at tile origin ({},{}), row={row}, column={column}",
+                                        tile_region.origin_x, tile_region.origin_y
+                                    ),
+                                })?;
+                        let pixel_index = row_offset.checked_add(output_x).ok_or_else(|| {
+                            DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed {component_name} pixel index overflow for ({output_x},{output_y})"
+                                ),
+                            }
+                        })?;
+                        write_uncompressed_component_sample(
+                            channel_samples,
+                            *spec,
+                            pixel_index,
+                            sample,
+                        )?;
+                    }
+                }
             }
-            reader.handle_row_alignment(row_align_size)?;
+            reader.handle_row_alignment(params.row_align_size)?;
         }
-        if per_component_tile_alignment {
-            reader.handle_tile_alignment(tile_align_size)?;
+        if params.per_component_tile_alignment {
+            reader.handle_tile_alignment(params.tile_align_size)?;
         }
     }
 
@@ -1944,6 +2121,7 @@ fn decode_uncompressed_tile_component_interleave(
     payload: &[u8],
     specs: &[UncompressedComponentDecodeSpec],
     tile_layout: UncompressedTileDecodeLayout,
+    sampling_type: u8,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
     // Provenance: mirrors libheif tile-component handling in
@@ -1971,6 +2149,7 @@ fn decode_uncompressed_tile_component_interleave(
             tile_layout.tile_height,
             tile_layout.row_align_size,
             tile_layout.tile_align_size,
+            sampling_type,
         )?;
         component_tile_sizes.push(component_tile_size);
         per_tile_size = per_tile_size
@@ -2082,9 +2261,12 @@ fn decode_uncompressed_tile_component_interleave(
                 &mut tile_reader,
                 specs,
                 tile_region,
-                tile_layout.row_align_size,
-                tile_layout.tile_align_size,
-                true,
+                UncompressedComponentDecodeParams {
+                    row_align_size: tile_layout.row_align_size,
+                    tile_align_size: tile_layout.tile_align_size,
+                    sampling_type,
+                    per_component_tile_alignment: true,
+                },
                 channel_samples,
             )?;
         }
@@ -2099,7 +2281,24 @@ fn uncompressed_component_tile_size_bytes(
     tile_height: usize,
     row_align_size: u32,
     tile_align_size: u32,
+    sampling_type: u8,
 ) -> Result<usize, DecodeUncompressedError> {
+    let (subsample_x, subsample_y) = uncompressed_component_subsampling(spec.role, sampling_type)?;
+    let component_name = spec
+        .role
+        .channel_index()
+        .map(uncompressed_channel_name)
+        .unwrap_or("padded");
+    if !tile_width.is_multiple_of(subsample_x) || !tile_height.is_multiple_of(subsample_y) {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "{component_name} tile extent {tile_width}x{tile_height} is not divisible by subsampling {subsample_x}x{subsample_y}"
+            ),
+        });
+    }
+    let component_tile_width = tile_width / subsample_x;
+    let component_tile_height = tile_height / subsample_y;
+
     let mut bits_per_component = usize::from(spec.bit_depth);
     if spec.component_align_size != 0 {
         let component_alignment = usize::from(spec.component_align_size);
@@ -2121,10 +2320,10 @@ fn uncompressed_component_tile_size_bytes(
     }
 
     let bits_per_row = bits_per_component
-        .checked_mul(tile_width)
+        .checked_mul(component_tile_width)
         .ok_or_else(|| DecodeUncompressedError::InvalidInput {
             detail: format!(
-                "component row bit-size overflow for tile width {tile_width} and component bit-size {bits_per_component}"
+                "component row bit-size overflow for tile width {component_tile_width} and component bit-size {bits_per_component}"
             ),
         })?;
     let mut bytes_per_row =
@@ -2146,10 +2345,10 @@ fn uncompressed_component_tile_size_bytes(
 
     let mut bytes_per_tile =
         bytes_per_row
-            .checked_mul(tile_height)
+            .checked_mul(component_tile_height)
             .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                 detail: format!(
-                    "component tile byte-size overflow for {bytes_per_row} bytes/row and tile height {tile_height}"
+                    "component tile byte-size overflow for {bytes_per_row} bytes/row and tile height {component_tile_height}"
                 ),
             })?;
     if tile_align_size != 0 {
@@ -3341,6 +3540,8 @@ const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
 const AUXC_PROPERTY_TYPE: [u8; 4] = *b"auxC";
 const HVCC_PROPERTY_TYPE: [u8; 4] = *b"hvcC";
 const UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING: u8 = 0;
+const UNCOMPRESSED_SAMPLING_422: u8 = 1;
+const UNCOMPRESSED_SAMPLING_420: u8 = 2;
 const UNCOMPRESSED_INTERLEAVE_COMPONENT: u8 = 0;
 const UNCOMPRESSED_INTERLEAVE_PIXEL: u8 = 1;
 const UNCOMPRESSED_INTERLEAVE_ROW: u8 = 3;
