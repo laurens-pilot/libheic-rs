@@ -1506,12 +1506,14 @@ pub fn decode_primary_uncompressed_to_image(
         interleave_type,
         UNCOMPRESSED_INTERLEAVE_COMPONENT
             | UNCOMPRESSED_INTERLEAVE_PIXEL
+            | UNCOMPRESSED_INTERLEAVE_MIXED
             | UNCOMPRESSED_INTERLEAVE_ROW
             | UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT
+            | UNCOMPRESSED_INTERLEAVE_MULTI_Y
     ) {
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
-                "unsupported uncC interleave_type {interleave_type}; baseline supports component/pixel/row/tile-component interleave"
+                "unsupported uncC interleave_type {interleave_type}; baseline supports component/pixel/mixed/row/tile-component/multi-y interleave"
             ),
         });
     }
@@ -1528,7 +1530,11 @@ pub fn decode_primary_uncompressed_to_image(
                     .to_string(),
         });
     }
-    if interleave_type != UNCOMPRESSED_INTERLEAVE_PIXEL && properties.unc_c.pixel_size != 0 {
+    if !matches!(
+        interleave_type,
+        UNCOMPRESSED_INTERLEAVE_PIXEL | UNCOMPRESSED_INTERLEAVE_MULTI_Y
+    ) && properties.unc_c.pixel_size != 0
+    {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!("uncC pixel_size must be zero for interleave_type {interleave_type}"),
         });
@@ -1602,11 +1608,30 @@ pub fn decode_primary_uncompressed_to_image(
 
     let mut has_channel = [false; UNCOMPRESSED_CHANNEL_COUNT];
     let mut channel_bit_depths = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
+    let mut channel_component_counts = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
     for spec in &component_specs {
         let Some(channel_index) = spec.role.channel_index() else {
             continue;
         };
         if has_channel[channel_index] {
+            let allow_duplicate = interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y
+                && channel_index == UNCOMPRESSED_CHANNEL_LUMA;
+            if allow_duplicate {
+                if channel_bit_depths[channel_index] != spec.bit_depth {
+                    return Err(DecodeUncompressedError::UnsupportedFeature {
+                        detail: format!(
+                            "uncC multi-y interleave requires duplicate luma components to use one bit depth (saw {} and {})",
+                            channel_bit_depths[channel_index], spec.bit_depth
+                        ),
+                    });
+                }
+                channel_component_counts[channel_index] = channel_component_counts[channel_index]
+                    .checked_add(1)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncompressed multi-y luma component-count overflow".to_string(),
+                    })?;
+                continue;
+            }
             return Err(DecodeUncompressedError::InvalidInput {
                 detail: format!(
                     "duplicate component mapping for {} is not supported in this baseline decoder",
@@ -1616,6 +1641,7 @@ pub fn decode_primary_uncompressed_to_image(
         }
         has_channel[channel_index] = true;
         channel_bit_depths[channel_index] = spec.bit_depth;
+        channel_component_counts[channel_index] = 1;
     }
 
     let has_monochrome = has_channel[UNCOMPRESSED_CHANNEL_MONO];
@@ -1678,13 +1704,52 @@ pub fn decode_primary_uncompressed_to_image(
         }
         if !matches!(
             interleave_type,
-            UNCOMPRESSED_INTERLEAVE_COMPONENT | UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT
+            UNCOMPRESSED_INTERLEAVE_COMPONENT
+                | UNCOMPRESSED_INTERLEAVE_MIXED
+                | UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT
+                | UNCOMPRESSED_INTERLEAVE_MULTI_Y
         ) {
             return Err(DecodeUncompressedError::UnsupportedFeature {
                 detail: format!(
-                    "uncC sampling_type {sampling_type} currently supports only component and tile-component interleave"
+                    "uncC sampling_type {sampling_type} currently supports only component/mixed/tile-component/multi-y interleave"
                 ),
             });
+        }
+        if interleave_type == UNCOMPRESSED_INTERLEAVE_MIXED
+            && (channel_component_counts[UNCOMPRESSED_CHANNEL_LUMA] != 1
+                || channel_component_counts[UNCOMPRESSED_CHANNEL_CB] != 1
+                || channel_component_counts[UNCOMPRESSED_CHANNEL_CR] != 1)
+        {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: "uncC mixed interleave currently requires one Y, one Cb, and one Cr component in decode order"
+                    .to_string(),
+            });
+        }
+        if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
+            if sampling_type != UNCOMPRESSED_SAMPLING_422 {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "uncC multi-y interleave currently supports only sampling_type {} (4:2:2)",
+                        UNCOMPRESSED_SAMPLING_422
+                    ),
+                });
+            }
+            let expected_luma_components = ycbcr_subsample_x
+                .checked_mul(ycbcr_subsample_y)
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "uncC multi-y luma component-count overflow".to_string(),
+                })?;
+            if usize::from(channel_component_counts[UNCOMPRESSED_CHANNEL_LUMA])
+                != expected_luma_components
+                || channel_component_counts[UNCOMPRESSED_CHANNEL_CB] != 1
+                || channel_component_counts[UNCOMPRESSED_CHANNEL_CR] != 1
+            {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "uncC multi-y interleave currently requires {expected_luma_components} Y components plus one Cb and one Cr component"
+                    ),
+                });
+            }
         }
         if width_usize % ycbcr_subsample_x != 0 || height_usize % ycbcr_subsample_y != 0 {
             return Err(DecodeUncompressedError::InvalidInput {
@@ -1802,11 +1867,27 @@ pub fn decode_primary_uncompressed_to_image(
                         properties.unc_c.row_align_size,
                         &mut channel_samples,
                     )?,
+                    UNCOMPRESSED_INTERLEAVE_MIXED => decode_uncompressed_mixed_interleave(
+                        &mut reader,
+                        &component_specs,
+                        tile_region,
+                        sampling_type,
+                        &mut channel_samples,
+                    )?,
                     UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
                         &mut reader,
                         &component_specs,
                         tile_region,
                         properties.unc_c.row_align_size,
+                        &mut channel_samples,
+                    )?,
+                    UNCOMPRESSED_INTERLEAVE_MULTI_Y => decode_uncompressed_multi_y_interleave(
+                        &mut reader,
+                        &component_specs,
+                        tile_region,
+                        properties.unc_c.pixel_size,
+                        properties.unc_c.row_align_size,
+                        sampling_type,
                         &mut channel_samples,
                     )?,
                     _ => unreachable!(),
@@ -2001,6 +2082,62 @@ fn uncompressed_component_subsampling(
     }
 }
 
+fn write_uncompressed_component_sample_block(
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+    spec: UncompressedComponentDecodeSpec,
+    tile_region: UncompressedDecodeTileRegion,
+    sample_origin: (usize, usize),
+    repeat: (usize, usize),
+    sample: u16,
+) -> Result<(), DecodeUncompressedError> {
+    let component_name = spec
+        .role
+        .channel_index()
+        .map(uncompressed_channel_name)
+        .unwrap_or("padded");
+    let (sample_origin_x, sample_origin_y) = sample_origin;
+    let (repeat_x, repeat_y) = repeat;
+
+    for repeat_row in 0..repeat_y {
+        let output_y = sample_origin_y
+            .checked_add(repeat_row)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncompressed {component_name} sample y overflow for origin ({sample_origin_x},{sample_origin_y})"
+                ),
+            })?;
+        let row_offset =
+            output_y
+                .checked_mul(tile_region.image_width)
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed {component_name} row offset overflow for y={output_y} and image width {}",
+                        tile_region.image_width
+                    ),
+                })?;
+        for repeat_column in 0..repeat_x {
+            let output_x = sample_origin_x
+                .checked_add(repeat_column)
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed {component_name} sample x overflow for origin ({sample_origin_x},{sample_origin_y})"
+                    ),
+                })?;
+            let pixel_index =
+                row_offset
+                    .checked_add(output_x)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed {component_name} pixel index overflow for ({output_x},{output_y})"
+                        ),
+                    })?;
+            write_uncompressed_component_sample(channel_samples, spec, pixel_index, sample)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn decode_uncompressed_component_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
@@ -2064,54 +2201,371 @@ fn decode_uncompressed_component_interleave(
                             tile_region.origin_x, tile_region.origin_y
                         ),
                     })?;
-                for subsample_row in 0..subsample_y {
-                    let output_y = sample_origin_y.checked_add(subsample_row).ok_or_else(|| {
-                        DecodeUncompressedError::InvalidInput {
-                            detail: format!(
-                                "uncompressed {component_name} sample y overflow at tile origin ({},{}), row={row}, column={column}",
-                                tile_region.origin_x, tile_region.origin_y
-                            ),
-                        }
-                    })?;
-                    let row_offset = output_y.checked_mul(tile_region.image_width).ok_or_else(
-                        || DecodeUncompressedError::InvalidInput {
-                            detail: format!(
-                                "uncompressed {component_name} row offset overflow for y={output_y} and image width {}",
-                                tile_region.image_width
-                            ),
-                        },
-                    )?;
-                    for subsample_column in 0..subsample_x {
-                        let output_x =
-                            sample_origin_x
-                                .checked_add(subsample_column)
-                                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                                    detail: format!(
-                                        "uncompressed {component_name} sample x overflow at tile origin ({},{}), row={row}, column={column}",
-                                        tile_region.origin_x, tile_region.origin_y
-                                    ),
-                                })?;
-                        let pixel_index = row_offset.checked_add(output_x).ok_or_else(|| {
-                            DecodeUncompressedError::InvalidInput {
-                                detail: format!(
-                                    "uncompressed {component_name} pixel index overflow for ({output_x},{output_y})"
-                                ),
-                            }
-                        })?;
-                        write_uncompressed_component_sample(
-                            channel_samples,
-                            *spec,
-                            pixel_index,
-                            sample,
-                        )?;
-                    }
-                }
+                write_uncompressed_component_sample_block(
+                    channel_samples,
+                    *spec,
+                    tile_region,
+                    (sample_origin_x, sample_origin_y),
+                    (subsample_x, subsample_y),
+                    sample,
+                )?;
             }
             reader.handle_row_alignment(params.row_align_size)?;
         }
         if params.per_component_tile_alignment {
             reader.handle_tile_alignment(params.tile_align_size)?;
         }
+    }
+
+    Ok(())
+}
+
+fn decode_uncompressed_mixed_interleave(
+    reader: &mut UncompressedBitReader<'_>,
+    specs: &[UncompressedComponentDecodeSpec],
+    tile_region: UncompressedDecodeTileRegion,
+    sampling_type: u8,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    // Provenance: mixed (semi-planar) uncompressed YCbCr decode mirrors
+    // libheif/libheif/codecs/uncompressed/unc_decoder_mixed_interleave.cc:
+    // unc_decoder_mixed_interleave::{get_tile_data_sizes,processTile}.
+    let mut decoded_chroma_pair = false;
+
+    for spec in specs {
+        match spec.role {
+            UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
+                if decoded_chroma_pair {
+                    continue;
+                }
+                let other_role = match spec.role {
+                    UncompressedChannelRole::ChromaBlue => UncompressedChannelRole::ChromaRed,
+                    UncompressedChannelRole::ChromaRed => UncompressedChannelRole::ChromaBlue,
+                    _ => unreachable!(),
+                };
+                let other_spec = specs
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.role == other_role)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncC mixed interleave is missing a complementary Cb/Cr channel"
+                            .to_string(),
+                    })?;
+
+                let (subsample_x, subsample_y) =
+                    uncompressed_component_subsampling(spec.role, sampling_type)?;
+                let component_name = spec
+                    .role
+                    .channel_index()
+                    .map(uncompressed_channel_name)
+                    .unwrap_or("padded");
+                if !tile_region.width.is_multiple_of(subsample_x)
+                    || !tile_region.height.is_multiple_of(subsample_y)
+                {
+                    return Err(DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "{component_name} tile extent {}x{} is not divisible by subsampling {}x{}",
+                            tile_region.width, tile_region.height, subsample_x, subsample_y
+                        ),
+                    });
+                }
+                let component_width = tile_region.width / subsample_x;
+                let component_height = tile_region.height / subsample_y;
+
+                for row in 0..component_height {
+                    for column in 0..component_width {
+                        let sample = read_uncompressed_component_sample(reader, *spec)?;
+                        let other_sample = read_uncompressed_component_sample(reader, other_spec)?;
+                        let sample_origin_x = tile_region
+                            .origin_x
+                            .checked_add(column.checked_mul(subsample_x).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: format!(
+                                        "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                        tile_region.origin_x, tile_region.origin_y
+                                    ),
+                                }
+                            })?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                    tile_region.origin_x, tile_region.origin_y
+                                ),
+                            })?;
+                        let sample_origin_y = tile_region
+                            .origin_y
+                            .checked_add(row.checked_mul(subsample_y).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: format!(
+                                        "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                        tile_region.origin_x, tile_region.origin_y
+                                    ),
+                                }
+                            })?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                    tile_region.origin_x, tile_region.origin_y
+                                ),
+                            })?;
+
+                        write_uncompressed_component_sample_block(
+                            channel_samples,
+                            *spec,
+                            tile_region,
+                            (sample_origin_x, sample_origin_y),
+                            (subsample_x, subsample_y),
+                            sample,
+                        )?;
+                        write_uncompressed_component_sample_block(
+                            channel_samples,
+                            other_spec,
+                            tile_region,
+                            (sample_origin_x, sample_origin_y),
+                            (subsample_x, subsample_y),
+                            other_sample,
+                        )?;
+                    }
+                    reader.skip_to_byte_boundary();
+                }
+
+                decoded_chroma_pair = true;
+            }
+            _ => {
+                let (subsample_x, subsample_y) =
+                    uncompressed_component_subsampling(spec.role, sampling_type)?;
+                let component_name = spec
+                    .role
+                    .channel_index()
+                    .map(uncompressed_channel_name)
+                    .unwrap_or("padded");
+                if !tile_region.width.is_multiple_of(subsample_x)
+                    || !tile_region.height.is_multiple_of(subsample_y)
+                {
+                    return Err(DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "{component_name} tile extent {}x{} is not divisible by subsampling {}x{}",
+                            tile_region.width, tile_region.height, subsample_x, subsample_y
+                        ),
+                    });
+                }
+                let component_width = tile_region.width / subsample_x;
+                let component_height = tile_region.height / subsample_y;
+                for row in 0..component_height {
+                    for column in 0..component_width {
+                        let sample = read_uncompressed_component_sample(reader, *spec)?;
+                        let sample_origin_x = tile_region
+                            .origin_x
+                            .checked_add(column.checked_mul(subsample_x).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: format!(
+                                        "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                        tile_region.origin_x, tile_region.origin_y
+                                    ),
+                                }
+                            })?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed {component_name} sample x-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                    tile_region.origin_x, tile_region.origin_y
+                                ),
+                            })?;
+                        let sample_origin_y = tile_region
+                            .origin_y
+                            .checked_add(row.checked_mul(subsample_y).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: format!(
+                                        "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                        tile_region.origin_x, tile_region.origin_y
+                                    ),
+                                }
+                            })?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed {component_name} sample y-origin overflow at tile origin ({},{}), row={row}, column={column}",
+                                    tile_region.origin_x, tile_region.origin_y
+                                ),
+                            })?;
+                        write_uncompressed_component_sample_block(
+                            channel_samples,
+                            *spec,
+                            tile_region,
+                            (sample_origin_x, sample_origin_y),
+                            (subsample_x, subsample_y),
+                            sample,
+                        )?;
+                    }
+                    reader.skip_to_byte_boundary();
+                }
+            }
+        }
+    }
+
+    if !decoded_chroma_pair {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: "uncC mixed interleave did not decode any Cb/Cr sample pairs".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn decode_uncompressed_multi_y_interleave(
+    reader: &mut UncompressedBitReader<'_>,
+    specs: &[UncompressedComponentDecodeSpec],
+    tile_region: UncompressedDecodeTileRegion,
+    pixel_size: u32,
+    row_align_size: u32,
+    sampling_type: u8,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    // Provenance: multi-Y grouped sample ordering follows
+    // libheif/libheif/codecs/uncompressed/unc_types.h (interleave_mode_multi_y)
+    // plus uncC profile definitions in
+    // libheif/libheif/codecs/uncompressed/unc_boxes.cc
+    // (e.g. 2vuy/yuv2/yvyu/vyuy tuple ordering for 4:2:2 groups).
+    let (subsample_x, subsample_y) = match sampling_type {
+        UNCOMPRESSED_SAMPLING_422 => (2_usize, 1_usize),
+        _ => {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC multi-y interleave currently supports only sampling_type {} (4:2:2)",
+                    UNCOMPRESSED_SAMPLING_422
+                ),
+            });
+        }
+    };
+    if !tile_region.width.is_multiple_of(subsample_x)
+        || !tile_region.height.is_multiple_of(subsample_y)
+    {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncC multi-y interleave requires tile extent {}x{} to be divisible by {}x{}",
+                tile_region.width, tile_region.height, subsample_x, subsample_y
+            ),
+        });
+    }
+
+    let groups_per_row = tile_region.width / subsample_x;
+    let group_rows = tile_region.height / subsample_y;
+    let expected_luma_per_group = subsample_x.checked_mul(subsample_y).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: "uncC multi-y luma sample-count overflow".to_string(),
+        }
+    })?;
+
+    for group_row in 0..group_rows {
+        reader.mark_row_start();
+        for group_column in 0..groups_per_row {
+            reader.mark_pixel_start();
+
+            let group_origin_x = tile_region
+                .origin_x
+                .checked_add(group_column.checked_mul(subsample_x).ok_or_else(|| {
+                    DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncC multi-y group x-origin overflow at row={group_row}, column={group_column}"
+                        ),
+                    }
+                })?)
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC multi-y group x-origin overflow at row={group_row}, column={group_column}"
+                    ),
+                })?;
+            let group_origin_y = tile_region
+                .origin_y
+                .checked_add(group_row.checked_mul(subsample_y).ok_or_else(|| {
+                    DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncC multi-y group y-origin overflow at row={group_row}, column={group_column}"
+                        ),
+                    }
+                })?)
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC multi-y group y-origin overflow at row={group_row}, column={group_column}"
+                    ),
+                })?;
+
+            let mut luma_sample_index = 0_usize;
+            let mut saw_cb = false;
+            let mut saw_cr = false;
+            for spec in specs {
+                let sample = read_uncompressed_component_sample(reader, *spec)?;
+                match spec.role {
+                    UncompressedChannelRole::Luma => {
+                        if luma_sample_index >= expected_luma_per_group {
+                            return Err(DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncC multi-y group ({group_column},{group_row}) has more than {expected_luma_per_group} luma samples"
+                                ),
+                            });
+                        }
+                        let luma_x_offset = luma_sample_index % subsample_x;
+                        let luma_y_offset = luma_sample_index / subsample_x;
+                        let luma_origin_x = group_origin_x.checked_add(luma_x_offset).ok_or_else(
+                            || DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncC multi-y luma x-origin overflow at row={group_row}, column={group_column}"
+                                ),
+                            },
+                        )?;
+                        let luma_origin_y = group_origin_y.checked_add(luma_y_offset).ok_or_else(
+                            || DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncC multi-y luma y-origin overflow at row={group_row}, column={group_column}"
+                                ),
+                            },
+                        )?;
+                        write_uncompressed_component_sample_block(
+                            channel_samples,
+                            *spec,
+                            tile_region,
+                            (luma_origin_x, luma_origin_y),
+                            (1, 1),
+                            sample,
+                        )?;
+                        luma_sample_index += 1;
+                    }
+                    UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
+                        write_uncompressed_component_sample_block(
+                            channel_samples,
+                            *spec,
+                            tile_region,
+                            (group_origin_x, group_origin_y),
+                            (subsample_x, subsample_y),
+                            sample,
+                        )?;
+                        if spec.role == UncompressedChannelRole::ChromaBlue {
+                            saw_cb = true;
+                        } else {
+                            saw_cr = true;
+                        }
+                    }
+                    UncompressedChannelRole::Padded => {}
+                    _ => {
+                        return Err(DecodeUncompressedError::UnsupportedFeature {
+                            detail: format!(
+                                "uncC multi-y interleave currently supports only Y/Cb/Cr/padded components, found {:?}",
+                                spec.role
+                            ),
+                        });
+                    }
+                }
+            }
+
+            if luma_sample_index != expected_luma_per_group || !saw_cb || !saw_cr {
+                return Err(DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC multi-y group ({group_column},{group_row}) does not provide the expected Y/Cb/Cr sample layout"
+                    ),
+                });
+            }
+
+            reader.handle_pixel_alignment(pixel_size)?;
+        }
+        reader.handle_row_alignment(row_align_size)?;
     }
 
     Ok(())
@@ -3544,8 +3998,10 @@ const UNCOMPRESSED_SAMPLING_422: u8 = 1;
 const UNCOMPRESSED_SAMPLING_420: u8 = 2;
 const UNCOMPRESSED_INTERLEAVE_COMPONENT: u8 = 0;
 const UNCOMPRESSED_INTERLEAVE_PIXEL: u8 = 1;
+const UNCOMPRESSED_INTERLEAVE_MIXED: u8 = 2;
 const UNCOMPRESSED_INTERLEAVE_ROW: u8 = 3;
 const UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT: u8 = 4;
+const UNCOMPRESSED_INTERLEAVE_MULTI_Y: u8 = 5;
 const UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED: u8 = 0;
 const UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME: u16 = 0;
 const UNCOMPRESSED_COMPONENT_TYPE_LUMA: u16 = 1;
@@ -6231,12 +6687,15 @@ mod tests {
         decode_file_to_png, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
         decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image,
-        parse_length_prefixed_hevc_nal_units, stitch_decoded_heic_grid_tiles,
-        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifPixelLayout, AvifPlane,
-        AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
-        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
-        HeicPixelLayout, HeicPlane, HevcNalClass, TransformGuardError, YCbCrMatrixCoefficients,
-        YCbCrRange,
+        decode_uncompressed_multi_y_interleave, parse_length_prefixed_hevc_nal_units,
+        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
+        write_rgba8_png, AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError,
+        DecodeError, DecodeErrorCategory, DecodeHeicError, DecodeUncompressedError,
+        DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane,
+        HevcNalClass, TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
+        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
+        YCbCrRange, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
+        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -6538,6 +6997,79 @@ mod tests {
         assert_eq!(frame_info.height, decoded.height);
         assert_eq!(frame_info.color_type, png::ColorType::Rgba);
         assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn decodes_multi_y_422_grouped_samples_into_luma_and_chroma_channels() {
+        let payload: Vec<u8> = vec![
+            10, 20, 30, 40, // group 0: Y0 Cb Y1 Cr
+            11, 21, 31, 41, // group 1: Y0 Cb Y1 Cr
+        ];
+        let mut reader = UncompressedBitReader::new(&payload);
+        let specs = vec![
+            UncompressedComponentDecodeSpec {
+                role: UncompressedChannelRole::Luma,
+                bit_depth: 8,
+                component_align_size: 0,
+            },
+            UncompressedComponentDecodeSpec {
+                role: UncompressedChannelRole::ChromaBlue,
+                bit_depth: 8,
+                component_align_size: 0,
+            },
+            UncompressedComponentDecodeSpec {
+                role: UncompressedChannelRole::Luma,
+                bit_depth: 8,
+                component_align_size: 0,
+            },
+            UncompressedComponentDecodeSpec {
+                role: UncompressedChannelRole::ChromaRed,
+                bit_depth: 8,
+                component_align_size: 0,
+            },
+        ];
+        let tile_region = UncompressedDecodeTileRegion {
+            image_width: 4,
+            width: 4,
+            height: 1,
+            origin_x: 0,
+            origin_y: 0,
+        };
+        let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
+            std::array::from_fn(|_| None);
+        channel_samples[UNCOMPRESSED_CHANNEL_LUMA] = Some(vec![0_u16; 4]);
+        channel_samples[UNCOMPRESSED_CHANNEL_CB] = Some(vec![0_u16; 4]);
+        channel_samples[UNCOMPRESSED_CHANNEL_CR] = Some(vec![0_u16; 4]);
+
+        decode_uncompressed_multi_y_interleave(
+            &mut reader,
+            &specs,
+            tile_region,
+            0,
+            0,
+            UNCOMPRESSED_SAMPLING_422,
+            &mut channel_samples,
+        )
+        .expect("multi-y grouped payload should decode");
+
+        assert_eq!(
+            channel_samples[UNCOMPRESSED_CHANNEL_LUMA]
+                .as_ref()
+                .expect("luma plane should be initialized"),
+            &vec![10_u16, 30, 11, 31]
+        );
+        assert_eq!(
+            channel_samples[UNCOMPRESSED_CHANNEL_CB]
+                .as_ref()
+                .expect("Cb plane should be initialized"),
+            &vec![20_u16, 20, 21, 21]
+        );
+        assert_eq!(
+            channel_samples[UNCOMPRESSED_CHANNEL_CR]
+                .as_ref()
+                .expect("Cr plane should be initialized"),
+            &vec![40_u16, 40, 41, 41]
+        );
     }
 
     #[test]
