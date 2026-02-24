@@ -1220,18 +1220,19 @@ fn stitch_decoded_heic_grid_tiles(
                     "grid tile x-origin overflow for column {column} with tile width {tile_width}"
                 ),
             })?;
-            let y_origin = u32::try_from(row_u64.checked_mul(u64::from(tile_height)).ok_or_else(
-                || DecodeHeicError::InvalidDecodedFrame {
+            let y_origin =
+                u32::try_from(row_u64.checked_mul(u64::from(tile_height)).ok_or_else(|| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: format!(
+                        "grid tile y-origin overflow for row {row} with tile height {tile_height}"
+                    ),
+                    }
+                })?)
+                .map_err(|_| DecodeHeicError::InvalidDecodedFrame {
                     detail: format!(
                         "grid tile y-origin overflow for row {row} with tile height {tile_height}"
                     ),
-                },
-            )?)
-            .map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!(
-                    "grid tile y-origin overflow for row {row} with tile height {tile_height}"
-                ),
-            })?;
+                })?;
 
             paste_heic_plane_with_clip(
                 &tile.y_plane,

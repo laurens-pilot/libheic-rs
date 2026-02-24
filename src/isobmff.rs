@@ -21,6 +21,8 @@ const AV1C_BOX_TYPE: [u8; 4] = *b"av1C";
 const HVCC_BOX_TYPE: [u8; 4] = *b"hvcC";
 const ISPE_BOX_TYPE: [u8; 4] = *b"ispe";
 const PIXI_BOX_TYPE: [u8; 4] = *b"pixi";
+const CMPD_BOX_TYPE: [u8; 4] = *b"cmpd";
+const UNCC_BOX_TYPE: [u8; 4] = *b"uncC";
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
 const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
@@ -34,6 +36,7 @@ const INFE_ITEM_TYPE_URI: [u8; 4] = *b"uri ";
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
+const UNCI_ITEM_TYPE: [u8; 4] = *b"unci";
 const GRID_ITEM_TYPE: [u8; 4] = *b"grid";
 const DIMG_REFERENCE_TYPE: [u8; 4] = *b"dimg";
 const FTYP_FIXED_FIELDS_SIZE: usize = 8;
@@ -306,6 +309,37 @@ impl<'a> ParsedBox<'a> {
         }
 
         parse_pixi_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as a `cmpd` property.
+    pub fn parse_cmpd(
+        &self,
+    ) -> Result<ComponentDefinitionProperty, ParseComponentDefinitionPropertyError> {
+        if self.header.box_type.as_bytes() != CMPD_BOX_TYPE {
+            return Err(ParseComponentDefinitionPropertyError::UnexpectedBoxType {
+                offset: self.offset,
+                actual: self.header.box_type,
+            });
+        }
+
+        parse_cmpd_payload(self.payload, self.payload_offset())
+    }
+
+    /// Parse this box payload as an `uncC` property.
+    pub fn parse_uncc(
+        &self,
+    ) -> Result<UncompressedFrameConfigurationProperty, ParseUncompressedFrameConfigurationError>
+    {
+        if self.header.box_type.as_bytes() != UNCC_BOX_TYPE {
+            return Err(
+                ParseUncompressedFrameConfigurationError::UnexpectedBoxType {
+                    offset: self.offset,
+                    actual: self.header.box_type,
+                },
+            );
+        }
+
+        parse_uncc_payload(self.payload, self.payload_offset())
     }
 
     /// Parse this box payload as a `colr` property.
@@ -783,6 +817,49 @@ pub struct PixelInformationProperty {
     pub bits_per_channel: Vec<u8>,
 }
 
+/// One parsed `cmpd` component definition entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentDefinition {
+    pub component_type: u16,
+    pub component_type_uri: Option<Vec<u8>>,
+}
+
+/// Parsed `cmpd` property fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentDefinitionProperty {
+    pub components: Vec<ComponentDefinition>,
+}
+
+/// One parsed `uncC` component configuration entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UncompressedFrameComponent {
+    pub component_index: u16,
+    pub component_bit_depth: u16,
+    pub component_format: u8,
+    pub component_align_size: u8,
+}
+
+/// Parsed `uncC` property fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UncompressedFrameConfigurationProperty {
+    pub full_box: FullBoxHeader,
+    pub profile: FourCc,
+    pub components: Vec<UncompressedFrameComponent>,
+    pub sampling_type: u8,
+    pub interleave_type: u8,
+    pub block_size: u8,
+    pub components_little_endian: bool,
+    pub block_pad_lsb: bool,
+    pub block_little_endian: bool,
+    pub block_reversed: bool,
+    pub pad_unknown: bool,
+    pub pixel_size: u32,
+    pub row_align_size: u32,
+    pub tile_align_size: u32,
+    pub num_tile_cols: u32,
+    pub num_tile_rows: u32,
+}
+
 /// Parsed `colr` NCLX/NCLC color profile fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NclxColorProfile {
@@ -895,6 +972,24 @@ pub struct HeicPrimaryItemPreflightProperties {
     pub ispe: ImageSpatialExtentsProperty,
     pub pixi: Option<PixelInformationProperty>,
     pub colr: PrimaryItemColorProperties,
+}
+
+/// Parsed primary uncompressed (`unci`) properties needed before decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UncompressedPrimaryItemProperties {
+    pub item_id: u32,
+    pub ispe: ImageSpatialExtentsProperty,
+    pub cmpd: Option<ComponentDefinitionProperty>,
+    pub unc_c: UncompressedFrameConfigurationProperty,
+    pub colr: PrimaryItemColorProperties,
+}
+
+/// Extracted primary uncompressed (`unci`) payload from `iloc` extents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UncompressedPrimaryItemData {
+    pub item_id: u32,
+    pub construction_method: u8,
+    pub payload: Vec<u8>,
 }
 
 /// Errors returned when parsing an `ftyp` payload.
@@ -1858,6 +1953,161 @@ impl From<ParseFullBoxError> for ParsePixelInformationPropertyError {
     }
 }
 
+/// Errors returned when parsing a `cmpd` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseComponentDefinitionPropertyError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl Display for ParseComponentDefinitionPropertyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseComponentDefinitionPropertyError::UnexpectedBoxType { offset, actual } => write!(
+                f,
+                "expected cmpd box at offset {offset}, got box type {actual}"
+            ),
+            ParseComponentDefinitionPropertyError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "cmpd payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+        }
+    }
+}
+
+impl Error for ParseComponentDefinitionPropertyError {}
+
+/// Errors returned when parsing an `uncC` payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseUncompressedFrameConfigurationError {
+    UnexpectedBoxType {
+        offset: u64,
+        actual: FourCc,
+    },
+    FullBox(ParseFullBoxError),
+    UnsupportedVersion {
+        offset: u64,
+        version: u8,
+    },
+    UnknownVersion1Profile {
+        offset: u64,
+        profile: FourCc,
+    },
+    PayloadTooSmall {
+        offset: u64,
+        context: &'static str,
+        available: usize,
+        required: usize,
+    },
+    InvalidComponentFormat {
+        offset: u64,
+        component_format: u8,
+    },
+    InvalidSamplingType {
+        offset: u64,
+        sampling_type: u8,
+    },
+    InvalidInterleaveType {
+        offset: u64,
+        interleave_type: u8,
+    },
+    InvalidTileCount {
+        offset: u64,
+        axis: &'static str,
+        value: u32,
+    },
+}
+
+impl Display for ParseUncompressedFrameConfigurationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseUncompressedFrameConfigurationError::UnexpectedBoxType { offset, actual } => {
+                write!(f, "expected uncC box at offset {offset}, got box type {actual}")
+            }
+            ParseUncompressedFrameConfigurationError::FullBox(err) => write!(f, "{err}"),
+            ParseUncompressedFrameConfigurationError::UnsupportedVersion { offset, version } => {
+                write!(
+                    f,
+                    "uncC box at offset {offset} has unsupported full box version {version}"
+                )
+            }
+            ParseUncompressedFrameConfigurationError::UnknownVersion1Profile {
+                offset,
+                profile,
+            } => write!(
+                f,
+                "uncC version 1 box at offset {offset} has unknown profile {profile}"
+            ),
+            ParseUncompressedFrameConfigurationError::PayloadTooSmall {
+                offset,
+                context,
+                available,
+                required,
+            } => write!(
+                f,
+                "uncC payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseUncompressedFrameConfigurationError::InvalidComponentFormat {
+                offset,
+                component_format,
+            } => write!(
+                f,
+                "uncC payload at offset {offset} has invalid component_format {component_format}"
+            ),
+            ParseUncompressedFrameConfigurationError::InvalidSamplingType {
+                offset,
+                sampling_type,
+            } => write!(
+                f,
+                "uncC payload at offset {offset} has invalid sampling_type {sampling_type}"
+            ),
+            ParseUncompressedFrameConfigurationError::InvalidInterleaveType {
+                offset,
+                interleave_type,
+            } => write!(
+                f,
+                "uncC payload at offset {offset} has invalid interleave_type {interleave_type}"
+            ),
+            ParseUncompressedFrameConfigurationError::InvalidTileCount {
+                offset,
+                axis,
+                value,
+            } => write!(
+                f,
+                "uncC payload at offset {offset} has invalid {axis} tile count value {value}"
+            ),
+        }
+    }
+}
+
+impl Error for ParseUncompressedFrameConfigurationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseUncompressedFrameConfigurationError::FullBox(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseFullBoxError> for ParseUncompressedFrameConfigurationError {
+    fn from(value: ParseFullBoxError) -> Self {
+        Self::FullBox(value)
+    }
+}
+
 /// Errors returned when parsing a `colr` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseColorInformationPropertyError {
@@ -2299,6 +2549,130 @@ impl Error for ParsePrimaryHeicPropertiesError {
     }
 }
 
+/// Errors returned when parsing/validating primary uncompressed (`unci`) properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsePrimaryUncompressedPropertiesError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    MissingRequiredProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    DuplicateProperty {
+        item_id: u32,
+        property_type: FourCc,
+    },
+    ImageSpatialExtents(ParseImageSpatialExtentsPropertyError),
+    ComponentDefinition(ParseComponentDefinitionPropertyError),
+    UncompressedFrameConfiguration(ParseUncompressedFrameConfigurationError),
+    ColorInformation(ParseColorInformationPropertyError),
+    MissingComponentDefinition {
+        item_id: u32,
+    },
+    InvalidImageExtent {
+        item_id: u32,
+        width: u32,
+        height: u32,
+    },
+    InvalidComponentIndex {
+        item_id: u32,
+        component_index: u16,
+        component_count: usize,
+    },
+}
+
+impl Display for ParsePrimaryUncompressedPropertiesError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParsePrimaryUncompressedPropertiesError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ParsePrimaryUncompressedPropertiesError::Meta(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected unci"
+            ),
+            ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
+                item_id,
+                actual,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has infe item_type {actual}, expected unci"
+            ),
+            ParsePrimaryUncompressedPropertiesError::MissingRequiredProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} is missing required uncompressed property {property_type}"
+            ),
+            ParsePrimaryUncompressedPropertiesError::DuplicateProperty {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has multiple {property_type} properties"
+            ),
+            ParsePrimaryUncompressedPropertiesError::ImageSpatialExtents(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::ComponentDefinition(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::UncompressedFrameConfiguration(err) => {
+                write!(f, "{err}")
+            }
+            ParsePrimaryUncompressedPropertiesError::ColorInformation(err) => write!(f, "{err}"),
+            ParsePrimaryUncompressedPropertiesError::MissingComponentDefinition { item_id } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} is missing required cmpd property for uncC version 0"
+                )
+            }
+            ParsePrimaryUncompressedPropertiesError::InvalidImageExtent {
+                item_id,
+                width,
+                height,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has invalid ispe dimensions ({width}x{height})"
+            ),
+            ParsePrimaryUncompressedPropertiesError::InvalidComponentIndex {
+                item_id,
+                component_index,
+                component_count,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uncC references component index {component_index}, but cmpd only defines {component_count} components"
+            ),
+        }
+    }
+}
+
+impl Error for ParsePrimaryUncompressedPropertiesError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParsePrimaryUncompressedPropertiesError::TopLevelBoxes(err) => Some(err),
+            ParsePrimaryUncompressedPropertiesError::Meta(err) => Some(err),
+            ParsePrimaryUncompressedPropertiesError::ResolvePrimaryItem(err) => Some(err),
+            ParsePrimaryUncompressedPropertiesError::ImageSpatialExtents(err) => Some(err),
+            ParsePrimaryUncompressedPropertiesError::ComponentDefinition(err) => Some(err),
+            ParsePrimaryUncompressedPropertiesError::UncompressedFrameConfiguration(err) => {
+                Some(err)
+            }
+            ParsePrimaryUncompressedPropertiesError::ColorInformation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned when extracting the primary AVIF payload from BMFF boxes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractAvifItemDataError {
@@ -2678,6 +3052,128 @@ impl Error for ExtractHeicItemDataError {
             ExtractHeicItemDataError::ResolvePrimaryItem(err) => Some(err),
             ExtractHeicItemDataError::MetaChildBoxes(err) => Some(err),
             ExtractHeicItemDataError::GridTileCodecConfiguration { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Errors returned when extracting the primary uncompressed (`unci`) payload from BMFF boxes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtractUncompressedItemDataError {
+    TopLevelBoxes(ParseBoxError),
+    MissingMetaBox,
+    Meta(ParseMetaBoxError),
+    ResolvePrimaryItem(ResolvePrimaryItemGraphError),
+    MissingPrimaryItemType {
+        item_id: u32,
+    },
+    UnexpectedPrimaryItemType {
+        item_id: u32,
+        actual: FourCc,
+    },
+    UnsupportedDataReferenceIndex {
+        item_id: u32,
+        data_reference_index: u16,
+    },
+    UnsupportedConstructionMethod {
+        item_id: u32,
+        construction_method: u8,
+    },
+    MissingIdatBox {
+        item_id: u32,
+    },
+    MetaChildBoxes(ParseBoxError),
+    ExtentOffsetOverflow {
+        item_id: u32,
+        base_offset: u64,
+        extent_offset: u64,
+        extent_length: u64,
+    },
+    ExtentOutOfBounds {
+        item_id: u32,
+        construction_method: u8,
+        start: u64,
+        length: u64,
+        available: u64,
+    },
+    PayloadTooLarge {
+        item_id: u32,
+        length: u64,
+    },
+}
+
+impl Display for ExtractUncompressedItemDataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractUncompressedItemDataError::TopLevelBoxes(err) => write!(f, "{err}"),
+            ExtractUncompressedItemDataError::MissingMetaBox => {
+                write!(f, "required top-level meta box is missing")
+            }
+            ExtractUncompressedItemDataError::Meta(err) => write!(f, "{err}"),
+            ExtractUncompressedItemDataError::ResolvePrimaryItem(err) => write!(f, "{err}"),
+            ExtractUncompressedItemDataError::MissingPrimaryItemType { item_id } => write!(
+                f,
+                "primary item_ID {item_id} is missing an infe item_type, expected unci"
+            ),
+            ExtractUncompressedItemDataError::UnexpectedPrimaryItemType { item_id, actual } => {
+                write!(
+                    f,
+                    "primary item_ID {item_id} has infe item_type {actual}, expected unci"
+                )
+            }
+            ExtractUncompressedItemDataError::UnsupportedDataReferenceIndex {
+                item_id,
+                data_reference_index,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc data_reference_index {data_reference_index}"
+            ),
+            ExtractUncompressedItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            } => write!(
+                f,
+                "primary item_ID {item_id} uses unsupported iloc construction_method {construction_method}"
+            ),
+            ExtractUncompressedItemDataError::MissingIdatBox { item_id } => write!(
+                f,
+                "primary item_ID {item_id} references idat-backed iloc extents but no idat box exists in meta"
+            ),
+            ExtractUncompressedItemDataError::MetaChildBoxes(err) => write!(f, "{err}"),
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset,
+                extent_offset,
+                extent_length,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent offset overflow (base_offset={base_offset}, extent_offset={extent_offset}, extent_length={extent_length})"
+            ),
+            ExtractUncompressedItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length,
+                available,
+            } => write!(
+                f,
+                "primary item_ID {item_id} iloc extent (construction_method={construction_method}, start={start}, length={length}) exceeds available bytes {available}"
+            ),
+            ExtractUncompressedItemDataError::PayloadTooLarge { item_id, length } => write!(
+                f,
+                "primary item_ID {item_id} payload length {length} cannot be represented on this platform"
+            ),
+        }
+    }
+}
+
+impl Error for ExtractUncompressedItemDataError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ExtractUncompressedItemDataError::TopLevelBoxes(err) => Some(err),
+            ExtractUncompressedItemDataError::Meta(err) => Some(err),
+            ExtractUncompressedItemDataError::ResolvePrimaryItem(err) => Some(err),
+            ExtractUncompressedItemDataError::MetaChildBoxes(err) => Some(err),
             _ => None,
         }
     }
@@ -3153,6 +3649,151 @@ pub fn parse_primary_heic_item_preflight_properties(
     })
 }
 
+/// Parse and validate primary uncompressed (`unci`) properties needed before decode.
+pub fn parse_primary_uncompressed_item_properties(
+    input: &[u8],
+) -> Result<UncompressedPrimaryItemProperties, ParsePrimaryUncompressedPropertiesError> {
+    // Provenance: mirrors libheif uncompressed property preconditions and parsing from
+    // libheif/libheif/codecs/uncompressed/unc_codec.cc:UncompressedImageCodec::check_header_validity
+    // and libheif/libheif/codecs/uncompressed/unc_boxes.cc:{Box_cmpd::parse,Box_uncC::parse}.
+    let top_level =
+        parse_boxes(input).map_err(ParsePrimaryUncompressedPropertiesError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ParsePrimaryUncompressedPropertiesError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ParsePrimaryUncompressedPropertiesError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ParsePrimaryUncompressedPropertiesError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ParsePrimaryUncompressedPropertiesError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != UNCI_ITEM_TYPE {
+        return Err(
+            ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
+                item_id,
+                actual: item_type,
+            },
+        );
+    }
+
+    let mut ispe = None;
+    let mut cmpd = None;
+    let mut unc_c = None;
+    let mut colr = PrimaryItemColorProperties::default();
+
+    for property in &resolved.primary_item.properties {
+        let property_type = property.property.header.box_type;
+        if property_type.as_bytes() == ISPE_BOX_TYPE {
+            if ispe.is_some() {
+                return Err(ParsePrimaryUncompressedPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            ispe = Some(
+                property
+                    .property
+                    .parse_ispe()
+                    .map_err(ParsePrimaryUncompressedPropertiesError::ImageSpatialExtents)?,
+            );
+        } else if property_type.as_bytes() == CMPD_BOX_TYPE {
+            if cmpd.is_some() {
+                return Err(ParsePrimaryUncompressedPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            cmpd = Some(
+                property
+                    .property
+                    .parse_cmpd()
+                    .map_err(ParsePrimaryUncompressedPropertiesError::ComponentDefinition)?,
+            );
+        } else if property_type.as_bytes() == UNCC_BOX_TYPE {
+            if unc_c.is_some() {
+                return Err(ParsePrimaryUncompressedPropertiesError::DuplicateProperty {
+                    item_id,
+                    property_type,
+                });
+            }
+            unc_c = Some(property.property.parse_uncc().map_err(
+                ParsePrimaryUncompressedPropertiesError::UncompressedFrameConfiguration,
+            )?);
+        } else if property_type.as_bytes() == COLR_BOX_TYPE {
+            let parsed_colr = property
+                .property
+                .parse_colr()
+                .map_err(ParsePrimaryUncompressedPropertiesError::ColorInformation)?;
+            match parsed_colr.information {
+                ColorInformation::Nclx(profile) => {
+                    colr.nclx = Some(profile);
+                }
+                ColorInformation::Icc(profile) => {
+                    colr.icc = Some(profile);
+                }
+            }
+        }
+    }
+
+    let ispe = ispe.ok_or(
+        ParsePrimaryUncompressedPropertiesError::MissingRequiredProperty {
+            item_id,
+            property_type: FourCc::new(ISPE_BOX_TYPE),
+        },
+    )?;
+    let unc_c = unc_c.ok_or(
+        ParsePrimaryUncompressedPropertiesError::MissingRequiredProperty {
+            item_id,
+            property_type: FourCc::new(UNCC_BOX_TYPE),
+        },
+    )?;
+    let cmpd = if unc_c.full_box.version == 1 {
+        cmpd
+    } else {
+        Some(cmpd.ok_or(
+            ParsePrimaryUncompressedPropertiesError::MissingComponentDefinition { item_id },
+        )?)
+    };
+
+    if ispe.width == 0 || ispe.height == 0 {
+        return Err(
+            ParsePrimaryUncompressedPropertiesError::InvalidImageExtent {
+                item_id,
+                width: ispe.width,
+                height: ispe.height,
+            },
+        );
+    }
+
+    if let Some(cmpd) = &cmpd {
+        for component in &unc_c.components {
+            if usize::from(component.component_index) >= cmpd.components.len() {
+                return Err(
+                    ParsePrimaryUncompressedPropertiesError::InvalidComponentIndex {
+                        item_id,
+                        component_index: component.component_index,
+                        component_count: cmpd.components.len(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(UncompressedPrimaryItemProperties {
+        item_id,
+        ispe,
+        cmpd,
+        unc_c,
+        colr,
+    })
+}
+
 /// Extract the primary AVIF (`av01`) coded payload from `iloc` extents.
 pub fn extract_primary_avif_item_data(
     input: &[u8],
@@ -3225,6 +3866,103 @@ pub fn extract_primary_avif_item_data(
     }
 
     Ok(AvifPrimaryItemData {
+        item_id,
+        construction_method: location.construction_method,
+        payload,
+    })
+}
+
+/// Extract the primary uncompressed (`unci`) payload from `iloc` extents.
+pub fn extract_primary_uncompressed_item_data(
+    input: &[u8],
+) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
+    // Provenance: mirrors the primary-item selection and uncompressed extent read flow from
+    // libheif/libheif/file.cc:HeifFile::get_uncompressed_item_data and
+    // libheif/libheif/box.cc:{Box_iloc::read_data,Box_idat::read_data}.
+    let top_level = parse_boxes(input).map_err(ExtractUncompressedItemDataError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ExtractUncompressedItemDataError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ExtractUncompressedItemDataError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ExtractUncompressedItemDataError::ResolvePrimaryItem)?;
+
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(ExtractUncompressedItemDataError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != UNCI_ITEM_TYPE {
+        return Err(
+            ExtractUncompressedItemDataError::UnexpectedPrimaryItemType {
+                item_id,
+                actual: item_type,
+            },
+        );
+    }
+
+    let location = &resolved.primary_item.location;
+    if location.data_reference_index != 0 {
+        return Err(
+            ExtractUncompressedItemDataError::UnsupportedDataReferenceIndex {
+                item_id,
+                data_reference_index: location.data_reference_index,
+            },
+        );
+    }
+
+    let total_length = location
+        .extents
+        .iter()
+        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
+        .ok_or(ExtractUncompressedItemDataError::PayloadTooLarge {
+            item_id,
+            length: u64::MAX,
+        })?;
+    let payload_capacity = usize::try_from(total_length).map_err(|_| {
+        ExtractUncompressedItemDataError::PayloadTooLarge {
+            item_id,
+            length: total_length,
+        }
+    })?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+
+    match location.construction_method {
+        0 => append_iloc_extents_to_payload_for_uncompressed(
+            input,
+            location,
+            item_id,
+            0,
+            &mut payload,
+        )?,
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractUncompressedItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractUncompressedItemDataError::MissingIdatBox { item_id })?;
+            append_iloc_extents_to_payload_for_uncompressed(
+                idat_box.payload,
+                location,
+                item_id,
+                1,
+                &mut payload,
+            )?;
+        }
+        construction_method => {
+            return Err(
+                ExtractUncompressedItemDataError::UnsupportedConstructionMethod {
+                    item_id,
+                    construction_method,
+                },
+            );
+        }
+    }
+
+    Ok(UncompressedPrimaryItemData {
         item_id,
         construction_method: location.construction_method,
         payload,
@@ -3710,6 +4448,61 @@ fn append_iloc_extents_to_payload_for_heic(
     Ok(())
 }
 
+fn append_iloc_extents_to_payload_for_uncompressed(
+    source: &[u8],
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractUncompressedItemDataError> {
+    let available = source.len() as u64;
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        if end > available {
+            return Err(ExtractUncompressedItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+
+        let start = usize::try_from(start).map_err(|_| {
+            ExtractUncompressedItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            }
+        })?;
+        let end = usize::try_from(end).map_err(|_| {
+            ExtractUncompressedItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            }
+        })?;
+        output.extend_from_slice(&source[start..end]);
+    }
+
+    Ok(())
+}
+
 fn find_first_child_box<'a, 'b>(
     children: &'b [ParsedBox<'a>],
     box_type: [u8; 4],
@@ -3967,6 +4760,258 @@ fn parse_pixi_payload(
         full_box,
         bits_per_channel: pixi_payload[1..(1 + num_channels)].to_vec(),
     })
+}
+
+fn parse_cmpd_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<ComponentDefinitionProperty, ParseComponentDefinitionPropertyError> {
+    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_boxes.cc:Box_cmpd::parse.
+    let mut cursor = 0usize;
+    let component_count =
+        read_u32_cursor_cmpd(payload, &mut cursor, payload_offset, "component_count")?;
+
+    let mut components = Vec::new();
+    for _ in 0..component_count {
+        let component_type =
+            read_u16_cursor_cmpd(payload, &mut cursor, payload_offset, "component_type")?;
+        let component_type_uri = if component_type >= 0x8000 {
+            Some(read_c_string_cursor(payload, &mut cursor))
+        } else {
+            None
+        };
+        components.push(ComponentDefinition {
+            component_type,
+            component_type_uri,
+        });
+    }
+
+    Ok(ComponentDefinitionProperty { components })
+}
+
+fn parse_uncc_payload(
+    payload: &[u8],
+    payload_offset: u64,
+) -> Result<UncompressedFrameConfigurationProperty, ParseUncompressedFrameConfigurationError> {
+    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_boxes.cc:Box_uncC::parse.
+    let (full_box, uncc_payload, uncc_payload_offset) =
+        parse_full_box_payload(payload, payload_offset)?;
+
+    let mut cursor = 0usize;
+    let profile =
+        read_fourcc_cursor_uncc(uncc_payload, &mut cursor, uncc_payload_offset, "profile")?;
+
+    if full_box.version == 1 {
+        if !is_known_uncc_v1_profile(profile) {
+            return Err(
+                ParseUncompressedFrameConfigurationError::UnknownVersion1Profile {
+                    offset: uncc_payload_offset,
+                    profile,
+                },
+            );
+        }
+
+        return Ok(UncompressedFrameConfigurationProperty {
+            full_box,
+            profile,
+            components: Vec::new(),
+            sampling_type: 0,
+            interleave_type: 0,
+            block_size: 0,
+            components_little_endian: false,
+            block_pad_lsb: false,
+            block_little_endian: false,
+            block_reversed: false,
+            pad_unknown: false,
+            pixel_size: 0,
+            row_align_size: 0,
+            tile_align_size: 0,
+            num_tile_cols: 1,
+            num_tile_rows: 1,
+        });
+    }
+
+    if full_box.version != 0 {
+        return Err(
+            ParseUncompressedFrameConfigurationError::UnsupportedVersion {
+                offset: payload_offset,
+                version: full_box.version,
+            },
+        );
+    }
+
+    let component_count = read_u32_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "component_count",
+    )?;
+
+    let mut components = Vec::new();
+    for _ in 0..component_count {
+        let component_index = read_u16_cursor_uncc(
+            uncc_payload,
+            &mut cursor,
+            uncc_payload_offset,
+            "component_index",
+        )?;
+        let component_bit_depth = u16::from(read_u8_cursor_uncc(
+            uncc_payload,
+            &mut cursor,
+            uncc_payload_offset,
+            "component_bit_depth_minus_one",
+        )?) + 1;
+        let component_format_offset = uncc_payload_offset + cursor as u64;
+        let component_format = read_u8_cursor_uncc(
+            uncc_payload,
+            &mut cursor,
+            uncc_payload_offset,
+            "component_format",
+        )?;
+        if component_format > 3 {
+            return Err(
+                ParseUncompressedFrameConfigurationError::InvalidComponentFormat {
+                    offset: component_format_offset,
+                    component_format,
+                },
+            );
+        }
+        let component_align_size = read_u8_cursor_uncc(
+            uncc_payload,
+            &mut cursor,
+            uncc_payload_offset,
+            "component_align_size",
+        )?;
+        components.push(UncompressedFrameComponent {
+            component_index,
+            component_bit_depth,
+            component_format,
+            component_align_size,
+        });
+    }
+
+    let sampling_type_offset = uncc_payload_offset + cursor as u64;
+    let sampling_type = read_u8_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "sampling_type",
+    )?;
+    if sampling_type > 3 {
+        return Err(
+            ParseUncompressedFrameConfigurationError::InvalidSamplingType {
+                offset: sampling_type_offset,
+                sampling_type,
+            },
+        );
+    }
+
+    let interleave_type_offset = uncc_payload_offset + cursor as u64;
+    let interleave_type = read_u8_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "interleave_type",
+    )?;
+    if interleave_type > 5 {
+        return Err(
+            ParseUncompressedFrameConfigurationError::InvalidInterleaveType {
+                offset: interleave_type_offset,
+                interleave_type,
+            },
+        );
+    }
+
+    let block_size =
+        read_u8_cursor_uncc(uncc_payload, &mut cursor, uncc_payload_offset, "block_size")?;
+    let flags = read_u8_cursor_uncc(uncc_payload, &mut cursor, uncc_payload_offset, "flags")?;
+    let components_little_endian = (flags & 0x80) != 0;
+    let block_pad_lsb = (flags & 0x40) != 0;
+    let block_little_endian = (flags & 0x20) != 0;
+    let block_reversed = (flags & 0x10) != 0;
+    let pad_unknown = (flags & 0x08) != 0;
+    let pixel_size =
+        read_u32_cursor_uncc(uncc_payload, &mut cursor, uncc_payload_offset, "pixel_size")?;
+    let row_align_size = read_u32_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "row_align_size",
+    )?;
+    let tile_align_size = read_u32_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "tile_align_size",
+    )?;
+    let num_tile_cols_minus_one = read_u32_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "num_tile_cols_minus_one",
+    )?;
+    let num_tile_rows_minus_one = read_u32_cursor_uncc(
+        uncc_payload,
+        &mut cursor,
+        uncc_payload_offset,
+        "num_tile_rows_minus_one",
+    )?;
+    let num_tile_cols = num_tile_cols_minus_one.checked_add(1).ok_or(
+        ParseUncompressedFrameConfigurationError::InvalidTileCount {
+            offset: uncc_payload_offset + cursor as u64 - 8,
+            axis: "column",
+            value: num_tile_cols_minus_one,
+        },
+    )?;
+    let num_tile_rows = num_tile_rows_minus_one.checked_add(1).ok_or(
+        ParseUncompressedFrameConfigurationError::InvalidTileCount {
+            offset: uncc_payload_offset + cursor as u64 - 4,
+            axis: "row",
+            value: num_tile_rows_minus_one,
+        },
+    )?;
+
+    Ok(UncompressedFrameConfigurationProperty {
+        full_box,
+        profile,
+        components,
+        sampling_type,
+        interleave_type,
+        block_size,
+        components_little_endian,
+        block_pad_lsb,
+        block_little_endian,
+        block_reversed,
+        pad_unknown,
+        pixel_size,
+        row_align_size,
+        tile_align_size,
+        num_tile_cols,
+        num_tile_rows,
+    })
+}
+
+fn is_known_uncc_v1_profile(profile: FourCc) -> bool {
+    let bytes = profile.as_bytes();
+    bytes == *b"rgb3"
+        || bytes == *b"rgba"
+        || bytes == *b"abgr"
+        || bytes == *b"2vuy"
+        || bytes == *b"yuv2"
+        || bytes == *b"yvyu"
+        || bytes == *b"vyuy"
+        || bytes == *b"yuv1"
+        || bytes == *b"v308"
+        || bytes == *b"v408"
+        || bytes == *b"y210"
+        || bytes == *b"v410"
+        || bytes == *b"v210"
+        || bytes == *b"i420"
+        || bytes == *b"nv12"
+        || bytes == *b"nv21"
+        || bytes == *b"yu22"
+        || bytes == *b"yv22"
+        || bytes == *b"yv20"
 }
 
 fn parse_colr_payload(
@@ -5085,6 +6130,112 @@ fn read_c_string_cursor(payload: &[u8], cursor: &mut usize) -> Vec<u8> {
     }
 }
 
+fn read_u16_cursor_cmpd(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseComponentDefinitionPropertyError> {
+    let bytes = take_cursor_bytes_cmpd(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_cmpd(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseComponentDefinitionPropertyError> {
+    let bytes = take_cursor_bytes_cmpd(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn take_cursor_bytes_cmpd<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseComponentDefinitionPropertyError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseComponentDefinitionPropertyError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
+fn read_u8_cursor_uncc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u8, ParseUncompressedFrameConfigurationError> {
+    let bytes = take_cursor_bytes_uncc(payload, cursor, size_of::<u8>(), payload_offset, context)?;
+    Ok(bytes[0])
+}
+
+fn read_u16_cursor_uncc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u16, ParseUncompressedFrameConfigurationError> {
+    let bytes = take_cursor_bytes_uncc(payload, cursor, size_of::<u16>(), payload_offset, context)?;
+    Ok(read_u16_be(bytes))
+}
+
+fn read_u32_cursor_uncc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<u32, ParseUncompressedFrameConfigurationError> {
+    let bytes = take_cursor_bytes_uncc(payload, cursor, size_of::<u32>(), payload_offset, context)?;
+    Ok(read_u32_be(bytes))
+}
+
+fn read_fourcc_cursor_uncc(
+    payload: &[u8],
+    cursor: &mut usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<FourCc, ParseUncompressedFrameConfigurationError> {
+    let bytes = take_cursor_bytes_uncc(payload, cursor, BRAND_FIELD_SIZE, payload_offset, context)?;
+    Ok(read_fourcc(bytes))
+}
+
+fn take_cursor_bytes_uncc<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    size: usize,
+    payload_offset: u64,
+    context: &'static str,
+) -> Result<&'a [u8], ParseUncompressedFrameConfigurationError> {
+    let start = *cursor;
+    let available = payload.len().saturating_sub(start);
+    if available < size {
+        return Err(ParseUncompressedFrameConfigurationError::PayloadTooSmall {
+            offset: payload_offset + start as u64,
+            context,
+            available,
+            required: size,
+        });
+    }
+
+    let end = start + size;
+    *cursor = end;
+    Ok(&payload[start..end])
+}
+
 fn read_u16_cursor(
     payload: &[u8],
     cursor: &mut usize,
@@ -5259,9 +6410,11 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         extract_primary_avif_item_data, extract_primary_heic_item_data,
-        extract_primary_heic_item_data_with_grid, parse_boxes, parse_primary_avif_item_properties,
+        extract_primary_heic_item_data_with_grid, extract_primary_uncompressed_item_data,
+        parse_boxes, parse_primary_avif_item_properties,
         parse_primary_heic_item_preflight_properties, parse_primary_heic_item_properties,
-        parse_primary_item_transform_properties, BoxIter, ColorInformation,
+        parse_primary_item_transform_properties, parse_primary_uncompressed_item_properties,
+        BoxIter, ColorInformation, ComponentDefinition, ComponentDefinitionProperty,
         ExtractAvifItemDataError, ExtractHeicItemDataError, FourCc, HeicPrimaryItemDataWithGrid,
         IccColorProfile, ImageCleanApertureProperty, ImageMirrorDirection, ImageMirrorProperty,
         ImageRotationProperty, ItemLocationField, NclxColorProfile,
@@ -5273,9 +6426,10 @@ mod tests {
         ParseItemPropertiesBoxError, ParseItemPropertyAssociationBoxError,
         ParseItemPropertyContainerBoxError, ParseItemReferenceBoxError, ParseMetaBoxError,
         ParsePixelInformationPropertyError, ParsePrimaryAvifPropertiesError,
-        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError, PrimaryItemColorProperties,
-        PrimaryItemTransformProperty, ResolvePrimaryItemGraphError, BASIC_HEADER_SIZE,
-        FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
+        ParsePrimaryHeicPropertiesError, ParsePrimaryItemBoxError,
+        ParsePrimaryUncompressedPropertiesError, PrimaryItemColorProperties,
+        PrimaryItemTransformProperty, ResolvePrimaryItemGraphError, UncompressedFrameComponent,
+        BASIC_HEADER_SIZE, FULL_BOX_HEADER_SIZE, LARGE_SIZE_FIELD_SIZE, UUID_EXTENDED_TYPE_SIZE,
     };
 
     #[test]
@@ -7606,6 +8760,179 @@ mod tests {
     }
 
     #[test]
+    fn parses_cmpd_property_with_predefined_and_uri_components() {
+        let cmpd = make_cmpd_property(&[(4_u16, None), (0x8001_u16, Some(b"urn:example:alpha"))]);
+        let parsed = parse_boxes(&cmpd).expect("cmpd box should parse");
+        let property = parsed[0]
+            .parse_cmpd()
+            .expect("cmpd property should parse components");
+        assert_eq!(
+            property,
+            ComponentDefinitionProperty {
+                components: vec![
+                    ComponentDefinition {
+                        component_type: 4,
+                        component_type_uri: None,
+                    },
+                    ComponentDefinition {
+                        component_type: 0x8001,
+                        component_type_uri: Some(b"urn:example:alpha".to_vec()),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_uncc_property_version_zero_fields() {
+        let uncc = make_uncc_property_v0(
+            FourCc::new(*b"\0\0\0\0"),
+            &[(0_u16, 8_u16, 0_u8, 0_u8), (1_u16, 8_u16, 0_u8, 0_u8)],
+            0_u8,
+            1_u8,
+            0_u8,
+            0x90_u8,
+            5_u32,
+            16_u32,
+            64_u32,
+            2_u32,
+            3_u32,
+        );
+        let parsed = parse_boxes(&uncc).expect("uncC box should parse");
+        let property = parsed[0]
+            .parse_uncc()
+            .expect("uncC property should parse fields");
+
+        assert_eq!(property.full_box.version, 0);
+        assert_eq!(property.profile, FourCc::new(*b"\0\0\0\0"));
+        assert_eq!(
+            property.components,
+            vec![
+                UncompressedFrameComponent {
+                    component_index: 0,
+                    component_bit_depth: 8,
+                    component_format: 0,
+                    component_align_size: 0,
+                },
+                UncompressedFrameComponent {
+                    component_index: 1,
+                    component_bit_depth: 8,
+                    component_format: 0,
+                    component_align_size: 0,
+                },
+            ]
+        );
+        assert_eq!(property.sampling_type, 0);
+        assert_eq!(property.interleave_type, 1);
+        assert!(property.components_little_endian);
+        assert!(property.block_reversed);
+        assert_eq!(property.pixel_size, 5);
+        assert_eq!(property.row_align_size, 16);
+        assert_eq!(property.tile_align_size, 64);
+        assert_eq!(property.num_tile_cols, 2);
+        assert_eq!(property.num_tile_rows, 3);
+    }
+
+    #[test]
+    fn parses_primary_uncompressed_properties_and_extracts_payload() {
+        let mdat = make_basic_box(*b"mdat", &[0x10_u8, 0x20, 0x30, 0x40, 0x50, 0x60]);
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x4440_u16.to_be_bytes()); // offset/length/base_offset=4
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&(BASIC_HEADER_SIZE as u32).to_be_bytes()); // base_offset
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&1_u32.to_be_bytes()); // extent_offset
+        iloc_payload.extend_from_slice(&3_u32.to_be_bytes()); // extent_length
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+        let meta = make_primary_item_meta_with_properties(
+            *b"unci",
+            iloc,
+            &[
+                make_ispe_property(3, 1),
+                make_cmpd_property(&[(4_u16, None), (5_u16, None), (6_u16, None)]),
+                make_uncc_property_v0(
+                    FourCc::new(*b"\0\0\0\0"),
+                    &[
+                        (0_u16, 8_u16, 0_u8, 0_u8),
+                        (1_u16, 8_u16, 0_u8, 0_u8),
+                        (2_u16, 8_u16, 0_u8, 0_u8),
+                    ],
+                    0_u8,
+                    1_u8,
+                    0_u8,
+                    0_u8,
+                    0_u32,
+                    0_u32,
+                    0_u32,
+                    1_u32,
+                    1_u32,
+                ),
+            ],
+            &[],
+        );
+        let mut file = Vec::new();
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&meta);
+
+        let properties = parse_primary_uncompressed_item_properties(&file)
+            .expect("primary uncompressed properties should parse");
+        assert_eq!(properties.item_id, 1);
+        assert_eq!(properties.ispe.width, 3);
+        assert_eq!(properties.ispe.height, 1);
+        assert!(properties.cmpd.is_some());
+        assert_eq!(properties.unc_c.interleave_type, 1);
+
+        let extracted = extract_primary_uncompressed_item_data(&file)
+            .expect("primary uncompressed payload should extract");
+        assert_eq!(extracted.item_id, 1);
+        assert_eq!(extracted.construction_method, 0);
+        assert_eq!(extracted.payload, vec![0x20, 0x30, 0x40]);
+    }
+
+    #[test]
+    fn rejects_primary_uncompressed_properties_without_cmpd_for_uncc_v0() {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        iloc_payload.extend_from_slice(&0x0000_u16.to_be_bytes()); // size fields all zero
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // item_ID
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        let iloc = make_basic_box(*b"iloc", &iloc_payload);
+
+        let meta = make_primary_item_meta_with_properties(
+            *b"unci",
+            iloc,
+            &[
+                make_ispe_property(1, 1),
+                make_uncc_property_v0(
+                    FourCc::new(*b"\0\0\0\0"),
+                    &[(0_u16, 8_u16, 0_u8, 0_u8)],
+                    0_u8,
+                    1_u8,
+                    0_u8,
+                    0_u8,
+                    0_u32,
+                    0_u32,
+                    0_u32,
+                    1_u32,
+                    1_u32,
+                ),
+            ],
+            &[],
+        );
+        let err = parse_primary_uncompressed_item_properties(&meta)
+            .expect_err("uncC version 0 without cmpd must fail");
+        assert_eq!(
+            err,
+            ParsePrimaryUncompressedPropertiesError::MissingComponentDefinition { item_id: 1 }
+        );
+    }
+
+    #[test]
     fn parses_colr_nclx_and_nclc_profiles() {
         let nclx = make_colr_nclx_property(1, 13, 6, true);
         let parsed = parse_boxes(&nclx).expect("colr box should parse");
@@ -8099,6 +9426,77 @@ mod tests {
         payload.push(bits_per_channel.len() as u8);
         payload.extend_from_slice(bits_per_channel);
         make_basic_box(*b"pixi", &payload)
+    }
+
+    fn make_cmpd_property(entries: &[(u16, Option<&[u8]>)]) -> Vec<u8> {
+        assert!(
+            entries.len() <= u32::MAX as usize,
+            "too many components for test cmpd property"
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (component_type, component_type_uri) in entries {
+            payload.extend_from_slice(&component_type.to_be_bytes());
+            if *component_type >= 0x8000 {
+                if let Some(uri) = component_type_uri {
+                    payload.extend_from_slice(uri);
+                }
+                payload.push(0);
+            }
+        }
+        make_basic_box(*b"cmpd", &payload)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_uncc_property_v0(
+        profile: FourCc,
+        components: &[(u16, u16, u8, u8)],
+        sampling_type: u8,
+        interleave_type: u8,
+        block_size: u8,
+        flags: u8,
+        pixel_size: u32,
+        row_align_size: u32,
+        tile_align_size: u32,
+        num_tile_cols: u32,
+        num_tile_rows: u32,
+    ) -> Vec<u8> {
+        assert!(
+            components.len() <= u32::MAX as usize,
+            "too many components for test uncC property"
+        );
+        assert!(
+            num_tile_cols > 0 && num_tile_rows > 0,
+            "uncC tile counts must be non-zero"
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // version=0, flags=0
+        payload.extend_from_slice(&profile.as_bytes());
+        payload.extend_from_slice(&(components.len() as u32).to_be_bytes());
+        for (component_index, component_bit_depth, component_format, component_align_size) in
+            components
+        {
+            assert!(
+                (1..=256).contains(component_bit_depth),
+                "component_bit_depth must be in 1..=256"
+            );
+            payload.extend_from_slice(&component_index.to_be_bytes());
+            payload.push((*component_bit_depth - 1) as u8);
+            payload.push(*component_format);
+            payload.push(*component_align_size);
+        }
+        payload.push(sampling_type);
+        payload.push(interleave_type);
+        payload.push(block_size);
+        payload.push(flags);
+        payload.extend_from_slice(&pixel_size.to_be_bytes());
+        payload.extend_from_slice(&row_align_size.to_be_bytes());
+        payload.extend_from_slice(&tile_align_size.to_be_bytes());
+        payload.extend_from_slice(&(num_tile_cols - 1).to_be_bytes());
+        payload.extend_from_slice(&(num_tile_rows - 1).to_be_bytes());
+        make_basic_box(*b"uncC", &payload)
     }
 
     fn make_colr_nclx_property(
