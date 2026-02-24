@@ -1,8 +1,94 @@
-use std::path::Path;
+use libheic_rs::DecodeGuardrails;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage(program_name: &str) {
-    eprintln!("Usage: {program_name} <input.heif|.heic|.avif> <output.png>");
+    eprintln!(
+        "Usage: {program_name} [--max-input-bytes <bytes>] [--max-pixels <pixels>] [--max-temp-spool-bytes <bytes>] [--temp-spool-directory <path>] <input.heif|.heic|.avif> <output.png>"
+    );
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CliInvocation {
+    input_path: PathBuf,
+    output_path: PathBuf,
+    guardrails: DecodeGuardrails,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CliParseError {
+    HelpRequested,
+    InvalidArguments(String),
+}
+
+fn parse_u64_option(flag: &str, value: String) -> Result<u64, CliParseError> {
+    value.parse::<u64>().map_err(|_| {
+        CliParseError::InvalidArguments(format!("{flag} expects a u64 value, got '{value}'"))
+    })
+}
+
+fn parse_cli_invocation<I>(args: I) -> Result<CliInvocation, CliParseError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut positional = Vec::new();
+    let mut guardrails = DecodeGuardrails::default();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Err(CliParseError::HelpRequested),
+            "--max-input-bytes" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments(
+                        "missing value for --max-input-bytes".to_string(),
+                    )
+                })?;
+                guardrails.max_input_bytes = Some(parse_u64_option("--max-input-bytes", value)?);
+            }
+            "--max-pixels" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments("missing value for --max-pixels".to_string())
+                })?;
+                guardrails.max_pixels = Some(parse_u64_option("--max-pixels", value)?);
+            }
+            "--max-temp-spool-bytes" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments(
+                        "missing value for --max-temp-spool-bytes".to_string(),
+                    )
+                })?;
+                guardrails.max_temp_spool_bytes =
+                    Some(parse_u64_option("--max-temp-spool-bytes", value)?);
+            }
+            "--temp-spool-directory" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments(
+                        "missing value for --temp-spool-directory".to_string(),
+                    )
+                })?;
+                guardrails.temp_spool_directory = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliParseError::InvalidArguments(format!(
+                    "unknown option '{arg}'"
+                )));
+            }
+            _ => positional.push(arg),
+        }
+    }
+
+    if positional.len() != 2 {
+        return Err(CliParseError::InvalidArguments(
+            "expected <input> and <output> positional arguments".to_string(),
+        ));
+    }
+
+    Ok(CliInvocation {
+        input_path: PathBuf::from(&positional[0]),
+        output_path: PathBuf::from(&positional[1]),
+        guardrails,
+    })
 }
 
 fn format_decode_failure(err: &libheic_rs::DecodeError) -> String {
@@ -15,18 +101,24 @@ fn format_decode_failure(err: &libheic_rs::DecodeError) -> String {
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let program_name = args.next().unwrap_or_else(|| "heif-decode".to_string());
-    let input_path = args.next();
-    let output_path = args.next();
+    let invocation = match parse_cli_invocation(args) {
+        Ok(invocation) => invocation,
+        Err(CliParseError::HelpRequested) => {
+            usage(&program_name);
+            return ExitCode::SUCCESS;
+        }
+        Err(CliParseError::InvalidArguments(message)) => {
+            eprintln!("{message}");
+            usage(&program_name);
+            return ExitCode::from(2);
+        }
+    };
 
-    if input_path.is_none() || output_path.is_none() || args.next().is_some() {
-        usage(&program_name);
-        return ExitCode::from(2);
-    }
-
-    let input_path = Path::new(input_path.as_deref().unwrap_or_default());
-    let output_path = Path::new(output_path.as_deref().unwrap_or_default());
-
-    match libheic_rs::decode_file_to_png(input_path, output_path) {
+    match libheic_rs::decode_path_to_png_with_guardrails(
+        Path::new(&invocation.input_path),
+        Path::new(&invocation.output_path),
+        invocation.guardrails,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{}", format_decode_failure(&err));
@@ -37,8 +129,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::format_decode_failure;
-    use libheic_rs::{DecodeError, DecodeHeicError};
+    use super::{format_decode_failure, parse_cli_invocation, CliInvocation, CliParseError};
+    use libheic_rs::{DecodeError, DecodeGuardrails, DecodeHeicError};
+    use std::path::PathBuf;
 
     #[test]
     fn formats_decode_failure_with_structured_category() {
@@ -55,6 +148,83 @@ mod tests {
         assert_eq!(
             format_decode_failure(&err),
             "Decode failed [category=malformed-input]: length-prefixed HEVC stream does not contain an SPS NAL unit"
+        );
+    }
+
+    #[test]
+    fn parses_cli_with_required_positional_arguments_only() {
+        assert_eq!(
+            parse_cli_invocation(["input.heic".to_string(), "output.png".to_string(),]),
+            Ok(CliInvocation {
+                input_path: PathBuf::from("input.heic"),
+                output_path: PathBuf::from("output.png"),
+                guardrails: DecodeGuardrails::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_cli_with_all_guardrail_flags() {
+        assert_eq!(
+            parse_cli_invocation([
+                "--max-input-bytes".to_string(),
+                "1048576".to_string(),
+                "--max-pixels".to_string(),
+                "262144".to_string(),
+                "--max-temp-spool-bytes".to_string(),
+                "2097152".to_string(),
+                "--temp-spool-directory".to_string(),
+                "/tmp/libheic-spool".to_string(),
+                "input.heic".to_string(),
+                "output.png".to_string(),
+            ]),
+            Ok(CliInvocation {
+                input_path: PathBuf::from("input.heic"),
+                output_path: PathBuf::from("output.png"),
+                guardrails: DecodeGuardrails {
+                    max_input_bytes: Some(1_048_576),
+                    max_pixels: Some(262_144),
+                    max_temp_spool_bytes: Some(2_097_152),
+                    temp_spool_directory: Some(PathBuf::from("/tmp/libheic-spool")),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_cli_options() {
+        assert_eq!(
+            parse_cli_invocation([
+                "--unknown".to_string(),
+                "input.heic".to_string(),
+                "output.png".to_string(),
+            ]),
+            Err(CliParseError::InvalidArguments(
+                "unknown option '--unknown'".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_guardrail_values() {
+        assert_eq!(
+            parse_cli_invocation([
+                "--max-input-bytes".to_string(),
+                "NaN".to_string(),
+                "input.heic".to_string(),
+                "output.png".to_string(),
+            ]),
+            Err(CliParseError::InvalidArguments(
+                "--max-input-bytes expects a u64 value, got 'NaN'".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn accepts_help_flag() {
+        assert_eq!(
+            parse_cli_invocation(["--help".to_string()]),
+            Err(CliParseError::HelpRequested)
         );
     }
 }

@@ -1,7 +1,8 @@
 use crate::{
-    decode_bufread_to_rgba, decode_bytes_to_rgba, decode_path_to_rgba, decode_read_to_rgba,
-    decode_seekable_to_rgba_with_hint, DecodeError, DecodedRgbaImage, DecodedRgbaPixels,
-    HeifInputFamily,
+    decode_bufread_to_rgba_with_guardrails, decode_bytes_to_rgba_with_guardrails,
+    decode_path_to_rgba_with_guardrails, decode_read_to_rgba_with_guardrails,
+    decode_seekable_to_rgba_with_hint_and_guardrails, DecodeError, DecodeGuardrails,
+    DecodedRgbaImage, DecodedRgbaPixels, HeifInputFamily,
 };
 use image::error::{
     DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
@@ -63,30 +64,74 @@ impl HeifImageDecoder {
 
     /// Decode HEIF/HEIC/AVIF bytes into an `image::ImageDecoder` adapter.
     pub fn from_bytes(input: &[u8]) -> ImageResult<Self> {
-        let decoded = decode_bytes_to_rgba(input).map_err(decode_error_to_image_error)?;
+        Self::from_bytes_with_guardrails(input, DecodeGuardrails::default())
+    }
+
+    /// Decode HEIF/HEIC/AVIF bytes into an `image::ImageDecoder` adapter with configurable guardrails.
+    pub fn from_bytes_with_guardrails(
+        input: &[u8],
+        guardrails: DecodeGuardrails,
+    ) -> ImageResult<Self> {
+        let decoded = decode_bytes_to_rgba_with_guardrails(input, guardrails)
+            .map_err(decode_error_to_image_error)?;
         Self::from_decoded(decoded)
     }
 
     /// Decode a `Read` source into an `image::ImageDecoder` adapter.
     pub fn from_read<R: Read>(input_reader: R) -> ImageResult<Self> {
-        let decoded = decode_read_to_rgba(input_reader).map_err(decode_error_to_image_error)?;
+        Self::from_read_with_guardrails(input_reader, DecodeGuardrails::default())
+    }
+
+    /// Decode a `Read` source into an `image::ImageDecoder` adapter with configurable guardrails.
+    pub fn from_read_with_guardrails<R: Read>(
+        input_reader: R,
+        guardrails: DecodeGuardrails,
+    ) -> ImageResult<Self> {
+        let decoded = decode_read_to_rgba_with_guardrails(input_reader, guardrails)
+            .map_err(decode_error_to_image_error)?;
         Self::from_decoded(decoded)
     }
 
     /// Decode a seekable `Read` source into an `image::ImageDecoder` adapter.
     pub fn from_seekable<R: Read + Seek>(input_reader: R) -> ImageResult<Self> {
-        Self::from_seekable_with_hint(input_reader, None)
+        Self::from_seekable_with_guardrails(input_reader, DecodeGuardrails::default())
+    }
+
+    /// Decode a seekable `Read` source into an `image::ImageDecoder` adapter with configurable guardrails.
+    pub fn from_seekable_with_guardrails<R: Read + Seek>(
+        input_reader: R,
+        guardrails: DecodeGuardrails,
+    ) -> ImageResult<Self> {
+        Self::from_seekable_with_hint_and_guardrails(input_reader, None, guardrails)
     }
 
     /// Decode a `BufRead` source into an `image::ImageDecoder` adapter.
     pub fn from_bufread<R: BufRead>(input_reader: R) -> ImageResult<Self> {
-        let decoded = decode_bufread_to_rgba(input_reader).map_err(decode_error_to_image_error)?;
+        Self::from_bufread_with_guardrails(input_reader, DecodeGuardrails::default())
+    }
+
+    /// Decode a `BufRead` source into an `image::ImageDecoder` adapter with configurable guardrails.
+    pub fn from_bufread_with_guardrails<R: BufRead>(
+        input_reader: R,
+        guardrails: DecodeGuardrails,
+    ) -> ImageResult<Self> {
+        let decoded = decode_bufread_to_rgba_with_guardrails(input_reader, guardrails)
+            .map_err(decode_error_to_image_error)?;
         Self::from_decoded(decoded)
     }
 
     /// Decode a file path into an `image::ImageDecoder` adapter.
     pub fn from_path(input_path: &Path) -> ImageResult<Self> {
-        let decoded = decode_path_to_rgba(input_path).map_err(decode_error_to_image_error)?;
+        Self::from_path_with_guardrails(input_path, DecodeGuardrails::default())
+    }
+
+    /// Decode a file path into an `image::ImageDecoder` adapter with configurable guardrails.
+    pub fn from_path_with_guardrails(
+        input_path: &Path,
+        guardrails: DecodeGuardrails,
+    ) -> ImageResult<Self> {
+        let decoded = decode_path_to_rgba_with_guardrails(input_path, guardrails)
+            .map_err(decode_error_to_image_error)?;
         Self::from_decoded(decoded)
     }
 
@@ -95,12 +140,14 @@ impl HeifImageDecoder {
         self.decoded
     }
 
-    fn from_seekable_with_hint<R: Read + Seek>(
+    fn from_seekable_with_hint_and_guardrails<R: Read + Seek>(
         input_reader: R,
         hint: Option<HeifInputFamily>,
+        guardrails: DecodeGuardrails,
     ) -> ImageResult<Self> {
-        let decoded = decode_seekable_to_rgba_with_hint(input_reader, hint)
-            .map_err(decode_error_to_image_error)?;
+        let decoded =
+            decode_seekable_to_rgba_with_hint_and_guardrails(input_reader, hint, guardrails)
+                .map_err(decode_error_to_image_error)?;
         Self::from_decoded(decoded)
     }
 
@@ -198,27 +245,45 @@ impl ImageHookRegistration {
 /// `.avif` inputs through this crate's pure-Rust decode path, including direct
 /// extension-based dispatch and content-based `ftyp` guesses for common brands.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
+    register_image_decoder_hooks_with_guardrails(DecodeGuardrails::default())
+}
+
+/// Register HEIF/HEIC/AVIF decoder hooks with `image::hooks`, applying the provided guardrails to all hook decodes.
+pub fn register_image_decoder_hooks_with_guardrails(
+    guardrails: DecodeGuardrails,
+) -> ImageHookRegistration {
+    let heif_guardrails = guardrails.clone();
     let heic_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIC),
-        Box::new(|reader| {
-            let decoder =
-                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Heif))?;
+        Box::new(move |reader| {
+            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+                reader,
+                Some(HeifInputFamily::Heif),
+                heif_guardrails.clone(),
+            )?;
             Ok(Box::new(decoder))
         }),
     );
+    let heif_guardrails = guardrails.clone();
     let heif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIF),
-        Box::new(|reader| {
-            let decoder =
-                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Heif))?;
+        Box::new(move |reader| {
+            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+                reader,
+                Some(HeifInputFamily::Heif),
+                heif_guardrails.clone(),
+            )?;
             Ok(Box::new(decoder))
         }),
     );
     let avif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_AVIF),
-        Box::new(|reader| {
-            let decoder =
-                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Avif))?;
+        Box::new(move |reader| {
+            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+                reader,
+                Some(HeifInputFamily::Avif),
+                guardrails.clone(),
+            )?;
             Ok(Box::new(decoder))
         }),
     );
@@ -380,13 +445,12 @@ impl DecodedRgbaImage {
     pub fn into_image_buffer_with_metadata(
         self,
     ) -> Result<ImageBufferWithMetadata, ImageConversionError> {
-        let expected_samples =
-            expected_rgba_sample_count(self.width, self.height).ok_or_else(|| {
-                ImageConversionError::SampleCountOverflow {
-                    width: self.width,
-                    height: self.height,
-                }
-            })?;
+        let expected_samples = expected_rgba_sample_count(self.width, self.height).ok_or(
+            ImageConversionError::SampleCountOverflow {
+                width: self.width,
+                height: self.height,
+            },
+        )?;
 
         let source_bit_depth = self.source_bit_depth;
         let icc_profile = self.icc_profile;
@@ -396,7 +460,7 @@ impl DecodedRgbaImage {
                 let actual_samples = pixels.len();
                 let buffer =
                     ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, pixels)
-                        .ok_or_else(|| ImageConversionError::SampleCountMismatch {
+                        .ok_or(ImageConversionError::SampleCountMismatch {
                             storage_bit_depth: 8,
                             width: self.width,
                             height: self.height,
@@ -409,7 +473,7 @@ impl DecodedRgbaImage {
                 let actual_samples = pixels.len();
                 let buffer =
                     ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(self.width, self.height, pixels)
-                        .ok_or_else(|| ImageConversionError::SampleCountMismatch {
+                        .ok_or(ImageConversionError::SampleCountMismatch {
                         storage_bit_depth: 16,
                         width: self.width,
                         height: self.height,
@@ -528,7 +592,7 @@ fn decode_error_to_image_error(err: DecodeError) -> ImageError {
 #[cfg(test)]
 mod tests {
     use super::{HeifImageDecoder, ImageBufferKind, ImageConversionError, ImageHookRegistration};
-    use crate::{DecodedRgbaImage, DecodedRgbaPixels};
+    use crate::{DecodeGuardrails, DecodedRgbaImage, DecodedRgbaPixels};
     use image::error::ParameterErrorKind;
     use image::{DynamicImage, ImageDecoder, ImageError};
 
@@ -676,6 +740,28 @@ mod tests {
                 assert_eq!(parameter.kind(), ParameterErrorKind::DimensionMismatch);
             }
             other => panic!("expected parameter error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_decoder_guardrails_surface_resource_limit_errors() {
+        let err = HeifImageDecoder::from_bytes_with_guardrails(
+            b"abcd",
+            DecodeGuardrails {
+                max_input_bytes: Some(3),
+                ..DecodeGuardrails::default()
+            },
+        )
+        .expect_err("guardrail should reject oversized input before decode");
+
+        match err {
+            ImageError::Decoding(_) => {
+                assert!(
+                    err.to_string().contains("max_input_bytes"),
+                    "expected guardrail error message, got: {err}"
+                );
+            }
+            other => panic!("expected image decoding error, got {other:?}"),
         }
     }
 

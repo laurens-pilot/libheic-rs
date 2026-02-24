@@ -5776,18 +5776,6 @@ fn decode_read_to_png_with_hint_and_guardrails<R: Read>(
 }
 
 #[cfg(feature = "image-integration")]
-fn decode_seekable_to_rgba_with_hint<R: Read + Seek>(
-    input_reader: R,
-    hint: Option<HeifInputFamily>,
-) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_seekable_to_rgba_with_hint_and_guardrails(
-        input_reader,
-        hint,
-        DecodeGuardrails::default(),
-    )
-}
-
-#[cfg(feature = "image-integration")]
 fn decode_seekable_to_rgba_with_hint_and_guardrails<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
