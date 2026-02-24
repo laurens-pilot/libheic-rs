@@ -1079,6 +1079,9 @@ pub fn decode_primary_heic_to_metadata(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UncompressedChannelRole {
     Monochrome,
+    Luma,
+    ChromaBlue,
+    ChromaRed,
     Red,
     Green,
     Blue,
@@ -1090,6 +1093,9 @@ impl UncompressedChannelRole {
     fn channel_index(self) -> Option<usize> {
         match self {
             UncompressedChannelRole::Monochrome => Some(UNCOMPRESSED_CHANNEL_MONO),
+            UncompressedChannelRole::Luma => Some(UNCOMPRESSED_CHANNEL_LUMA),
+            UncompressedChannelRole::ChromaBlue => Some(UNCOMPRESSED_CHANNEL_CB),
+            UncompressedChannelRole::ChromaRed => Some(UNCOMPRESSED_CHANNEL_CR),
             UncompressedChannelRole::Red => Some(UNCOMPRESSED_CHANNEL_RED),
             UncompressedChannelRole::Green => Some(UNCOMPRESSED_CHANNEL_GREEN),
             UncompressedChannelRole::Blue => Some(UNCOMPRESSED_CHANNEL_BLUE),
@@ -1600,23 +1606,52 @@ pub fn decode_primary_uncompressed_to_image(
     }
 
     let has_monochrome = has_channel[UNCOMPRESSED_CHANNEL_MONO];
+    let has_ycbcr = has_channel[UNCOMPRESSED_CHANNEL_LUMA]
+        || has_channel[UNCOMPRESSED_CHANNEL_CB]
+        || has_channel[UNCOMPRESSED_CHANNEL_CR];
+    let has_full_ycbcr = has_channel[UNCOMPRESSED_CHANNEL_LUMA]
+        && has_channel[UNCOMPRESSED_CHANNEL_CB]
+        && has_channel[UNCOMPRESSED_CHANNEL_CR];
     let has_rgb = has_channel[UNCOMPRESSED_CHANNEL_RED]
         || has_channel[UNCOMPRESSED_CHANNEL_GREEN]
         || has_channel[UNCOMPRESSED_CHANNEL_BLUE];
     let has_full_rgb = has_channel[UNCOMPRESSED_CHANNEL_RED]
         && has_channel[UNCOMPRESSED_CHANNEL_GREEN]
         && has_channel[UNCOMPRESSED_CHANNEL_BLUE];
-    if has_monochrome && has_rgb {
+    // Provenance: channel-set detection mirrors libheif uncompressed
+    // chroma/colorspace derivation in
+    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
+    // UncompressedImageCodec::get_heif_chroma_uncompressed.
+    if has_monochrome && (has_rgb || has_ycbcr) {
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail:
-                "simultaneous monochrome and RGB component sets are not supported in this baseline decoder"
+                "simultaneous monochrome and RGB/YCbCr component sets are not supported in this baseline decoder"
                     .to_string(),
         });
     }
-    if !has_monochrome && !has_full_rgb {
+    if has_rgb && has_ycbcr {
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail:
-                "baseline uncompressed decoder requires either monochrome or full RGB components"
+                "simultaneous RGB and YCbCr component sets are not supported in this baseline decoder"
+                    .to_string(),
+        });
+    }
+    if has_rgb && !has_full_rgb {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: "baseline uncompressed decoder requires full RGB channel sets (R/G/B)"
+                .to_string(),
+        });
+    }
+    if has_ycbcr && !has_full_ycbcr {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: "baseline uncompressed decoder requires full YCbCr channel sets (Y/Cb/Cr)"
+                .to_string(),
+        });
+    }
+    if !has_monochrome && !has_full_rgb && !has_full_ycbcr {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail:
+                "baseline uncompressed decoder requires either monochrome, full RGB, or full YCbCr components"
                     .to_string(),
         });
     }
@@ -1706,6 +1741,21 @@ pub fn decode_primary_uncompressed_to_image(
 
     let output_bit_depth = select_uncompressed_output_bit_depth(&has_channel, &channel_bit_depths)?;
     let alpha_default = max_sample_for_bit_depth(output_bit_depth)?;
+    let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
+    let ycbcr_transform = if has_full_ycbcr {
+        let matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
+        Some(
+            ycbcr_transform_from_matrix(matrix).map_err(|matrix_coefficients| {
+                DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "uncompressed nclx matrix_coefficients {matrix_coefficients} is not supported for YCbCr->RGB conversion"
+                    ),
+                }
+            })?,
+        )
+    } else {
+        None
+    };
 
     let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4).ok_or_else(|| {
         DecodeUncompressedError::InvalidInput {
@@ -1713,17 +1763,68 @@ pub fn decode_primary_uncompressed_to_image(
         }
     })?);
     for pixel_index in 0..pixel_count {
-        let (r_sample, g_sample, b_sample, color_depth) = if has_monochrome {
+        let (r_sample, g_sample, b_sample) = if has_monochrome {
             let mono = channel_samples[UNCOMPRESSED_CHANNEL_MONO]
                 .as_ref()
                 .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                     detail: "missing decoded monochrome channel samples".to_string(),
                 })?;
-            (
-                mono[pixel_index],
-                mono[pixel_index],
+            let scaled = scale_uncompressed_sample_bit_depth(
                 mono[pixel_index],
                 channel_bit_depths[UNCOMPRESSED_CHANNEL_MONO],
+                output_bit_depth,
+                "monochrome",
+            )?;
+            (scaled, scaled, scaled)
+        } else if has_full_ycbcr {
+            let y = channel_samples[UNCOMPRESSED_CHANNEL_LUMA]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded luma channel samples".to_string(),
+                })?;
+            let cb = channel_samples[UNCOMPRESSED_CHANNEL_CB]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded Cb channel samples".to_string(),
+                })?;
+            let cr = channel_samples[UNCOMPRESSED_CHANNEL_CR]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded Cr channel samples".to_string(),
+                })?;
+            // Provenance: no-subsampling uncompressed YCbCr conversion reuses
+            // libheif-aligned nclx/range-aware YCbCr->RGB conversion semantics
+            // from libheif/libheif/color-conversion/yuv2rgb.cc:
+            // Op_YCbCr_to_RGB::convert_colorspace.
+            let y_sample = scale_uncompressed_sample_bit_depth(
+                y[pixel_index],
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_LUMA],
+                output_bit_depth,
+                "luma",
+            )?;
+            let cb_sample = scale_uncompressed_sample_bit_depth(
+                cb[pixel_index],
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_CB],
+                output_bit_depth,
+                "Cb",
+            )?;
+            let cr_sample = scale_uncompressed_sample_bit_depth(
+                cr[pixel_index],
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_CR],
+                output_bit_depth,
+                "Cr",
+            )?;
+            let transform =
+                ycbcr_transform.ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing YCbCr transform for decoded YCbCr channel set".to_string(),
+                })?;
+            ycbcr_to_rgb_components(
+                i32::from(y_sample),
+                i32::from(cb_sample),
+                i32::from(cr_sample),
+                output_bit_depth,
+                ycbcr_range,
+                transform,
             )
         } else {
             let red = channel_samples[UNCOMPRESSED_CHANNEL_RED]
@@ -1741,9 +1842,32 @@ pub fn decode_primary_uncompressed_to_image(
                 .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                     detail: "missing decoded blue channel samples".to_string(),
                 })?;
-            (red[pixel_index], green[pixel_index], blue[pixel_index], 0)
+            (
+                scale_uncompressed_sample_bit_depth(
+                    red[pixel_index],
+                    channel_bit_depths[UNCOMPRESSED_CHANNEL_RED],
+                    output_bit_depth,
+                    "red",
+                )?,
+                scale_uncompressed_sample_bit_depth(
+                    green[pixel_index],
+                    channel_bit_depths[UNCOMPRESSED_CHANNEL_GREEN],
+                    output_bit_depth,
+                    "green",
+                )?,
+                scale_uncompressed_sample_bit_depth(
+                    blue[pixel_index],
+                    channel_bit_depths[UNCOMPRESSED_CHANNEL_BLUE],
+                    output_bit_depth,
+                    "blue",
+                )?,
+            )
         };
-        let alpha_sample = if has_channel[UNCOMPRESSED_CHANNEL_ALPHA] {
+        rgba.push(r_sample);
+        rgba.push(g_sample);
+        rgba.push(b_sample);
+
+        let alpha_output = if has_channel[UNCOMPRESSED_CHANNEL_ALPHA] {
             channel_samples[UNCOMPRESSED_CHANNEL_ALPHA]
                 .as_ref()
                 .ok_or_else(|| DecodeUncompressedError::InvalidInput {
@@ -1753,39 +1877,9 @@ pub fn decode_primary_uncompressed_to_image(
             alpha_default
         };
 
-        if has_monochrome {
-            let scaled = scale_uncompressed_sample_bit_depth(
-                r_sample,
-                color_depth,
-                output_bit_depth,
-                "monochrome",
-            )?;
-            rgba.push(scaled);
-            rgba.push(scaled);
-            rgba.push(scaled);
-        } else {
-            rgba.push(scale_uncompressed_sample_bit_depth(
-                r_sample,
-                channel_bit_depths[UNCOMPRESSED_CHANNEL_RED],
-                output_bit_depth,
-                "red",
-            )?);
-            rgba.push(scale_uncompressed_sample_bit_depth(
-                g_sample,
-                channel_bit_depths[UNCOMPRESSED_CHANNEL_GREEN],
-                output_bit_depth,
-                "green",
-            )?);
-            rgba.push(scale_uncompressed_sample_bit_depth(
-                b_sample,
-                channel_bit_depths[UNCOMPRESSED_CHANNEL_BLUE],
-                output_bit_depth,
-                "blue",
-            )?);
-        }
         rgba.push(if has_channel[UNCOMPRESSED_CHANNEL_ALPHA] {
             scale_uncompressed_sample_bit_depth(
-                alpha_sample,
+                alpha_output,
                 channel_bit_depths[UNCOMPRESSED_CHANNEL_ALPHA],
                 output_bit_depth,
                 "alpha",
@@ -2232,6 +2326,9 @@ fn uncompressed_role_from_component_type(
 ) -> Result<UncompressedChannelRole, DecodeUncompressedError> {
     match component_type {
         UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME => Ok(UncompressedChannelRole::Monochrome),
+        UNCOMPRESSED_COMPONENT_TYPE_LUMA => Ok(UncompressedChannelRole::Luma),
+        UNCOMPRESSED_COMPONENT_TYPE_CB => Ok(UncompressedChannelRole::ChromaBlue),
+        UNCOMPRESSED_COMPONENT_TYPE_CR => Ok(UncompressedChannelRole::ChromaRed),
         UNCOMPRESSED_COMPONENT_TYPE_RED => Ok(UncompressedChannelRole::Red),
         UNCOMPRESSED_COMPONENT_TYPE_GREEN => Ok(UncompressedChannelRole::Green),
         UNCOMPRESSED_COMPONENT_TYPE_BLUE => Ok(UncompressedChannelRole::Blue),
@@ -2239,7 +2336,7 @@ fn uncompressed_role_from_component_type(
         UNCOMPRESSED_COMPONENT_TYPE_PADDED => Ok(UncompressedChannelRole::Padded),
         _ => Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
-                "unsupported uncompressed component_type {component_type}; baseline currently supports monochrome/R/G/B/alpha/padded"
+                "unsupported uncompressed component_type {component_type}; baseline currently supports monochrome/Y/Cb/Cr/R/G/B/alpha/padded"
             ),
         }),
     }
@@ -2404,6 +2501,9 @@ fn primary_uncompressed_uses_generic_compression(
 fn uncompressed_channel_name(channel_index: usize) -> &'static str {
     match channel_index {
         UNCOMPRESSED_CHANNEL_MONO => "monochrome",
+        UNCOMPRESSED_CHANNEL_LUMA => "luma",
+        UNCOMPRESSED_CHANNEL_CB => "Cb",
+        UNCOMPRESSED_CHANNEL_CR => "Cr",
         UNCOMPRESSED_CHANNEL_RED => "red",
         UNCOMPRESSED_CHANNEL_GREEN => "green",
         UNCOMPRESSED_CHANNEL_BLUE => "blue",
@@ -3247,17 +3347,23 @@ const UNCOMPRESSED_INTERLEAVE_ROW: u8 = 3;
 const UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT: u8 = 4;
 const UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED: u8 = 0;
 const UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME: u16 = 0;
+const UNCOMPRESSED_COMPONENT_TYPE_LUMA: u16 = 1;
+const UNCOMPRESSED_COMPONENT_TYPE_CB: u16 = 2;
+const UNCOMPRESSED_COMPONENT_TYPE_CR: u16 = 3;
 const UNCOMPRESSED_COMPONENT_TYPE_RED: u16 = 4;
 const UNCOMPRESSED_COMPONENT_TYPE_GREEN: u16 = 5;
 const UNCOMPRESSED_COMPONENT_TYPE_BLUE: u16 = 6;
 const UNCOMPRESSED_COMPONENT_TYPE_ALPHA: u16 = 7;
 const UNCOMPRESSED_COMPONENT_TYPE_PADDED: u16 = 12;
-const UNCOMPRESSED_CHANNEL_COUNT: usize = 5;
+const UNCOMPRESSED_CHANNEL_COUNT: usize = 8;
 const UNCOMPRESSED_CHANNEL_MONO: usize = 0;
-const UNCOMPRESSED_CHANNEL_RED: usize = 1;
-const UNCOMPRESSED_CHANNEL_GREEN: usize = 2;
-const UNCOMPRESSED_CHANNEL_BLUE: usize = 3;
-const UNCOMPRESSED_CHANNEL_ALPHA: usize = 4;
+const UNCOMPRESSED_CHANNEL_LUMA: usize = 1;
+const UNCOMPRESSED_CHANNEL_CB: usize = 2;
+const UNCOMPRESSED_CHANNEL_CR: usize = 3;
+const UNCOMPRESSED_CHANNEL_RED: usize = 4;
+const UNCOMPRESSED_CHANNEL_GREEN: usize = 5;
+const UNCOMPRESSED_CHANNEL_BLUE: usize = 6;
+const UNCOMPRESSED_CHANNEL_ALPHA: usize = 7;
 const ALPHA_AUX_TYPES: [&[u8]; 3] = [
     b"urn:mpeg:avc:2015:auxid:1",
     b"urn:mpeg:hevc:2015:auxid:1",

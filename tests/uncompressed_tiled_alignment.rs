@@ -243,6 +243,93 @@ fn decodes_tile_component_r7_plus_1_fixture() {
 }
 
 #[test]
+fn decodes_component_interleave_yuv_tiled_fixture() {
+    let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_comp_YUV_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("component-interleave YUV fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 0,
+        "expected component interleave"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+    assert_eq!(properties.unc_c.components.len(), 3);
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("component-interleave YUV fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 8);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+    assert!(
+        decoded
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+        "YUV fixture should produce chroma-varying RGB output"
+    );
+}
+
+#[test]
+fn decodes_pixel_interleave_yuv_tiled_fixture() {
+    let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_pix_YUV_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("pixel-interleave YUV fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 1,
+        "expected pixel interleave"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+    assert_eq!(properties.unc_c.components.len(), 3);
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("pixel-interleave YUV fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 8);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+    assert!(
+        decoded
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+        "YUV fixture should produce chroma-varying RGB output"
+    );
+}
+
+#[test]
+fn decodes_tile_component_yuv_tiled_fixture() {
+    let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_tile_YUV_tiled.heic");
+    let properties = parse_primary_uncompressed_item_properties(&input)
+        .expect("tile-component YUV fixture properties should parse");
+    assert_eq!(
+        properties.unc_c.interleave_type, 4,
+        "expected tile-component interleave"
+    );
+    assert_eq!(properties.unc_c.sampling_type, 0, "expected no subsampling");
+    assert_eq!(properties.unc_c.components.len(), 3);
+
+    let decoded = decode_primary_uncompressed_to_image(&input)
+        .expect("tile-component YUV fixture should decode");
+    assert_eq!((decoded.width, decoded.height), (30, 20));
+    assert_eq!(decoded.bit_depth, 8);
+    assert_eq!(
+        decoded.rgba.len(),
+        decoded.width as usize * decoded.height as usize * 4
+    );
+    assert!(
+        decoded
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+        "YUV fixture should produce chroma-varying RGB output"
+    );
+}
+
+#[test]
 fn decodes_tiled_r5g6b5_component_fixture_without_mixed_depth_double_scaling() {
     let input = read_fixture("../libheif/fuzzing/data/corpus/uncompressed_comp_R5G6B5_tiled.heic");
     let decoded = decode_primary_uncompressed_to_image(&input)
