@@ -470,14 +470,19 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_temp_path() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("libheic-rs-source-{nanos}.bin"))
+        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("libheic-rs-source-{nanos}-{pid}-{counter}.bin"))
     }
 
     #[test]
