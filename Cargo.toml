@@ -35,3 +35,7 @@ path = "src/bin/heif-decode.rs"
 name = "heif-image-adapter-bench"
 path = "src/bin/heif-image-adapter-bench.rs"
 required-features = ["image-integration"]
+
+[[bin]]
+name = "heif-ingestion-bench"
+path = "src/bin/heif-ingestion-bench.rs"
