@@ -14,7 +14,7 @@ use rav1d::src::lib::{
 };
 use rav1d::Dav1dResult;
 use scuffle_h265::{NALUnitType, SpsNALUnit};
-use source::{FileSource, RandomAccessSource, SourceReadError};
+use source::{FileSource, RandomAccessSource, SourceReadError, TempFileSpoolSource};
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::c_void;
@@ -5553,18 +5553,13 @@ fn decode_source_to_png_with_hint<S: RandomAccessSource>(
     write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
-fn read_all_from_reader<R: Read>(mut input_reader: R) -> Result<Vec<u8>, DecodeError> {
-    let mut input = Vec::new();
-    input_reader.read_to_end(&mut input)?;
-    Ok(input)
-}
-
 fn decode_read_to_rgba_with_hint<R: Read>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let input = read_all_from_reader(input_reader)?;
-    decode_bytes_to_rgba_with_hint(&input, hint)
+    let mut source = TempFileSpoolSource::from_reader(input_reader)
+        .map_err(decode_error_from_source_read_error)?;
+    decode_source_to_rgba_with_hint(&mut source, hint)
 }
 
 fn decode_read_to_png_with_hint<R: Read>(
@@ -5572,8 +5567,9 @@ fn decode_read_to_png_with_hint<R: Read>(
     hint: Option<HeifInputFamily>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
-    let input = read_all_from_reader(input_reader)?;
-    decode_bytes_to_png_with_hint(&input, hint, output_path)
+    let mut source = TempFileSpoolSource::from_reader(input_reader)
+        .map_err(decode_error_from_source_read_error)?;
+    decode_source_to_png_with_hint(&mut source, hint, output_path)
 }
 
 #[cfg(feature = "image-integration")]

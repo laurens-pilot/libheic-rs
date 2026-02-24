@@ -1,8 +1,10 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Shared random-access source abstraction for HEIF payload ingestion.
 pub trait RandomAccessSource {
@@ -213,9 +215,167 @@ impl FileSource {
     }
 }
 
+const TEMP_SPOOL_PREFIX: &str = "libheic-rs-spool";
+static TEMP_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_temp_spool_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_nanos());
+    let counter = TEMP_SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{TEMP_SPOOL_PREFIX}-{}-{nanos}-{counter}.bin",
+        std::process::id()
+    ))
+}
+
+fn create_temp_spool_file() -> Result<(PathBuf, File), SourceReadError> {
+    let mut last_already_exists: Option<std::io::Error> = None;
+    for _ in 0..32 {
+        let path = next_temp_spool_path();
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_already_exists = Some(source);
+            }
+            Err(source) => {
+                return Err(SourceReadError::Io {
+                    operation: "temp-spool-open",
+                    offset: 0,
+                    requested: 0,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(SourceReadError::Io {
+        operation: "temp-spool-open",
+        offset: 0,
+        requested: 0,
+        source: last_already_exists.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "failed to create unique temp spool path",
+            )
+        }),
+    })
+}
+
+/// Random-access source backed by a temporary file that is deleted on drop.
+#[derive(Debug)]
+pub struct TempFileSpoolSource {
+    path: PathBuf,
+    source: Option<FileSource>,
+}
+
+impl TempFileSpoolSource {
+    /// Spool all bytes from a non-seek `Read` into one temp file and reopen it
+    /// as a seek-backed random-access source.
+    pub fn from_reader<R: Read>(mut input_reader: R) -> Result<Self, SourceReadError> {
+        let (path, mut spool_file) = create_temp_spool_file()?;
+        let spool_result = (|| {
+            let mut bytes_written = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let bytes_read =
+                    input_reader
+                        .read(&mut buffer)
+                        .map_err(|source| SourceReadError::Io {
+                            operation: "temp-spool-read",
+                            offset: bytes_written,
+                            requested: buffer.len(),
+                            source,
+                        })?;
+                if bytes_read == 0 {
+                    break;
+                }
+                spool_file
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|source| SourceReadError::Io {
+                        operation: "temp-spool-write",
+                        offset: bytes_written,
+                        requested: bytes_read,
+                        source,
+                    })?;
+                bytes_written = bytes_written.checked_add(bytes_read as u64).ok_or(
+                    SourceReadError::RangeOverflow {
+                        offset: bytes_written,
+                        requested: bytes_read,
+                    },
+                )?;
+            }
+
+            spool_file.flush().map_err(|source| SourceReadError::Io {
+                operation: "temp-spool-flush",
+                offset: bytes_written,
+                requested: 0,
+                source,
+            })?;
+            drop(spool_file);
+            FileSource::open(&path)
+        })();
+
+        match spool_result {
+            Ok(source) => Ok(Self {
+                path,
+                source: Some(source),
+            }),
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                Err(err)
+            }
+        }
+    }
+
+    fn source_ref(&self) -> &FileSource {
+        self.source
+            .as_ref()
+            .expect("temp spool source should remain present while in use")
+    }
+
+    fn source_mut(&mut self) -> &mut FileSource {
+        self.source
+            .as_mut()
+            .expect("temp spool source should remain present while in use")
+    }
+
+    #[cfg(test)]
+    fn spool_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl RandomAccessSource for TempFileSpoolSource {
+    fn len(&self) -> u64 {
+        self.source_ref().len()
+    }
+
+    fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), SourceReadError> {
+        self.source_mut().read_exact_at(offset, output)
+    }
+}
+
+impl Drop for TempFileSpoolSource {
+    fn drop(&mut self) {
+        // Close file handle before removing the spool path.
+        let _ = self.source.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FileSource, RandomAccessSource, SeekableSource, SliceSource, SourceReadError};
+    use super::{
+        FileSource, RandomAccessSource, SeekableSource, SliceSource, SourceReadError,
+        TempFileSpoolSource,
+    };
     use std::fs;
     use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::path::PathBuf;
@@ -393,5 +553,52 @@ mod tests {
         assert_eq!(&output, b"source");
 
         fs::remove_file(&path).expect("temp source fixture should be removed");
+    }
+
+    #[test]
+    fn temp_file_spool_source_spools_and_cleans_up_on_drop() {
+        let mut source = TempFileSpoolSource::from_reader(Cursor::new(b"spooled-heif".to_vec()))
+            .expect("temp spool source should initialize from reader");
+        let path = source.spool_path().to_path_buf();
+        assert!(
+            path.exists(),
+            "spool file should exist while source is alive"
+        );
+
+        let mut output = [0_u8; 6];
+        source
+            .read_exact_at(2, &mut output)
+            .expect("temp spool source should serve random-access reads");
+        assert_eq!(&output, b"ooled-");
+
+        drop(source);
+        assert!(!path.exists(), "spool file should be removed after drop");
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("forced spool read failure"))
+        }
+    }
+
+    #[test]
+    fn temp_file_spool_source_reports_reader_errors() {
+        let err = TempFileSpoolSource::from_reader(FailingReader)
+            .expect_err("reader failures should surface as source IO errors");
+        match err {
+            SourceReadError::Io {
+                operation,
+                offset,
+                requested,
+                ..
+            } => {
+                assert_eq!(operation, "temp-spool-read");
+                assert_eq!(offset, 0);
+                assert_eq!(requested, 64 * 1024);
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
     }
 }
