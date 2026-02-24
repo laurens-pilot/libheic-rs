@@ -1,0 +1,64 @@
+use libheic_rs::decode_primary_heic_to_image;
+use libheic_rs::isobmff::{extract_primary_heic_item_data_with_grid, HeicPrimaryItemDataWithGrid};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+#[test]
+fn decodes_real_heic_grid_fixture_with_expected_descriptor_and_tile_coverage() {
+    let fixture = fixture_path("tests/fixtures/heic_grid_primary_32.heic");
+    let input = std::fs::read(&fixture).expect("HEIC grid fixture must be readable");
+
+    let grid = match extract_primary_heic_item_data_with_grid(&input)
+        .expect("HEIC grid fixture should parse")
+    {
+        HeicPrimaryItemDataWithGrid::Grid(grid) => grid,
+        HeicPrimaryItemDataWithGrid::Coded(_) => {
+            panic!("fixture primary item must resolve to HEIC grid data")
+        }
+    };
+
+    assert_eq!((grid.descriptor.columns, grid.descriptor.rows), (2, 2));
+    assert_eq!(
+        (grid.descriptor.output_width, grid.descriptor.output_height),
+        (32, 32)
+    );
+    assert_eq!(grid.tiles.len(), 4);
+
+    let decoded = decode_primary_heic_to_image(&input)
+        .expect("HEIC grid fixture should decode through stitched tile path");
+    assert_eq!((decoded.width, decoded.height), (32, 32));
+    assert_eq!((decoded.y_plane.width, decoded.y_plane.height), (32, 32));
+
+    let quadrant_sums = [
+        sum_luma_quadrant(&decoded.y_plane.samples, 32, 0, 0, 16, 16),
+        sum_luma_quadrant(&decoded.y_plane.samples, 32, 16, 0, 16, 16),
+        sum_luma_quadrant(&decoded.y_plane.samples, 32, 0, 16, 16, 16),
+        sum_luma_quadrant(&decoded.y_plane.samples, 32, 16, 16, 16, 16),
+    ];
+    let unique_quadrants = quadrant_sums.into_iter().collect::<HashSet<_>>();
+    assert_eq!(unique_quadrants.len(), 4);
+}
+
+fn sum_luma_quadrant(
+    samples: &[u16],
+    image_width: usize,
+    origin_x: usize,
+    origin_y: usize,
+    width: usize,
+    height: usize,
+) -> u64 {
+    let mut sum = 0_u64;
+    for y in origin_y..(origin_y + height) {
+        let row_offset = y
+            .checked_mul(image_width)
+            .expect("quadrant row offset should fit usize");
+        for x in origin_x..(origin_x + width) {
+            sum = sum.saturating_add(samples[row_offset + x] as u64);
+        }
+    }
+    sum
+}
+
+fn fixture_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
