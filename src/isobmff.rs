@@ -4626,16 +4626,27 @@ fn append_iloc_extents_to_payload_from_source(
                 length: end,
             }
         })?;
-        let bytes = source.read_range(start, extent_len).map_err(|_| {
-            ExtractAvifItemDataError::ExtentOutOfBounds {
+        let output_start = output.len();
+        let output_end = output_start.checked_add(extent_len).ok_or(
+            ExtractAvifItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            },
+        )?;
+        output.resize(output_end, 0);
+        if source
+            .read_exact_at(start, &mut output[output_start..output_end])
+            .is_err()
+        {
+            output.truncate(output_start);
+            return Err(ExtractAvifItemDataError::ExtentOutOfBounds {
                 item_id,
                 construction_method,
                 start,
                 length: extent.length,
                 available,
-            }
-        })?;
-        output.extend_from_slice(&bytes);
+            });
+        }
     }
 
     Ok(())
@@ -4726,16 +4737,27 @@ fn append_iloc_extents_to_payload_for_heic_from_source(
                 length: end,
             }
         })?;
-        let bytes = source.read_range(start, extent_len).map_err(|_| {
-            ExtractHeicItemDataError::ExtentOutOfBounds {
+        let output_start = output.len();
+        let output_end = output_start.checked_add(extent_len).ok_or(
+            ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            },
+        )?;
+        output.resize(output_end, 0);
+        if source
+            .read_exact_at(start, &mut output[output_start..output_end])
+            .is_err()
+        {
+            output.truncate(output_start);
+            return Err(ExtractHeicItemDataError::ExtentOutOfBounds {
                 item_id,
                 construction_method,
                 start,
                 length: extent.length,
                 available,
-            }
-        })?;
-        output.extend_from_slice(&bytes);
+            });
+        }
     }
 
     Ok(())
@@ -4829,16 +4851,27 @@ fn append_iloc_extents_to_payload_for_uncompressed_from_source(
                 length: end,
             }
         })?;
-        let bytes = source.read_range(start, extent_len).map_err(|_| {
-            ExtractUncompressedItemDataError::ExtentOutOfBounds {
+        let output_start = output.len();
+        let output_end = output_start.checked_add(extent_len).ok_or(
+            ExtractUncompressedItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            },
+        )?;
+        output.resize(output_end, 0);
+        if source
+            .read_exact_at(start, &mut output[output_start..output_end])
+            .is_err()
+        {
+            output.truncate(output_start);
+            return Err(ExtractUncompressedItemDataError::ExtentOutOfBounds {
                 item_id,
                 construction_method,
                 start,
                 length: extent.length,
                 available,
-            }
-        })?;
-        output.extend_from_slice(&bytes);
+            });
+        }
     }
 
     Ok(())

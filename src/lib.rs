@@ -5197,16 +5197,18 @@ fn append_heic_item_location_extents_from_source(
 ) -> Option<()> {
     for extent in &location.extents {
         let start = location.base_offset.checked_add(extent.offset)?;
-        let end = start.checked_add(extent.length)?;
+        start.checked_add(extent.length)?;
         let extent_len = usize::try_from(extent.length).ok()?;
-        let bytes = source.read_range(start, extent_len).ok()?;
-        if bytes.len() != extent_len || u64::try_from(bytes.len()).ok()? != extent.length {
+        let output_start = output.len();
+        let output_end = output_start.checked_add(extent_len)?;
+        output.resize(output_end, 0);
+        if source
+            .read_exact_at(start, &mut output[output_start..output_end])
+            .is_err()
+        {
+            output.truncate(output_start);
             return None;
         }
-        if start.checked_add(extent.length)? != end {
-            return None;
-        }
-        output.extend_from_slice(&bytes);
     }
     Some(())
 }
