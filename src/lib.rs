@@ -24,6 +24,8 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::{self, NonNull};
 
+#[cfg(feature = "image-integration")]
+pub mod image_integration;
 pub mod isobmff;
 
 /// Stable high-level decoder error categories for callers and tooling.
