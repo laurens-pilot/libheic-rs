@@ -27,6 +27,7 @@ use std::ptr::{self, NonNull};
 #[cfg(feature = "image-integration")]
 pub mod image_integration;
 pub mod isobmff;
+pub mod source;
 
 /// Stable high-level decoder error categories for callers and tooling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
