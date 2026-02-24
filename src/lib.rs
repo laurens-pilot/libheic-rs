@@ -61,6 +61,7 @@ pub enum DecodeError {
     Io(std::io::Error),
     AvifDecode(DecodeAvifError),
     HeicDecode(DecodeHeicError),
+    UncompressedDecode(DecodeUncompressedError),
     PngEncoding(png::EncodingError),
     TransformGuard(TransformGuardError),
     OutputBufferOverflow {
@@ -241,6 +242,7 @@ impl DecodeError {
             DecodeError::Io(_) => DecodeErrorCategory::Io,
             DecodeError::AvifDecode(err) => err.category(),
             DecodeError::HeicDecode(err) => err.category(),
+            DecodeError::UncompressedDecode(err) => err.category(),
             DecodeError::PngEncoding(_) => DecodeErrorCategory::OutputEncoding,
             DecodeError::TransformGuard(err) => err.category(),
             DecodeError::OutputBufferOverflow { .. } => DecodeErrorCategory::OutputEncoding,
@@ -255,6 +257,7 @@ impl Display for DecodeError {
             DecodeError::Io(err) => write!(f, "I/O error: {err}"),
             DecodeError::AvifDecode(err) => write!(f, "{err}"),
             DecodeError::HeicDecode(err) => write!(f, "{err}"),
+            DecodeError::UncompressedDecode(err) => write!(f, "{err}"),
             DecodeError::PngEncoding(err) => write!(f, "PNG encode error: {err}"),
             DecodeError::TransformGuard(err) => write!(f, "{err}"),
             DecodeError::OutputBufferOverflow {
@@ -276,6 +279,7 @@ impl Error for DecodeError {
             DecodeError::Io(err) => Some(err),
             DecodeError::AvifDecode(err) => Some(err),
             DecodeError::HeicDecode(err) => Some(err),
+            DecodeError::UncompressedDecode(err) => Some(err),
             DecodeError::PngEncoding(err) => Some(err),
             DecodeError::TransformGuard(_) => None,
             DecodeError::OutputBufferOverflow { .. } => None,
@@ -299,6 +303,12 @@ impl From<DecodeAvifError> for DecodeError {
 impl From<DecodeHeicError> for DecodeError {
     fn from(value: DecodeHeicError) -> Self {
         Self::HeicDecode(value)
+    }
+}
+
+impl From<DecodeUncompressedError> for DecodeError {
+    fn from(value: DecodeUncompressedError) -> Self {
+        Self::UncompressedDecode(value)
     }
 }
 
@@ -401,6 +411,16 @@ pub struct DecodedHeicImage {
     pub y_plane: HeicPlane,
     pub u_plane: Option<HeicPlane>,
     pub v_plane: Option<HeicPlane>,
+}
+
+/// Decoded uncompressed HEIF image materialized as RGBA samples.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedUncompressedImage {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub rgba: Vec<u16>,
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 /// Parsed HEIC image metadata extracted from the primary HEVC SPS.
@@ -896,6 +916,67 @@ impl From<isobmff::ExtractHeicItemDataError> for DecodeHeicError {
     }
 }
 
+/// Errors from uncompressed (`unci`) primary-item decode.
+#[derive(Debug)]
+pub enum DecodeUncompressedError {
+    ParsePrimaryProperties(isobmff::ParsePrimaryUncompressedPropertiesError),
+    ParsePrimaryTransforms(isobmff::ParsePrimaryItemTransformPropertiesError),
+    ExtractPrimaryPayload(isobmff::ExtractUncompressedItemDataError),
+    UnsupportedFeature { detail: String },
+    InvalidInput { detail: String },
+}
+
+impl DecodeUncompressedError {
+    /// Return the stable high-level category for this uncompressed decode failure.
+    pub fn category(&self) -> DecodeErrorCategory {
+        match self {
+            DecodeUncompressedError::ParsePrimaryProperties(_)
+            | DecodeUncompressedError::ParsePrimaryTransforms(_)
+            | DecodeUncompressedError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
+            DecodeUncompressedError::UnsupportedFeature { .. } => {
+                DecodeErrorCategory::UnsupportedFeature
+            }
+            DecodeUncompressedError::InvalidInput { .. } => DecodeErrorCategory::MalformedInput,
+        }
+    }
+}
+
+impl Display for DecodeUncompressedError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeUncompressedError::ParsePrimaryProperties(err) => write!(f, "{err}"),
+            DecodeUncompressedError::ParsePrimaryTransforms(err) => write!(f, "{err}"),
+            DecodeUncompressedError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
+            DecodeUncompressedError::UnsupportedFeature { detail } => write!(f, "{detail}"),
+            DecodeUncompressedError::InvalidInput { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl Error for DecodeUncompressedError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            DecodeUncompressedError::ParsePrimaryProperties(err) => Some(err),
+            DecodeUncompressedError::ParsePrimaryTransforms(err) => Some(err),
+            DecodeUncompressedError::ExtractPrimaryPayload(err) => Some(err),
+            DecodeUncompressedError::UnsupportedFeature { .. }
+            | DecodeUncompressedError::InvalidInput { .. } => None,
+        }
+    }
+}
+
+impl From<isobmff::ParsePrimaryUncompressedPropertiesError> for DecodeUncompressedError {
+    fn from(value: isobmff::ParsePrimaryUncompressedPropertiesError) -> Self {
+        Self::ParsePrimaryProperties(value)
+    }
+}
+
+impl From<isobmff::ExtractUncompressedItemDataError> for DecodeUncompressedError {
+    fn from(value: isobmff::ExtractUncompressedItemDataError) -> Self {
+        Self::ExtractPrimaryPayload(value)
+    }
+}
+
 /// Decode the primary AVIF item into an internal planar YUV image model.
 pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
     // Provenance: mirrors libheif configuration+payload bitstream assembly in
@@ -993,6 +1074,908 @@ pub fn decode_primary_heic_to_metadata(
 
     let (_, metadata, _, _) = decode_primary_heic_stream_and_metadata(input)?;
     Ok(metadata)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncompressedChannelRole {
+    Monochrome,
+    Red,
+    Green,
+    Blue,
+    Alpha,
+    Padded,
+}
+
+impl UncompressedChannelRole {
+    fn channel_index(self) -> Option<usize> {
+        match self {
+            UncompressedChannelRole::Monochrome => Some(UNCOMPRESSED_CHANNEL_MONO),
+            UncompressedChannelRole::Red => Some(UNCOMPRESSED_CHANNEL_RED),
+            UncompressedChannelRole::Green => Some(UNCOMPRESSED_CHANNEL_GREEN),
+            UncompressedChannelRole::Blue => Some(UNCOMPRESSED_CHANNEL_BLUE),
+            UncompressedChannelRole::Alpha => Some(UNCOMPRESSED_CHANNEL_ALPHA),
+            UncompressedChannelRole::Padded => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UncompressedComponentDecodeSpec {
+    role: UncompressedChannelRole,
+    bit_depth: u8,
+    component_align_size: u8,
+}
+
+struct UncompressedBitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+    pixel_start_byte: usize,
+    row_start_byte: usize,
+    tile_start_byte: usize,
+}
+
+impl<'a> UncompressedBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_offset: 0,
+            pixel_start_byte: 0,
+            row_start_byte: 0,
+            tile_start_byte: 0,
+        }
+    }
+
+    fn mark_pixel_start(&mut self) {
+        self.pixel_start_byte = self.current_byte_index();
+    }
+
+    fn mark_row_start(&mut self) {
+        self.row_start_byte = self.current_byte_index();
+    }
+
+    fn mark_tile_start(&mut self) {
+        self.tile_start_byte = self.current_byte_index();
+    }
+
+    fn current_byte_index(&self) -> usize {
+        self.bit_offset / 8
+    }
+
+    fn skip_to_byte_boundary(&mut self) {
+        let residual = self.bit_offset % 8;
+        if residual != 0 {
+            self.bit_offset += 8 - residual;
+        }
+    }
+
+    fn skip_bits(&mut self, bits: usize) -> Result<(), DecodeUncompressedError> {
+        let total_bits = self.data.len().checked_mul(8).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed payload bit-length overflow".to_string(),
+            }
+        })?;
+        let next_offset = self.bit_offset.checked_add(bits).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed payload bit cursor overflow".to_string(),
+            }
+        })?;
+        if next_offset > total_bits {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncompressed payload is truncated while skipping {bits} bits (only {} bits remain)",
+                    total_bits.saturating_sub(self.bit_offset)
+                ),
+            });
+        }
+        self.bit_offset = next_offset;
+        Ok(())
+    }
+
+    fn skip_bytes(&mut self, bytes: usize) -> Result<(), DecodeUncompressedError> {
+        let bits = bytes
+            .checked_mul(8)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed payload byte-skip overflow".to_string(),
+            })?;
+        self.skip_bits(bits)
+    }
+
+    fn read_bits(&mut self, bit_count: usize) -> Result<u16, DecodeUncompressedError> {
+        if bit_count == 0 || bit_count > 16 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "unsupported uncompressed component bit depth {bit_count}, expected 1..=16"
+                ),
+            });
+        }
+
+        let total_bits = self.data.len().checked_mul(8).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed payload bit-length overflow".to_string(),
+            }
+        })?;
+        let end_offset = self.bit_offset.checked_add(bit_count).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed payload bit cursor overflow".to_string(),
+            }
+        })?;
+        if end_offset > total_bits {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncompressed payload is truncated while reading {bit_count}-bit sample (only {} bits remain)",
+                    total_bits.saturating_sub(self.bit_offset)
+                ),
+            });
+        }
+
+        let mut value = 0_u16;
+        for _ in 0..bit_count {
+            let byte_index = self.bit_offset / 8;
+            let bit_in_byte = 7 - (self.bit_offset % 8);
+            let bit = (self.data[byte_index] >> bit_in_byte) & 1;
+            value = (value << 1) | u16::from(bit);
+            self.bit_offset += 1;
+        }
+        Ok(value)
+    }
+
+    fn handle_pixel_alignment(&mut self, pixel_size: u32) -> Result<(), DecodeUncompressedError> {
+        if pixel_size == 0 {
+            return Ok(());
+        }
+
+        let pixel_size =
+            usize::try_from(pixel_size).map_err(|_| DecodeUncompressedError::InvalidInput {
+                detail: format!("uncC pixel_size {pixel_size} cannot be represented"),
+            })?;
+        let bytes_in_pixel = self
+            .current_byte_index()
+            .checked_sub(self.pixel_start_byte)
+            .ok_or(DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed pixel alignment cursor underflow".to_string(),
+            })?;
+
+        if pixel_size > bytes_in_pixel {
+            self.skip_bytes(pixel_size - bytes_in_pixel)?;
+            return Ok(());
+        }
+        if pixel_size == bytes_in_pixel {
+            return Ok(());
+        }
+
+        Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncC pixel_size {pixel_size} is smaller than decoded pixel payload ({bytes_in_pixel} bytes)"
+            ),
+        })
+    }
+
+    fn handle_row_alignment(&mut self, alignment: u32) -> Result<(), DecodeUncompressedError> {
+        self.skip_to_byte_boundary();
+        if alignment == 0 {
+            return Ok(());
+        }
+
+        let alignment =
+            usize::try_from(alignment).map_err(|_| DecodeUncompressedError::InvalidInput {
+                detail: format!("uncC row_align_size {alignment} cannot be represented"),
+            })?;
+        let bytes_in_row = self
+            .current_byte_index()
+            .checked_sub(self.row_start_byte)
+            .ok_or(DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed row alignment cursor underflow".to_string(),
+            })?;
+        let residual = bytes_in_row % alignment;
+        if residual != 0 {
+            self.skip_bytes(alignment - residual)?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_tile_alignment(&mut self, alignment: u32) -> Result<(), DecodeUncompressedError> {
+        if alignment == 0 {
+            return Ok(());
+        }
+
+        let alignment =
+            usize::try_from(alignment).map_err(|_| DecodeUncompressedError::InvalidInput {
+                detail: format!("uncC tile_align_size {alignment} cannot be represented"),
+            })?;
+        let bytes_in_tile = self
+            .current_byte_index()
+            .checked_sub(self.tile_start_byte)
+            .ok_or(DecodeUncompressedError::InvalidInput {
+                detail: "uncompressed tile alignment cursor underflow".to_string(),
+            })?;
+        let residual = bytes_in_tile % alignment;
+        if residual != 0 {
+            self.skip_bytes(alignment - residual)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Decode the primary uncompressed (`unci`) item into an internal RGBA model.
+pub fn decode_primary_uncompressed_to_image(
+    input: &[u8],
+) -> Result<DecodedUncompressedImage, DecodeUncompressedError> {
+    // Provenance: baseline decode flow mirrors libheif uncompressed handling in
+    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
+    // UncompressedImageCodec::{check_header_validity,decode_uncompressed_image}
+    // and decoder dispatch constraints from
+    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
+    // unc_decoder_factory::{check_common_requirements,get_unc_decoder}.
+    let properties = isobmff::parse_primary_uncompressed_item_properties(input)?;
+    if primary_uncompressed_uses_generic_compression(input)? {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail:
+                "generic-compressed uncompressed (`unci`) payloads are not supported in this baseline decoder"
+                    .to_string(),
+        });
+    }
+
+    let mut interleave_type = properties.unc_c.interleave_type;
+    let mut sampling_type = properties.unc_c.sampling_type;
+    let mut component_specs = Vec::new();
+    if properties.unc_c.full_box.version == 1 {
+        // Provenance: mirrors profile expansion from
+        // libheif/libheif/codecs/uncompressed/unc_boxes.cc:fill_uncC_and_cmpd_from_profile
+        // for the baseline RGB profiles used in this decoder pass.
+        let profile = properties.unc_c.profile;
+        match profile.as_bytes() {
+            bytes if bytes == *b"rgb3" => {
+                component_specs.extend_from_slice(&[
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Red,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Green,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Blue,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                ]);
+                sampling_type = UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING;
+                interleave_type = UNCOMPRESSED_INTERLEAVE_PIXEL;
+            }
+            bytes if bytes == *b"rgba" => {
+                component_specs.extend_from_slice(&[
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Red,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Green,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Blue,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Alpha,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                ]);
+                sampling_type = UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING;
+                interleave_type = UNCOMPRESSED_INTERLEAVE_PIXEL;
+            }
+            bytes if bytes == *b"abgr" => {
+                component_specs.extend_from_slice(&[
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Alpha,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Blue,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Green,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                    UncompressedComponentDecodeSpec {
+                        role: UncompressedChannelRole::Red,
+                        bit_depth: 8,
+                        component_align_size: 0,
+                    },
+                ]);
+                sampling_type = UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING;
+                interleave_type = UNCOMPRESSED_INTERLEAVE_PIXEL;
+            }
+            _ => {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "unsupported uncC v1 profile {} for baseline uncompressed decode",
+                        profile
+                    ),
+                });
+            }
+        }
+    } else {
+        let cmpd =
+            properties
+                .cmpd
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "primary item_ID {} is missing required cmpd mapping for uncC version {}",
+                        properties.item_id, properties.unc_c.full_box.version
+                    ),
+                })?;
+
+        for component in &properties.unc_c.components {
+            let component_index = usize::from(component.component_index);
+            let component_def = cmpd.components.get(component_index).ok_or_else(|| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC component index {} exceeds cmpd component count {}",
+                        component.component_index,
+                        cmpd.components.len()
+                    ),
+                }
+            })?;
+            if component.component_format != UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "unsupported uncompressed component_format {} (only unsigned integer is supported in this baseline)",
+                        component.component_format
+                    ),
+                });
+            }
+            if component.component_bit_depth == 0 || component.component_bit_depth > 16 {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "unsupported uncompressed component bit depth {} (expected 1..=16)",
+                        component.component_bit_depth
+                    ),
+                });
+            }
+            let role = uncompressed_role_from_component_type(component_def.component_type)?;
+            component_specs.push(UncompressedComponentDecodeSpec {
+                role,
+                bit_depth: component.component_bit_depth as u8,
+                component_align_size: component.component_align_size,
+            });
+        }
+    }
+
+    if sampling_type != UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported uncC sampling_type {sampling_type}; baseline supports only no-subsampling"
+            ),
+        });
+    }
+    if !matches!(
+        interleave_type,
+        UNCOMPRESSED_INTERLEAVE_COMPONENT
+            | UNCOMPRESSED_INTERLEAVE_PIXEL
+            | UNCOMPRESSED_INTERLEAVE_ROW
+    ) {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported uncC interleave_type {interleave_type}; baseline supports component/pixel/row interleave"
+            ),
+        });
+    }
+    if properties.unc_c.num_tile_cols != 1 || properties.unc_c.num_tile_rows != 1 {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "tiled uncompressed decode is not supported in this baseline (tiles={}x{})",
+                properties.unc_c.num_tile_cols, properties.unc_c.num_tile_rows
+            ),
+        });
+    }
+    if properties.unc_c.block_size != 0
+        || properties.unc_c.components_little_endian
+        || properties.unc_c.block_pad_lsb
+        || properties.unc_c.block_little_endian
+        || properties.unc_c.block_reversed
+        || properties.unc_c.pad_unknown
+    {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail:
+                "uncC block/endian flags are not supported in this baseline uncompressed decoder"
+                    .to_string(),
+        });
+    }
+    if interleave_type != UNCOMPRESSED_INTERLEAVE_PIXEL && properties.unc_c.pixel_size != 0 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!("uncC pixel_size must be zero for interleave_type {interleave_type}"),
+        });
+    }
+    if component_specs.is_empty() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: "uncompressed primary item has no component descriptors".to_string(),
+        });
+    }
+
+    let width = properties.ispe.width;
+    let height = properties.ispe.height;
+    let width_usize =
+        usize::try_from(width).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncompressed image width {width} cannot be represented"),
+        })?;
+    let height_usize =
+        usize::try_from(height).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncompressed image height {height} cannot be represented"),
+        })?;
+    let pixel_count = width_usize.checked_mul(height_usize).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed image sample-count overflow for dimensions {width}x{height}"
+            ),
+        }
+    })?;
+
+    let mut has_channel = [false; UNCOMPRESSED_CHANNEL_COUNT];
+    let mut channel_bit_depths = [0_u8; UNCOMPRESSED_CHANNEL_COUNT];
+    for spec in &component_specs {
+        let Some(channel_index) = spec.role.channel_index() else {
+            continue;
+        };
+        if has_channel[channel_index] {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "duplicate component mapping for {} is not supported in this baseline decoder",
+                    uncompressed_channel_name(channel_index)
+                ),
+            });
+        }
+        has_channel[channel_index] = true;
+        channel_bit_depths[channel_index] = spec.bit_depth;
+    }
+
+    let has_monochrome = has_channel[UNCOMPRESSED_CHANNEL_MONO];
+    let has_rgb = has_channel[UNCOMPRESSED_CHANNEL_RED]
+        || has_channel[UNCOMPRESSED_CHANNEL_GREEN]
+        || has_channel[UNCOMPRESSED_CHANNEL_BLUE];
+    let has_full_rgb = has_channel[UNCOMPRESSED_CHANNEL_RED]
+        && has_channel[UNCOMPRESSED_CHANNEL_GREEN]
+        && has_channel[UNCOMPRESSED_CHANNEL_BLUE];
+    if has_monochrome && has_rgb {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail:
+                "simultaneous monochrome and RGB component sets are not supported in this baseline decoder"
+                    .to_string(),
+        });
+    }
+    if !has_monochrome && !has_full_rgb {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail:
+                "baseline uncompressed decoder requires either monochrome or full RGB components"
+                    .to_string(),
+        });
+    }
+
+    let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
+        std::array::from_fn(|_| None);
+    for channel_index in 0..UNCOMPRESSED_CHANNEL_COUNT {
+        if has_channel[channel_index] {
+            channel_samples[channel_index] = Some(vec![0_u16; pixel_count]);
+        }
+    }
+
+    let payload = isobmff::extract_primary_uncompressed_item_data(input)?;
+    let mut reader = UncompressedBitReader::new(&payload.payload);
+    reader.mark_tile_start();
+
+    match interleave_type {
+        UNCOMPRESSED_INTERLEAVE_COMPONENT => decode_uncompressed_component_interleave(
+            &mut reader,
+            &component_specs,
+            width_usize,
+            height_usize,
+            properties.unc_c.row_align_size,
+            &mut channel_samples,
+        )?,
+        UNCOMPRESSED_INTERLEAVE_PIXEL => decode_uncompressed_pixel_interleave(
+            &mut reader,
+            &component_specs,
+            width_usize,
+            height_usize,
+            properties.unc_c.pixel_size,
+            properties.unc_c.row_align_size,
+            &mut channel_samples,
+        )?,
+        UNCOMPRESSED_INTERLEAVE_ROW => decode_uncompressed_row_interleave(
+            &mut reader,
+            &component_specs,
+            width_usize,
+            height_usize,
+            properties.unc_c.row_align_size,
+            &mut channel_samples,
+        )?,
+        _ => unreachable!(),
+    }
+    reader.handle_tile_alignment(properties.unc_c.tile_align_size)?;
+
+    let mut output_bit_depth = 0_u8;
+    for (is_present, bit_depth) in has_channel.iter().zip(channel_bit_depths) {
+        if *is_present {
+            output_bit_depth = output_bit_depth.max(bit_depth);
+        }
+    }
+    if output_bit_depth == 0 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: "uncompressed primary item has zero output bit depth".to_string(),
+        });
+    }
+    let alpha_default = max_sample_for_bit_depth(output_bit_depth)?;
+
+    let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: "uncompressed RGBA output length overflow".to_string(),
+        }
+    })?);
+    for pixel_index in 0..pixel_count {
+        let (r_sample, g_sample, b_sample, color_depth) = if has_monochrome {
+            let mono = channel_samples[UNCOMPRESSED_CHANNEL_MONO]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded monochrome channel samples".to_string(),
+                })?;
+            (
+                mono[pixel_index],
+                mono[pixel_index],
+                mono[pixel_index],
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_MONO],
+            )
+        } else {
+            let red = channel_samples[UNCOMPRESSED_CHANNEL_RED]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded red channel samples".to_string(),
+                })?;
+            let green = channel_samples[UNCOMPRESSED_CHANNEL_GREEN]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded green channel samples".to_string(),
+                })?;
+            let blue = channel_samples[UNCOMPRESSED_CHANNEL_BLUE]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded blue channel samples".to_string(),
+                })?;
+            (red[pixel_index], green[pixel_index], blue[pixel_index], 0)
+        };
+        let alpha_sample = if has_channel[UNCOMPRESSED_CHANNEL_ALPHA] {
+            channel_samples[UNCOMPRESSED_CHANNEL_ALPHA]
+                .as_ref()
+                .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                    detail: "missing decoded alpha channel samples".to_string(),
+                })?[pixel_index]
+        } else {
+            alpha_default
+        };
+
+        if has_monochrome {
+            let scaled = scale_uncompressed_sample_bit_depth(
+                r_sample,
+                color_depth,
+                output_bit_depth,
+                "monochrome",
+            )?;
+            rgba.push(scaled);
+            rgba.push(scaled);
+            rgba.push(scaled);
+        } else {
+            rgba.push(scale_uncompressed_sample_bit_depth(
+                r_sample,
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_RED],
+                output_bit_depth,
+                "red",
+            )?);
+            rgba.push(scale_uncompressed_sample_bit_depth(
+                g_sample,
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_GREEN],
+                output_bit_depth,
+                "green",
+            )?);
+            rgba.push(scale_uncompressed_sample_bit_depth(
+                b_sample,
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_BLUE],
+                output_bit_depth,
+                "blue",
+            )?);
+        }
+        rgba.push(if has_channel[UNCOMPRESSED_CHANNEL_ALPHA] {
+            scale_uncompressed_sample_bit_depth(
+                alpha_sample,
+                channel_bit_depths[UNCOMPRESSED_CHANNEL_ALPHA],
+                output_bit_depth,
+                "alpha",
+            )?
+        } else {
+            alpha_default
+        });
+    }
+
+    Ok(DecodedUncompressedImage {
+        width,
+        height,
+        bit_depth: output_bit_depth,
+        rgba,
+        icc_profile: properties.colr.icc.map(|profile| profile.profile),
+    })
+}
+
+fn decode_uncompressed_component_interleave(
+    reader: &mut UncompressedBitReader<'_>,
+    specs: &[UncompressedComponentDecodeSpec],
+    width: usize,
+    height: usize,
+    row_align_size: u32,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    for spec in specs {
+        for row in 0..height {
+            reader.mark_row_start();
+            for column in 0..width {
+                let sample = read_uncompressed_component_sample(reader, *spec)?;
+                let pixel_index = row
+                    .checked_mul(width)
+                    .and_then(|offset| offset.checked_add(column))
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed component-interleave pixel index overflow at row={row}, column={column}"
+                        ),
+                    })?;
+                write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
+            }
+            reader.handle_row_alignment(row_align_size)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_uncompressed_pixel_interleave(
+    reader: &mut UncompressedBitReader<'_>,
+    specs: &[UncompressedComponentDecodeSpec],
+    width: usize,
+    height: usize,
+    pixel_size: u32,
+    row_align_size: u32,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    for row in 0..height {
+        reader.mark_row_start();
+        for column in 0..width {
+            reader.mark_pixel_start();
+            for spec in specs {
+                let sample = read_uncompressed_component_sample(reader, *spec)?;
+                let pixel_index = row
+                    .checked_mul(width)
+                    .and_then(|offset| offset.checked_add(column))
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed pixel-interleave pixel index overflow at row={row}, column={column}"
+                        ),
+                    })?;
+                write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
+            }
+            reader.handle_pixel_alignment(pixel_size)?;
+        }
+        reader.handle_row_alignment(row_align_size)?;
+    }
+
+    Ok(())
+}
+
+fn decode_uncompressed_row_interleave(
+    reader: &mut UncompressedBitReader<'_>,
+    specs: &[UncompressedComponentDecodeSpec],
+    width: usize,
+    height: usize,
+    row_align_size: u32,
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+) -> Result<(), DecodeUncompressedError> {
+    for row in 0..height {
+        for spec in specs {
+            reader.mark_row_start();
+            for column in 0..width {
+                let sample = read_uncompressed_component_sample(reader, *spec)?;
+                let pixel_index = row
+                    .checked_mul(width)
+                    .and_then(|offset| offset.checked_add(column))
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed row-interleave pixel index overflow at row={row}, column={column}"
+                        ),
+                    })?;
+                write_uncompressed_component_sample(channel_samples, *spec, pixel_index, sample)?;
+            }
+            reader.handle_row_alignment(row_align_size)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn read_uncompressed_component_sample(
+    reader: &mut UncompressedBitReader<'_>,
+    spec: UncompressedComponentDecodeSpec,
+) -> Result<u16, DecodeUncompressedError> {
+    if spec.component_align_size != 0 {
+        let alignment_bits = usize::from(spec.component_align_size)
+            .checked_mul(8)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "component_align_size {} overflows bit calculations",
+                    spec.component_align_size
+                ),
+            })?;
+        if alignment_bits < usize::from(spec.bit_depth) {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "component_align_size {} bytes is too small for {}-bit sample",
+                    spec.component_align_size, spec.bit_depth
+                ),
+            });
+        }
+        reader.skip_to_byte_boundary();
+        reader.skip_bits(alignment_bits - usize::from(spec.bit_depth))?;
+    }
+    reader.read_bits(usize::from(spec.bit_depth))
+}
+
+fn write_uncompressed_component_sample(
+    channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
+    spec: UncompressedComponentDecodeSpec,
+    pixel_index: usize,
+    sample: u16,
+) -> Result<(), DecodeUncompressedError> {
+    let Some(channel_index) = spec.role.channel_index() else {
+        return Ok(());
+    };
+    let samples = channel_samples[channel_index].as_mut().ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "decoded channel buffer for {} was not initialized",
+                uncompressed_channel_name(channel_index)
+            ),
+        }
+    })?;
+    if pixel_index >= samples.len() {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "decoded sample index {pixel_index} exceeds {} channel length {}",
+                uncompressed_channel_name(channel_index),
+                samples.len()
+            ),
+        });
+    }
+    samples[pixel_index] = sample;
+    Ok(())
+}
+
+fn uncompressed_role_from_component_type(
+    component_type: u16,
+) -> Result<UncompressedChannelRole, DecodeUncompressedError> {
+    match component_type {
+        UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME => Ok(UncompressedChannelRole::Monochrome),
+        UNCOMPRESSED_COMPONENT_TYPE_RED => Ok(UncompressedChannelRole::Red),
+        UNCOMPRESSED_COMPONENT_TYPE_GREEN => Ok(UncompressedChannelRole::Green),
+        UNCOMPRESSED_COMPONENT_TYPE_BLUE => Ok(UncompressedChannelRole::Blue),
+        UNCOMPRESSED_COMPONENT_TYPE_ALPHA => Ok(UncompressedChannelRole::Alpha),
+        UNCOMPRESSED_COMPONENT_TYPE_PADDED => Ok(UncompressedChannelRole::Padded),
+        _ => Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported uncompressed component_type {component_type}; baseline currently supports monochrome/R/G/B/alpha/padded"
+            ),
+        }),
+    }
+}
+
+fn max_sample_for_bit_depth(bit_depth: u8) -> Result<u16, DecodeUncompressedError> {
+    if bit_depth == 0 || bit_depth > 16 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!("invalid uncompressed output bit depth {bit_depth}"),
+        });
+    }
+
+    let max = (1_u32 << bit_depth) - 1;
+    u16::try_from(max).map_err(|_| DecodeUncompressedError::InvalidInput {
+        detail: format!(
+            "uncompressed output bit depth {bit_depth} exceeds 16-bit PNG conversion range"
+        ),
+    })
+}
+
+fn scale_uncompressed_sample_bit_depth(
+    sample: u16,
+    source_bit_depth: u8,
+    target_bit_depth: u8,
+    channel_name: &'static str,
+) -> Result<u16, DecodeUncompressedError> {
+    if source_bit_depth == target_bit_depth {
+        return Ok(sample);
+    }
+    if source_bit_depth == 0
+        || source_bit_depth > 16
+        || target_bit_depth == 0
+        || target_bit_depth > 16
+    {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "cannot scale {channel_name} sample between invalid bit depths {source_bit_depth}->{target_bit_depth}"
+            ),
+        });
+    }
+
+    let source_max = (1_u32 << source_bit_depth) - 1;
+    let target_max = (1_u32 << target_bit_depth) - 1;
+    let scaled = (u32::from(sample)
+        .saturating_mul(target_max)
+        .saturating_add(source_max / 2))
+        / source_max;
+    u16::try_from(scaled).map_err(|_| DecodeUncompressedError::InvalidInput {
+        detail: format!(
+            "scaled {channel_name} sample overflow while converting {source_bit_depth}-bit to {target_bit_depth}-bit"
+        ),
+    })
+}
+
+fn primary_uncompressed_uses_generic_compression(
+    input: &[u8],
+) -> Result<bool, DecodeUncompressedError> {
+    let top_level =
+        isobmff::parse_boxes(input).map_err(|err| DecodeUncompressedError::InvalidInput {
+            detail: format!("failed to inspect primary uncompressed properties: {err}"),
+        })?;
+    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: "required top-level meta box is missing".to_string(),
+        }
+    })?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(|err| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "failed to parse meta box while inspecting uncompressed properties: {err}"
+            ),
+        })?;
+    let resolved =
+        meta.resolve_primary_item()
+            .map_err(|err| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                "failed to resolve primary item while inspecting uncompressed properties: {err}"
+            ),
+            })?;
+
+    Ok(resolved.primary_item.properties.iter().any(|property| {
+        let property_type = property.property.header.box_type.as_bytes();
+        property_type == CMPC_PROPERTY_TYPE || property_type == ICEF_PROPERTY_TYPE
+    }))
+}
+
+fn uncompressed_channel_name(channel_index: usize) -> &'static str {
+    match channel_index {
+        UNCOMPRESSED_CHANNEL_MONO => "monochrome",
+        UNCOMPRESSED_CHANNEL_RED => "red",
+        UNCOMPRESSED_CHANNEL_GREEN => "green",
+        UNCOMPRESSED_CHANNEL_BLUE => "blue",
+        UNCOMPRESSED_CHANNEL_ALPHA => "alpha",
+        _ => "unknown",
+    }
 }
 
 type PrimaryHeicStreamDecodeContext = (
@@ -1816,11 +2799,30 @@ fn heic_layout_from_sps_chroma_array_type(
 
 const META_BOX_TYPE: [u8; 4] = *b"meta";
 const IDAT_BOX_TYPE: [u8; 4] = *b"idat";
+const CMPC_PROPERTY_TYPE: [u8; 4] = *b"cmpC";
+const ICEF_PROPERTY_TYPE: [u8; 4] = *b"icef";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
 const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
 const AUXC_PROPERTY_TYPE: [u8; 4] = *b"auxC";
 const HVCC_PROPERTY_TYPE: [u8; 4] = *b"hvcC";
+const UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING: u8 = 0;
+const UNCOMPRESSED_INTERLEAVE_COMPONENT: u8 = 0;
+const UNCOMPRESSED_INTERLEAVE_PIXEL: u8 = 1;
+const UNCOMPRESSED_INTERLEAVE_ROW: u8 = 3;
+const UNCOMPRESSED_COMPONENT_FORMAT_UNSIGNED: u8 = 0;
+const UNCOMPRESSED_COMPONENT_TYPE_MONOCHROME: u16 = 0;
+const UNCOMPRESSED_COMPONENT_TYPE_RED: u16 = 4;
+const UNCOMPRESSED_COMPONENT_TYPE_GREEN: u16 = 5;
+const UNCOMPRESSED_COMPONENT_TYPE_BLUE: u16 = 6;
+const UNCOMPRESSED_COMPONENT_TYPE_ALPHA: u16 = 7;
+const UNCOMPRESSED_COMPONENT_TYPE_PADDED: u16 = 12;
+const UNCOMPRESSED_CHANNEL_COUNT: usize = 5;
+const UNCOMPRESSED_CHANNEL_MONO: usize = 0;
+const UNCOMPRESSED_CHANNEL_RED: usize = 1;
+const UNCOMPRESSED_CHANNEL_GREEN: usize = 2;
+const UNCOMPRESSED_CHANNEL_BLUE: usize = 3;
+const UNCOMPRESSED_CHANNEL_ALPHA: usize = 4;
 const ALPHA_AUX_TYPES: [&[u8]; 3] = [
     b"urn:mpeg:avc:2015:auxid:1",
     b"urn:mpeg:hevc:2015:auxid:1",
@@ -2060,6 +3062,21 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"))
     {
         let input = std::fs::read(input_path)?;
+        match decode_primary_uncompressed_to_image(&input) {
+            Ok(decoded) => {
+                let transforms = isobmff::parse_primary_item_transform_properties(&input)
+                    .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
+                write_decoded_uncompressed_to_png(&decoded, &transforms.transforms, output_path)?;
+                return Ok(());
+            }
+            Err(DecodeUncompressedError::ParsePrimaryProperties(
+                isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
+                    ..
+                },
+            )) => {}
+            Err(err) => return Err(err.into()),
+        }
+
         let transforms = isobmff::parse_primary_item_transform_properties(&input)
             .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
         let icc_profile = primary_icc_profile_from_heic(&input);
@@ -2436,6 +3453,65 @@ fn write_decoded_heic_to_png(
     let (width, height, transformed) =
         apply_primary_item_transforms_rgba(decoded.width, decoded.height, pixels, transforms)?;
     write_rgba16_png(width, height, &transformed, icc_profile, output_path)
+}
+
+fn write_decoded_uncompressed_to_png(
+    decoded: &DecodedUncompressedImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    if decoded.bit_depth == 0 || decoded.bit_depth > 16 {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed output bit depth {} is outside supported range 1..=16",
+                decoded.bit_depth
+            ),
+        }
+        .into());
+    }
+
+    let expected_sample_count = checked_rgba_sample_count(decoded.width, decoded.height)?;
+    if decoded.rgba.len() != expected_sample_count {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage: "uncompressed RGBA input",
+                actual: decoded.rgba.len(),
+                expected: expected_sample_count,
+                width: decoded.width,
+                height: decoded.height,
+            },
+        ));
+    }
+
+    if decoded.bit_depth <= 8 {
+        let mut rgba8 = Vec::with_capacity(decoded.rgba.len());
+        for sample in &decoded.rgba {
+            rgba8.push(scale_sample_to_u8(*sample, decoded.bit_depth));
+        }
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(decoded.width, decoded.height, rgba8, transforms)?;
+        return write_rgba8_png(
+            width,
+            height,
+            &transformed,
+            decoded.icc_profile.as_deref(),
+            output_path,
+        );
+    }
+
+    let mut rgba16 = Vec::with_capacity(decoded.rgba.len());
+    for sample in &decoded.rgba {
+        rgba16.push(scale_sample_to_u16(*sample, decoded.bit_depth));
+    }
+    let (width, height, transformed) =
+        apply_primary_item_transforms_rgba(decoded.width, decoded.height, rgba16, transforms)?;
+    write_rgba16_png(
+        width,
+        height,
+        &transformed,
+        decoded.icc_profile.as_deref(),
+        output_path,
+    )
 }
 
 fn apply_auxiliary_alpha_to_rgba8(
@@ -4412,12 +5488,13 @@ mod tests {
         assemble_primary_heic_hevc_stream, convert_avif_to_rgba8, convert_heic_to_rgba8,
         decode_file_to_png, decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image,
         decode_primary_avif_to_image, decode_primary_heic_to_image,
-        decode_primary_heic_to_metadata, parse_length_prefixed_hevc_nal_units,
-        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
-        write_rgba8_png, AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError,
-        DecodeError, DecodeErrorCategory, DecodeHeicError, DecodedAvifImage, DecodedHeicImage,
-        DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HevcNalClass, TransformGuardError,
-        YCbCrMatrixCoefficients, YCbCrRange,
+        decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image,
+        parse_length_prefixed_hevc_nal_units, stitch_decoded_heic_grid_tiles,
+        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifPixelLayout, AvifPlane,
+        AvifPlaneSamples, DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
+        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
+        HeicPixelLayout, HeicPlane, HevcNalClass, TransformGuardError, YCbCrMatrixCoefficients,
+        YCbCrRange,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
@@ -4522,6 +5599,127 @@ mod tests {
             png::BitDepth::Sixteen
         };
         assert_eq!(frame_info.bit_depth, expected_bit_depth);
+    }
+
+    #[test]
+    fn decodes_uncompressed_pixel_abgr_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/uncompressed_pix_ABGR.heif");
+        let input = std::fs::read(&fixture).expect("uncompressed ABGR fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("uncompressed ABGR fixture should decode");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(decoded.bit_depth, 8);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+        assert!(
+            decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255),
+            "ABGR fixture should carry non-opaque alpha samples"
+        );
+
+        let output = test_output_png_path("uncompressed-pix-abgr");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output).expect("uncompressed ABGR fixture should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn decodes_uncompressed_component_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/fuzzing/data/corpus/uncompressed_comp_ABGR.heic");
+        let input =
+            std::fs::read(&fixture).expect("uncompressed component fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("uncompressed component fixture should decode");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert_eq!(decoded.bit_depth, 8);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("uncompressed-comp-abgr");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output)
+            .expect("uncompressed component fixture should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert_eq!(frame_info.bit_depth, png::BitDepth::Eight);
+    }
+
+    #[test]
+    fn decodes_uncompressed_row_fixture_to_png() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/fuzzing/data/corpus/uncompressed_row_B16R16G16.heic");
+        let input = std::fs::read(&fixture).expect("uncompressed row fixture must be readable");
+        let decoded = decode_primary_uncompressed_to_image(&input)
+            .expect("uncompressed row fixture should decode");
+        assert!(decoded.width > 0);
+        assert!(decoded.height > 0);
+        assert!(decoded.bit_depth >= 8);
+        assert_eq!(
+            decoded.rgba.len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+
+        let output = test_output_png_path("uncompressed-row-b16r16g16");
+        let _guard = TempFileGuard(output.clone());
+        decode_file_to_png(&fixture, &output).expect("uncompressed row fixture should write PNG");
+
+        let png_data = std::fs::read(&output).expect("decoded PNG should be readable");
+        let decoder = png::Decoder::new(Cursor::new(png_data));
+        let mut reader = decoder.read_info().expect("PNG info should decode");
+        let frame_len = reader
+            .output_buffer_size()
+            .expect("output buffer size should be known after read_info");
+        let mut frame = vec![0; frame_len];
+        let frame_info = reader
+            .next_frame(&mut frame)
+            .expect("PNG frame should decode");
+
+        assert_eq!(frame_info.width, decoded.width);
+        assert_eq!(frame_info.height, decoded.height);
+        assert_eq!(frame_info.color_type, png::ColorType::Rgba);
+        assert_eq!(
+            frame_info.bit_depth,
+            if decoded.bit_depth <= 8 {
+                png::BitDepth::Eight
+            } else {
+                png::BitDepth::Sixteen
+            }
+        );
     }
 
     #[test]
@@ -4769,6 +5967,11 @@ mod tests {
             height: 16,
         });
         assert_eq!(transform.category(), DecodeErrorCategory::MalformedInput);
+
+        let uncompressed = DecodeError::UncompressedDecode(DecodeUncompressedError::InvalidInput {
+            detail: "bad uncompressed payload".to_string(),
+        });
+        assert_eq!(uncompressed.category(), DecodeErrorCategory::MalformedInput);
 
         let output = DecodeError::OutputBufferOverflow {
             buffer_name: "RGBA16 PNG byte buffer",
