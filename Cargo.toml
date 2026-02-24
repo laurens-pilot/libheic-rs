@@ -39,3 +39,7 @@ required-features = ["image-integration"]
 [[bin]]
 name = "heif-ingestion-bench"
 path = "src/bin/heif-ingestion-bench.rs"
+
+[[bin]]
+name = "heif-stream-concurrency-bench"
+path = "src/bin/heif-stream-concurrency-bench.rs"
