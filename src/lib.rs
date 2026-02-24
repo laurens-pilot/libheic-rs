@@ -19,7 +19,7 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{BufWriter, Read};
+use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -4930,69 +4930,150 @@ fn find_first_box_by_type<'a, 'b>(
         .find(|child| child.header.box_type.as_bytes() == box_type)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeifInputFamily {
+    Avif,
+    Heif,
+}
+
+const AVIF_FILE_BRANDS: [[u8; 4]; 2] = [*b"avif", *b"avis"];
+const HEIF_FILE_BRANDS: [[u8; 4]; 9] = [
+    *b"mif1", *b"msf1", *b"miaf", *b"heic", *b"heix", *b"hevc", *b"hevx", *b"heim", *b"heis",
+];
+
+fn decode_avif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
+    let icc_profile = primary_icc_profile_from_avif(input);
+    let decoded = decode_primary_avif_to_image(input)?;
+    write_decoded_avif_to_png(
+        &decoded,
+        &transforms.transforms,
+        icc_profile.as_deref(),
+        output_path,
+    )
+}
+
+fn decode_heif_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+    match decode_primary_uncompressed_to_image(input) {
+        Ok(decoded) => {
+            let transforms = isobmff::parse_primary_item_transform_properties(input)
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
+            write_decoded_uncompressed_to_png(&decoded, &transforms.transforms, output_path)?;
+            return Ok(());
+        }
+        Err(DecodeUncompressedError::ParsePrimaryProperties(
+            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
+        )) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
+    let icc_profile = primary_icc_profile_from_heic(input);
+    let decoded = decode_primary_heic_to_image(input)?;
+    let auxiliary_alpha =
+        decode_primary_heic_auxiliary_alpha_plane(input, decoded.width, decoded.height);
+    write_decoded_heic_to_png(
+        &decoded,
+        &transforms.transforms,
+        auxiliary_alpha.as_ref(),
+        icc_profile.as_deref(),
+        output_path,
+    )
+}
+
+fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("avif") {
+        return Some(HeifInputFamily::Avif);
+    }
+    if extension.eq_ignore_ascii_case("heic") || extension.eq_ignore_ascii_case("heif") {
+        return Some(HeifInputFamily::Heif);
+    }
+    None
+}
+
+fn has_file_brand(ftyp: &isobmff::FileTypeBox, accepted: &[[u8; 4]]) -> bool {
+    accepted.contains(&ftyp.major_brand.as_bytes())
+        || ftyp
+            .compatible_brands
+            .iter()
+            .any(|brand| accepted.contains(&brand.as_bytes()))
+}
+
+fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
+    let boxes = isobmff::parse_boxes(input).ok()?;
+    let ftyp_box = boxes
+        .iter()
+        .find(|parsed| parsed.header.box_type.as_bytes() == *b"ftyp")?;
+    let ftyp = ftyp_box.parse_ftyp().ok()?;
+    if has_file_brand(&ftyp, &AVIF_FILE_BRANDS) {
+        return Some(HeifInputFamily::Avif);
+    }
+    if has_file_brand(&ftyp, &HEIF_FILE_BRANDS) {
+        return Some(HeifInputFamily::Heif);
+    }
+    None
+}
+
+fn decode_bytes_to_png_with_hint(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let family = detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(|| {
+            DecodeError::Unsupported(
+                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                    .to_string(),
+            )
+        })?;
+    match family {
+        HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path),
+        HeifInputFamily::Heif => decode_heif_bytes_to_png(input, output_path),
+    }
+}
+
+/// Decode a HEIF/HEIC/AVIF image from bytes and write a PNG to `output_path`.
+pub fn decode_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
+    decode_bytes_to_png_with_hint(input, None, output_path)
+}
+
+/// Decode a HEIF/HEIC/AVIF image from a `Read` input and write a PNG to `output_path`.
+pub fn decode_read_to_png<R: Read>(
+    mut input_reader: R,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let mut input = Vec::new();
+    input_reader.read_to_end(&mut input)?;
+    decode_bytes_to_png(&input, output_path)
+}
+
+/// Decode a HEIF/HEIC/AVIF image from a `BufRead` input and write a PNG to `output_path`.
+pub fn decode_bufread_to_png<R: BufRead>(
+    input_reader: R,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    decode_read_to_png(input_reader, output_path)
+}
+
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
-pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
     if !input_path.exists() {
         return Err(DecodeError::Unsupported(format!(
             "Input file does not exist: {}",
             input_path.display()
         )));
     }
+    let input = std::fs::read(input_path)?;
+    decode_bytes_to_png_with_hint(&input, extension_family_hint(input_path), output_path)
+}
 
-    let extension = input_path.extension().and_then(|ext| ext.to_str());
-    if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("avif")) {
-        let input = std::fs::read(input_path)?;
-        let transforms = isobmff::parse_primary_item_transform_properties(&input)
-            .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
-        let icc_profile = primary_icc_profile_from_avif(&input);
-        let decoded = decode_primary_avif_to_image(&input)?;
-        write_decoded_avif_to_png(
-            &decoded,
-            &transforms.transforms,
-            icc_profile.as_deref(),
-            output_path,
-        )?;
-        return Ok(());
-    }
-
-    if matches!(extension, Some(ext) if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"))
-    {
-        let input = std::fs::read(input_path)?;
-        match decode_primary_uncompressed_to_image(&input) {
-            Ok(decoded) => {
-                let transforms = isobmff::parse_primary_item_transform_properties(&input)
-                    .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
-                write_decoded_uncompressed_to_png(&decoded, &transforms.transforms, output_path)?;
-                return Ok(());
-            }
-            Err(DecodeUncompressedError::ParsePrimaryProperties(
-                isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
-                    ..
-                },
-            )) => {}
-            Err(err) => return Err(err.into()),
-        }
-
-        let transforms = isobmff::parse_primary_item_transform_properties(&input)
-            .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
-        let icc_profile = primary_icc_profile_from_heic(&input);
-        let decoded = decode_primary_heic_to_image(&input)?;
-        let auxiliary_alpha =
-            decode_primary_heic_auxiliary_alpha_plane(&input, decoded.width, decoded.height);
-        write_decoded_heic_to_png(
-            &decoded,
-            &transforms.transforms,
-            auxiliary_alpha.as_ref(),
-            icc_profile.as_deref(),
-            output_path,
-        )?;
-        return Ok(());
-    }
-
-    Err(DecodeError::Unsupported(format!(
-        "Unsupported file extension for input: {}",
-        input_path.display()
-    )))
+/// Backward-compatible alias for [`decode_path_to_png`].
+pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+    decode_path_to_png(input_path, output_path)
 }
 
 fn primary_icc_profile_from_avif(input: &[u8]) -> Option<Vec<u8>> {
@@ -7477,9 +7558,10 @@ mod tests {
     use super::{
         append_normalized_hevc_payload_nals, apply_primary_item_transforms_rgba,
         assemble_primary_heic_hevc_stream, convert_avif_to_rgba16, convert_avif_to_rgba8,
-        convert_heic_to_rgba8, decode_file_to_png, decode_hevc_stream_metadata_from_sps,
-        decode_hevc_stream_to_image, decode_primary_avif_to_image, decode_primary_heic_to_image,
-        decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image,
+        convert_heic_to_rgba8, decode_bufread_to_png, decode_bytes_to_png, decode_file_to_png,
+        decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image, decode_path_to_png,
+        decode_primary_avif_to_image, decode_primary_heic_to_image,
+        decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
         decode_uncompressed_multi_y_interleave, parse_length_prefixed_hevc_nal_units,
         stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
         write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
@@ -7494,7 +7576,7 @@ mod tests {
         UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor};
     use std::ops::Range;
     use std::path::PathBuf;
     use std::process::Command;
@@ -7597,6 +7679,83 @@ mod tests {
             png::BitDepth::Sixteen
         };
         assert_eq!(frame_info.bit_depth, expected_bit_depth);
+    }
+
+    #[test]
+    fn decode_entry_points_match_for_example_avif() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+
+        let output_via_path = test_output_png_path("entrypoint-path-avif");
+        let _path_guard = TempFileGuard(output_via_path.clone());
+        decode_path_to_png(&fixture, &output_via_path)
+            .expect("path entry point should decode AVIF");
+        let expected_png =
+            std::fs::read(&output_via_path).expect("path output PNG should be readable");
+
+        let output_via_file_alias = test_output_png_path("entrypoint-file-alias-avif");
+        let _file_alias_guard = TempFileGuard(output_via_file_alias.clone());
+        decode_file_to_png(&fixture, &output_via_file_alias)
+            .expect("decode_file_to_png alias should decode AVIF");
+        assert_eq!(
+            std::fs::read(&output_via_file_alias)
+                .expect("file alias output PNG should be readable"),
+            expected_png
+        );
+
+        let output_via_bytes = test_output_png_path("entrypoint-bytes-avif");
+        let _bytes_guard = TempFileGuard(output_via_bytes.clone());
+        decode_bytes_to_png(&input, &output_via_bytes)
+            .expect("bytes entry point should decode AVIF");
+        assert_eq!(
+            std::fs::read(&output_via_bytes).expect("bytes output PNG should be readable"),
+            expected_png
+        );
+
+        let output_via_read = test_output_png_path("entrypoint-read-avif");
+        let _read_guard = TempFileGuard(output_via_read.clone());
+        decode_read_to_png(Cursor::new(input.clone()), &output_via_read)
+            .expect("Read entry point should decode AVIF");
+        assert_eq!(
+            std::fs::read(&output_via_read).expect("Read output PNG should be readable"),
+            expected_png
+        );
+
+        let output_via_bufread = test_output_png_path("entrypoint-bufread-avif");
+        let _bufread_guard = TempFileGuard(output_via_bufread.clone());
+        decode_bufread_to_png(BufReader::new(Cursor::new(input)), &output_via_bufread)
+            .expect("BufRead entry point should decode AVIF");
+        assert_eq!(
+            std::fs::read(&output_via_bufread).expect("BufRead output PNG should be readable"),
+            expected_png
+        );
+    }
+
+    #[test]
+    fn decode_path_to_png_detects_heif_family_without_known_extension() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("example.heic fixture must be readable");
+
+        let copied_input = std::env::temp_dir().join(format!(
+            "libheic-rs-heif-ftyp-detect-{}-{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let _copied_input_guard = TempFileGuard(copied_input.clone());
+        std::fs::write(&copied_input, &input).expect("temporary copied HEIC input should write");
+
+        let output = test_output_png_path("entrypoint-unknown-extension-heic");
+        let _output_guard = TempFileGuard(output.clone());
+        decode_path_to_png(&copied_input, &output)
+            .expect("path entry point should detect HEIF family from ftyp brands");
+
+        let png = std::fs::read(&output).expect("decoded output PNG should be readable");
+        assert!(!png.is_empty(), "decoded PNG output should not be empty");
     }
 
     #[test]
