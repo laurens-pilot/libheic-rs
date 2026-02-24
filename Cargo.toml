@@ -30,3 +30,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "heif-decode"
 path = "src/bin/heif-decode.rs"
+
+[[bin]]
+name = "heif-image-adapter-bench"
+path = "src/bin/heif-image-adapter-bench.rs"
+required-features = ["image-integration"]
