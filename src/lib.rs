@@ -1083,11 +1083,23 @@ impl From<isobmff::ExtractUncompressedItemDataError> for DecodeUncompressedError
 
 /// Decode the primary AVIF item into an internal planar YUV image model.
 pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_avif_to_image_internal(input, &mut source)
+}
+
+fn decode_primary_avif_to_image_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<DecodedAvifImage, DecodeAvifError> {
     // Provenance: mirrors libheif configuration+payload bitstream assembly in
     // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
     // AVIF configuration extraction in
     // libheif/libheif/codecs/avif_dec.cc:Decoder_AVIF::read_bitstream_configuration_data.
-    let item_data = isobmff::extract_primary_avif_item_data(input)?;
+    let item_data = if let Some(source) = source.as_mut() {
+        isobmff::extract_primary_avif_item_data_from_source(source, input)?
+    } else {
+        isobmff::extract_primary_avif_item_data(input)?
+    };
     let payload = item_data.payload;
     let mut ycbcr_range = YCbCrRange::Full;
     let mut ycbcr_matrix = YCbCrMatrixCoefficients::default();
@@ -1130,7 +1142,7 @@ pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, De
     }
 
     decoded.alpha_plane =
-        decode_primary_avif_auxiliary_alpha_plane(input, decoded.width, decoded.height);
+        decode_primary_avif_auxiliary_alpha_plane(input, source, decoded.width, decoded.height);
 
     Ok(decoded)
 }
@@ -1149,14 +1161,25 @@ pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, Decode
 
 /// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
-    if let isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) =
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_heic_to_image_internal(input, &mut source)
+}
+
+fn decode_primary_heic_to_image_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    let primary_with_grid = if let Some(source) = source.as_mut() {
+        isobmff::extract_primary_heic_item_data_with_grid_from_source(source, input)?
+    } else {
         isobmff::extract_primary_heic_item_data_with_grid(input)?
-    {
+    };
+    if let isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) = primary_with_grid {
         return decode_primary_heic_grid_to_image(&grid_data);
     }
 
     let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
-        decode_primary_heic_stream_and_metadata(input)?;
+        decode_primary_heic_stream_and_metadata_internal(input, source)?;
     let mut decoded = decode_hevc_stream_to_image(&stream)?;
     if let Some(ycbcr_range) = ycbcr_range_override {
         decoded.ycbcr_range = ycbcr_range;
@@ -1442,6 +1465,14 @@ impl<'a> UncompressedBitReader<'a> {
 /// Decode the primary uncompressed (`unci`) item into an internal RGBA model.
 pub fn decode_primary_uncompressed_to_image(
     input: &[u8],
+) -> Result<DecodedUncompressedImage, DecodeUncompressedError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_uncompressed_to_image_internal(input, &mut source)
+}
+
+fn decode_primary_uncompressed_to_image_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedUncompressedImage, DecodeUncompressedError> {
     // Provenance: baseline decode flow mirrors libheif uncompressed handling in
     // libheif/libheif/codecs/uncompressed/unc_codec.cc:
@@ -1902,7 +1933,11 @@ pub fn decode_primary_uncompressed_to_image(
         }
     }
 
-    let item_data = isobmff::extract_primary_uncompressed_item_data(input)?;
+    let item_data = if let Some(source) = source.as_mut() {
+        isobmff::extract_primary_uncompressed_item_data_from_source(source, input)?
+    } else {
+        isobmff::extract_primary_uncompressed_item_data(input)?
+    };
     let payload =
         maybe_decode_primary_uncompressed_generic_compression_payload(input, &item_data.payload)?;
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
@@ -3682,8 +3717,20 @@ type PrimaryHeicStreamDecodeContext = (
 fn decode_primary_heic_stream_and_metadata(
     input: &[u8],
 ) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_heic_stream_and_metadata_internal(input, &mut source)
+}
+
+fn decode_primary_heic_stream_and_metadata_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
-    let item_data = isobmff::extract_primary_heic_item_data(input)?;
+    let item_data = if let Some(source) = source.as_mut() {
+        isobmff::extract_primary_heic_item_data_from_source(source, input)?
+    } else {
+        isobmff::extract_primary_heic_item_data(input)?
+    };
     let ycbcr_range_override = ycbcr_range_override_from_primary_colr(&properties.colr);
     let ycbcr_matrix_override = ycbcr_matrix_override_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
@@ -4724,6 +4771,7 @@ const ALPHA_AUX_TYPES: [&[u8]; 3] = [
 
 fn decode_primary_avif_auxiliary_alpha_plane(
     input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
     expected_width: u32,
     expected_height: u32,
 ) -> Option<AvifAuxiliaryAlphaPlane> {
@@ -4748,6 +4796,7 @@ fn decode_primary_avif_auxiliary_alpha_plane(
 
         let Some(alpha_plane) = decode_auxiliary_alpha_avif_item_candidate(
             input,
+            source,
             &meta,
             &resolved,
             reference.from_item_id,
@@ -4765,6 +4814,7 @@ fn decode_primary_avif_auxiliary_alpha_plane(
 
 fn decode_auxiliary_alpha_avif_item_candidate<'a>(
     input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &isobmff::MetaBox<'a>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
@@ -4801,7 +4851,7 @@ fn decode_auxiliary_alpha_avif_item_candidate<'a>(
         .find(|property| property.header.box_type.as_bytes() == AV1C_PROPERTY_TYPE)?
         .parse_av1c()
         .ok()?;
-    let payload = extract_heic_item_payload(input, meta, location)?;
+    let payload = extract_heic_item_payload_with_source(input, source, meta, location)?;
     let mut elementary_stream = av1c.config_obus;
     elementary_stream.extend_from_slice(&payload);
 
@@ -4837,6 +4887,21 @@ fn decode_primary_heic_auxiliary_alpha_plane(
     expected_width: u32,
     expected_height: u32,
 ) -> Option<HeicAuxiliaryAlphaPlane> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_heic_auxiliary_alpha_plane_internal(
+        input,
+        &mut source,
+        expected_width,
+        expected_height,
+    )
+}
+
+fn decode_primary_heic_auxiliary_alpha_plane_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    expected_width: u32,
+    expected_height: u32,
+) -> Option<HeicAuxiliaryAlphaPlane> {
     // Provenance: mirrors libheif auxiliary alpha linkage in
     // libheif/libheif/context.cc (auxl reference direction, auxC alpha-type
     // filtering) and auxC payload parsing in libheif/libheif/box.cc:Box_auxC::parse.
@@ -4855,9 +4920,13 @@ fn decode_primary_heic_auxiliary_alpha_plane(
             continue;
         }
 
-        let Some(alpha_plane) =
-            decode_auxiliary_alpha_item_candidate(input, &meta, &resolved, reference.from_item_id)
-        else {
+        let Some(alpha_plane) = decode_auxiliary_alpha_item_candidate(
+            input,
+            source,
+            &meta,
+            &resolved,
+            reference.from_item_id,
+        ) else {
             continue;
         };
 
@@ -4872,6 +4941,7 @@ fn decode_primary_heic_auxiliary_alpha_plane(
 
 fn decode_auxiliary_alpha_item_candidate<'a>(
     input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &isobmff::MetaBox<'a>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
@@ -4909,7 +4979,7 @@ fn decode_auxiliary_alpha_item_candidate<'a>(
         .parse_hvcc()
         .ok()?;
 
-    let payload = extract_heic_item_payload(input, meta, location)?;
+    let payload = extract_heic_item_payload_with_source(input, source, meta, location)?;
     let stream = assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()?;
     let decoded = decode_hevc_stream_to_image(&stream).ok()?;
     let expected_alpha_samples = heic_sample_count(decoded.width, decoded.height, "alpha").ok()?;
@@ -4975,8 +5045,9 @@ fn property_is_alpha_auxiliary_type_property(property: &isobmff::ParsedBox<'_>) 
     ALPHA_AUX_TYPES.contains(&aux_type)
 }
 
-fn extract_heic_item_payload(
+fn extract_heic_item_payload_with_source(
     input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &isobmff::MetaBox<'_>,
     location: &isobmff::ItemLocationItem,
 ) -> Option<Vec<u8>> {
@@ -4988,7 +5059,13 @@ fn extract_heic_item_payload(
     let mut payload = Vec::with_capacity(payload_capacity);
 
     match location.construction_method {
-        0 => append_heic_item_location_extents(input, location, &mut payload)?,
+        0 => {
+            if let Some(source) = source.as_mut() {
+                append_heic_item_location_extents_from_source(*source, location, &mut payload)?;
+            } else {
+                append_heic_item_location_extents(input, location, &mut payload)?;
+            }
+        }
         1 => {
             let children = meta.parse_children().ok()?;
             let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
@@ -5016,6 +5093,27 @@ fn append_heic_item_location_extents(
         let start = usize::try_from(start).ok()?;
         let end = usize::try_from(end).ok()?;
         output.extend_from_slice(&source[start..end]);
+    }
+    Some(())
+}
+
+fn append_heic_item_location_extents_from_source(
+    source: &mut dyn RandomAccessSource,
+    location: &isobmff::ItemLocationItem,
+    output: &mut Vec<u8>,
+) -> Option<()> {
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset)?;
+        let end = start.checked_add(extent.length)?;
+        let extent_len = usize::try_from(extent.length).ok()?;
+        let bytes = source.read_range(start, extent_len).ok()?;
+        if bytes.len() != extent_len || u64::try_from(bytes.len()).ok()? != extent.length {
+            return None;
+        }
+        if start.checked_add(extent.length)? != end {
+            return None;
+        }
+        output.extend_from_slice(&bytes);
     }
     Some(())
 }
@@ -5048,6 +5146,18 @@ fn decode_avif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeErr
     decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
 
+fn decode_avif_source_to_rgba<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
+    let icc_profile = primary_icc_profile_from_avif(input);
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    let decoded = decode_primary_avif_to_image_internal(input, &mut source)?;
+    decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
+}
+
 fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     match decode_primary_uncompressed_to_image(input) {
         Ok(decoded) => {
@@ -5067,6 +5177,41 @@ fn decode_heif_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeErr
     let decoded = decode_primary_heic_to_image(input)?;
     let auxiliary_alpha =
         decode_primary_heic_auxiliary_alpha_plane(input, decoded.width, decoded.height);
+    decoded_heic_to_rgba_image(
+        &decoded,
+        &transforms.transforms,
+        auxiliary_alpha.as_ref(),
+        icc_profile,
+    )
+}
+
+fn decode_heif_source_to_rgba<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    match decode_primary_uncompressed_to_image_internal(input, &mut source) {
+        Ok(decoded) => {
+            let transforms = isobmff::parse_primary_item_transform_properties(input)
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
+            return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
+        }
+        Err(DecodeUncompressedError::ParsePrimaryProperties(
+            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
+        )) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
+    let icc_profile = primary_icc_profile_from_heic(input);
+    let decoded = decode_primary_heic_to_image_internal(input, &mut source)?;
+    let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+        input,
+        &mut source,
+        decoded.width,
+        decoded.height,
+    );
     decoded_heic_to_rgba_image(
         &decoded,
         &transforms.transforms,
@@ -5294,6 +5439,7 @@ fn detect_input_family_from_source_selected_boxes(
     Ok(None)
 }
 
+#[cfg(test)]
 fn detect_input_family_from_source<S: RandomAccessSource>(
     source: &mut S,
 ) -> Result<Option<HeifInputFamily>, DecodeError> {
@@ -5303,6 +5449,18 @@ fn detect_input_family_from_source<S: RandomAccessSource>(
     let selected =
         read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     detect_input_family_from_source_selected_boxes(&selected)
+}
+
+fn encode_source_selected_top_level_boxes(selected: &[SourceTopLevelBox]) -> Vec<u8> {
+    let mut ordered: Vec<&SourceTopLevelBox> = selected.iter().collect();
+    ordered.sort_by_key(|entry| entry.offset);
+    let mut bytes = Vec::new();
+    for entry in ordered {
+        if entry.header.box_type == FTYP_BOX_TYPE || entry.header.box_type == META_BOX_TYPE {
+            bytes.extend_from_slice(&entry.bytes);
+        }
+    }
+    bytes
 }
 
 fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
@@ -5366,25 +5524,24 @@ fn decode_error_from_source_read_error(err: SourceReadError) -> DecodeError {
     }
 }
 
-fn read_all_from_source<S: RandomAccessSource>(source: &mut S) -> Result<Vec<u8>, DecodeError> {
-    let source_len = source.len();
-    let source_len_usize = usize::try_from(source_len).map_err(|_| {
-        DecodeError::Unsupported(format!(
-            "Input source is too large to decode on this platform: {source_len} bytes"
-        ))
-    })?;
-    source
-        .read_range(0, source_len_usize)
-        .map_err(decode_error_from_source_read_error)
-}
-
 fn decode_source_to_rgba_with_hint<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let source_family_hint = detect_input_family_from_source(source)?;
-    let input = read_all_from_source(source)?;
-    decode_bytes_to_rgba_with_hint(&input, source_family_hint.or(hint))
+    let selected =
+        read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
+    let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
+    let input = encode_source_selected_top_level_boxes(&selected);
+    let family = source_family_hint.or(hint).ok_or_else(|| {
+        DecodeError::Unsupported(
+            "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                .to_string(),
+        )
+    })?;
+    match family {
+        HeifInputFamily::Avif => decode_avif_source_to_rgba(source, &input),
+        HeifInputFamily::Heif => decode_heif_source_to_rgba(source, &input),
+    }
 }
 
 fn decode_source_to_png_with_hint<S: RandomAccessSource>(
@@ -5392,9 +5549,8 @@ fn decode_source_to_png_with_hint<S: RandomAccessSource>(
     hint: Option<HeifInputFamily>,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
-    let source_family_hint = detect_input_family_from_source(source)?;
-    let input = read_all_from_source(source)?;
-    decode_bytes_to_png_with_hint(&input, source_family_hint.or(hint), output_path)
+    let decoded = decode_source_to_rgba_with_hint(source, hint)?;
+    write_decoded_rgba_image_to_png(&decoded, output_path)
 }
 
 fn read_all_from_reader<R: Read>(mut input_reader: R) -> Result<Vec<u8>, DecodeError> {
@@ -8050,19 +8206,20 @@ mod tests {
         decode_hevc_stream_metadata_from_sps, decode_hevc_stream_to_image, decode_path_to_png,
         decode_path_to_rgba, decode_primary_avif_to_image, decode_primary_heic_to_image,
         decode_primary_heic_to_metadata, decode_primary_uncompressed_to_image, decode_read_to_png,
-        decode_read_to_rgba, decode_uncompressed_multi_y_interleave,
-        detect_input_family_from_source, parse_length_prefixed_hevc_nal_units,
-        read_selected_top_level_boxes_from_source, stitch_decoded_heic_grid_tiles,
-        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
-        AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
-        DecodeErrorCategory, DecodeHeicError, DecodeUncompressedError, DecodedAvifImage,
-        DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HeifInputFamily,
-        HevcNalClass, TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
-        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
-        YCbCrRange, CMPC_PROPERTY_TYPE, FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
-        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
-        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
-        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        decode_read_to_rgba, decode_source_to_rgba_with_hint,
+        decode_uncompressed_multi_y_interleave, detect_input_family_from_source,
+        parse_length_prefixed_hevc_nal_units, read_selected_top_level_boxes_from_source,
+        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
+        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
+        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeHeicError,
+        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
+        HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass, TransformGuardError,
+        UncompressedBitReader, UncompressedChannelRole, UncompressedComponentDecodeSpec,
+        UncompressedDecodeTileRegion, YCbCrMatrixCoefficients, YCbCrRange, CMPC_PROPERTY_TYPE,
+        FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL, GENERIC_COMPRESSED_UNIT_IMAGE_ROW,
+        ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE, ICEF_SIZE_BITS_TABLE, META_BOX_TYPE,
+        UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
+        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::{BufReader, Cursor};
@@ -8320,6 +8477,73 @@ mod tests {
         assert!(
             source.bytes_requested < 128 * 1024,
             "source scan should not materialize the full file"
+        );
+    }
+
+    #[test]
+    fn seekable_avif_decode_skips_large_unselected_tail_payload() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let input = std::fs::read(&fixture).expect("example.avif fixture must be readable");
+        let expected = decode_bytes_to_rgba(&input).expect("bytes decode should succeed for AVIF");
+
+        let tail = make_basic_box(*b"mdat", &vec![0xAB_u8; 512 * 1024]);
+        let mut with_tail = input.clone();
+        with_tail.extend_from_slice(&tail);
+        let with_tail_len = with_tail.len();
+        let mut source = TrackingSliceSource::new(with_tail);
+
+        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Avif))
+            .expect("seekable AVIF decode should succeed with trailing unselected payload");
+        assert_eq!(decoded, expected);
+        assert!(
+            source.bytes_requested < with_tail_len - (256 * 1024),
+            "seekable AVIF decode should avoid reading the full trailing payload"
+        );
+    }
+
+    #[test]
+    fn seekable_heic_decode_skips_large_unselected_tail_payload() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.heic");
+        let input = std::fs::read(&fixture).expect("example.heic fixture must be readable");
+        let expected = decode_bytes_to_rgba(&input).expect("bytes decode should succeed for HEIC");
+
+        let tail = make_basic_box(*b"mdat", &vec![0xCD_u8; 512 * 1024]);
+        let mut with_tail = input.clone();
+        with_tail.extend_from_slice(&tail);
+        let with_tail_len = with_tail.len();
+        let mut source = TrackingSliceSource::new(with_tail);
+
+        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Heif))
+            .expect("seekable HEIC decode should succeed with trailing unselected payload");
+        assert_eq!(decoded, expected);
+        assert!(
+            source.bytes_requested < with_tail_len - (256 * 1024),
+            "seekable HEIC decode should avoid reading the full trailing payload"
+        );
+    }
+
+    #[test]
+    fn seekable_uncompressed_decode_skips_large_unselected_tail_payload() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/uncompressed_pix_ABGR.heif");
+        let input = std::fs::read(&fixture).expect("uncompressed fixture must be readable");
+        let expected = decode_bytes_to_rgba(&input)
+            .expect("bytes decode should succeed for uncompressed HEIF");
+
+        let tail = make_basic_box(*b"mdat", &vec![0xEF_u8; 512 * 1024]);
+        let mut with_tail = input.clone();
+        with_tail.extend_from_slice(&tail);
+        let with_tail_len = with_tail.len();
+        let mut source = TrackingSliceSource::new(with_tail);
+
+        let decoded = decode_source_to_rgba_with_hint(&mut source, Some(HeifInputFamily::Heif))
+            .expect("seekable uncompressed decode should succeed with trailing unselected payload");
+        assert_eq!(decoded, expected);
+        assert!(
+            source.bytes_requested < with_tail_len - (256 * 1024),
+            "seekable uncompressed decode should avoid reading the full trailing payload"
         );
     }
 

@@ -25,6 +25,16 @@ pub trait RandomAccessSource {
     }
 }
 
+impl<T: RandomAccessSource + ?Sized> RandomAccessSource for &mut T {
+    fn len(&self) -> u64 {
+        (**self).len()
+    }
+
+    fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), SourceReadError> {
+        (**self).read_exact_at(offset, output)
+    }
+}
+
 #[derive(Debug)]
 pub enum SourceReadError {
     RangeOverflow {

@@ -1,3 +1,4 @@
+use crate::source::RandomAccessSource;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
@@ -3841,6 +3842,23 @@ pub fn parse_primary_uncompressed_item_properties(
 pub fn extract_primary_avif_item_data(
     input: &[u8],
 ) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    extract_primary_avif_item_data_internal(input, &mut source)
+}
+
+/// Extract the primary AVIF (`av01`) coded payload from `iloc` extents using a random-access source.
+pub fn extract_primary_avif_item_data_from_source<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    extract_primary_avif_item_data_internal(input, &mut source)
+}
+
+fn extract_primary_avif_item_data_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
     // Provenance: mirrors the primary-item selection and extent read flow from
     // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::set_decoder_input_data
     // and libheif/libheif/box.cc:Box_iloc::read_data.
@@ -3891,7 +3909,19 @@ pub fn extract_primary_avif_item_data(
     let mut payload = Vec::with_capacity(payload_capacity);
 
     match location.construction_method {
-        0 => append_iloc_extents_to_payload(input, location, item_id, 0, &mut payload)?,
+        0 => {
+            if let Some(source) = source.as_mut() {
+                append_iloc_extents_to_payload_from_source(
+                    *source,
+                    location,
+                    item_id,
+                    0,
+                    &mut payload,
+                )?;
+            } else {
+                append_iloc_extents_to_payload(input, location, item_id, 0, &mut payload)?;
+            }
+        }
         1 => {
             let children = meta
                 .parse_children()
@@ -3918,6 +3948,23 @@ pub fn extract_primary_avif_item_data(
 /// Extract the primary uncompressed (`unci`) payload from `iloc` extents.
 pub fn extract_primary_uncompressed_item_data(
     input: &[u8],
+) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    extract_primary_uncompressed_item_data_internal(input, &mut source)
+}
+
+/// Extract the primary uncompressed (`unci`) payload from `iloc` extents using a random-access source.
+pub fn extract_primary_uncompressed_item_data_from_source<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    extract_primary_uncompressed_item_data_internal(input, &mut source)
+}
+
+fn extract_primary_uncompressed_item_data_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
     // Provenance: mirrors the primary-item selection and uncompressed extent read flow from
     // libheif/libheif/file.cc:HeifFile::get_uncompressed_item_data and
@@ -3974,13 +4021,25 @@ pub fn extract_primary_uncompressed_item_data(
     let mut payload = Vec::with_capacity(payload_capacity);
 
     match location.construction_method {
-        0 => append_iloc_extents_to_payload_for_uncompressed(
-            input,
-            location,
-            item_id,
-            0,
-            &mut payload,
-        )?,
+        0 => {
+            if let Some(source) = source.as_mut() {
+                append_iloc_extents_to_payload_for_uncompressed_from_source(
+                    *source,
+                    location,
+                    item_id,
+                    0,
+                    &mut payload,
+                )?;
+            } else {
+                append_iloc_extents_to_payload_for_uncompressed(
+                    input,
+                    location,
+                    item_id,
+                    0,
+                    &mut payload,
+                )?;
+            }
+        }
         1 => {
             let children = meta
                 .parse_children()
@@ -4016,6 +4075,23 @@ pub fn extract_primary_uncompressed_item_data(
 pub fn extract_primary_heic_item_data(
     input: &[u8],
 ) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    extract_primary_heic_item_data_internal(input, &mut source)
+}
+
+/// Extract the primary HEIC (`hvc1`/`hev1`) coded payload from `iloc` extents using a random-access source.
+pub fn extract_primary_heic_item_data_from_source<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    extract_primary_heic_item_data_internal(input, &mut source)
+}
+
+fn extract_primary_heic_item_data_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
     // Provenance: mirrors the HEIC primary-item selection and extent read flow
     // from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::set_decoder_input_data,
     // libheif/libheif/box.cc:Box_iloc::read_data, and
@@ -4037,6 +4113,7 @@ pub fn extract_primary_heic_item_data(
 
     let (construction_method, payload) = extract_heic_item_payload_from_location(
         input,
+        source,
         &meta,
         &resolved.primary_item.location,
         item_id,
@@ -4052,6 +4129,23 @@ pub fn extract_primary_heic_item_data(
 /// Extract primary HEIC item data, including `grid` item descriptor + tiles.
 pub fn extract_primary_heic_item_data_with_grid(
     input: &[u8],
+) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    extract_primary_heic_item_data_with_grid_internal(input, &mut source)
+}
+
+/// Extract primary HEIC item data, including `grid` item descriptor + tiles, using a random-access source.
+pub fn extract_primary_heic_item_data_with_grid_from_source<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    extract_primary_heic_item_data_with_grid_internal(input, &mut source)
+}
+
+fn extract_primary_heic_item_data_with_grid_internal(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
     // Provenance: mirrors libheif `grid` descriptor parsing and tile-reference
     // resolution in libheif/libheif/image-items/grid.cc:{ImageGrid::parse,ImageItem_Grid::read_grid_spec},
@@ -4069,6 +4163,7 @@ pub fn extract_primary_heic_item_data_with_grid(
     if item_type.as_bytes() == HVC1_ITEM_TYPE || item_type.as_bytes() == HEV1_ITEM_TYPE {
         let (construction_method, payload) = extract_heic_item_payload_from_location(
             input,
+            source,
             &meta,
             &resolved.primary_item.location,
             item_id,
@@ -4089,6 +4184,7 @@ pub fn extract_primary_heic_item_data_with_grid(
 
     let (construction_method, grid_payload) = extract_heic_item_payload_from_location(
         input,
+        source,
         &meta,
         &resolved.primary_item.location,
         item_id,
@@ -4172,8 +4268,13 @@ pub fn extract_primary_heic_item_data_with_grid(
                 item_id,
                 tile_item_id,
             })?;
-        let (tile_construction_method, payload) =
-            extract_heic_item_payload_from_location(input, &meta, tile_location, tile_item_id)?;
+        let (tile_construction_method, payload) = extract_heic_item_payload_from_location(
+            input,
+            source,
+            &meta,
+            tile_location,
+            tile_item_id,
+        )?;
         tiles.push(HeicGridTileItemData {
             item_id: tile_item_id,
             construction_method: tile_construction_method,
@@ -4309,6 +4410,7 @@ fn resolve_primary_heic_item_graph<'a>(
 
 fn extract_heic_item_payload_from_location(
     input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &MetaBox<'_>,
     location: &ItemLocationItem,
     item_id: u32,
@@ -4336,7 +4438,19 @@ fn extract_heic_item_payload_from_location(
     let mut payload = Vec::with_capacity(payload_capacity);
 
     match location.construction_method {
-        0 => append_iloc_extents_to_payload_for_heic(input, location, item_id, 0, &mut payload)?,
+        0 => {
+            if let Some(source) = source.as_mut() {
+                append_iloc_extents_to_payload_for_heic_from_source(
+                    *source,
+                    location,
+                    item_id,
+                    0,
+                    &mut payload,
+                )?;
+            } else {
+                append_iloc_extents_to_payload_for_heic(input, location, item_id, 0, &mut payload)?;
+            }
+        }
         1 => {
             let children = meta
                 .parse_children()
@@ -4479,6 +4593,54 @@ fn append_iloc_extents_to_payload(
     Ok(())
 }
 
+fn append_iloc_extents_to_payload_from_source(
+    source: &mut dyn RandomAccessSource,
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractAvifItemDataError> {
+    let available = source.len();
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        let extent_len = usize::try_from(extent.length).map_err(|_| {
+            ExtractAvifItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            }
+        })?;
+        let bytes = source.read_range(start, extent_len).map_err(|_| {
+            ExtractAvifItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            }
+        })?;
+        output.extend_from_slice(&bytes);
+    }
+
+    Ok(())
+}
+
 fn append_iloc_extents_to_payload_for_heic(
     source: &[u8],
     location: &ItemLocationItem,
@@ -4526,6 +4688,54 @@ fn append_iloc_extents_to_payload_for_heic(
             length: end,
         })?;
         output.extend_from_slice(&source[start..end]);
+    }
+
+    Ok(())
+}
+
+fn append_iloc_extents_to_payload_for_heic_from_source(
+    source: &mut dyn RandomAccessSource,
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractHeicItemDataError> {
+    let available = source.len();
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        let extent_len = usize::try_from(extent.length).map_err(|_| {
+            ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            }
+        })?;
+        let bytes = source.read_range(start, extent_len).map_err(|_| {
+            ExtractHeicItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            }
+        })?;
+        output.extend_from_slice(&bytes);
     }
 
     Ok(())
@@ -4581,6 +4791,54 @@ fn append_iloc_extents_to_payload_for_uncompressed(
             }
         })?;
         output.extend_from_slice(&source[start..end]);
+    }
+
+    Ok(())
+}
+
+fn append_iloc_extents_to_payload_for_uncompressed_from_source(
+    source: &mut dyn RandomAccessSource,
+    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), ExtractUncompressedItemDataError> {
+    let available = source.len();
+
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+
+        let extent_len = usize::try_from(extent.length).map_err(|_| {
+            ExtractUncompressedItemDataError::PayloadTooLarge {
+                item_id,
+                length: end,
+            }
+        })?;
+        let bytes = source.read_range(start, extent_len).map_err(|_| {
+            ExtractUncompressedItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            }
+        })?;
+        output.extend_from_slice(&bytes);
     }
 
     Ok(())
