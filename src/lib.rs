@@ -14,6 +14,7 @@ use rav1d::src::lib::{
 };
 use rav1d::Dav1dResult;
 use scuffle_h265::{NALUnitType, SpsNALUnit};
+use source::{FileSource, RandomAccessSource, SourceReadError};
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::c_void;
@@ -5146,6 +5147,44 @@ fn decode_bytes_to_png_with_hint(
     }
 }
 
+fn decode_error_from_source_read_error(err: SourceReadError) -> DecodeError {
+    match err {
+        SourceReadError::Io { source, .. } => DecodeError::Io(source),
+        SourceReadError::RangeOverflow { .. } | SourceReadError::OutOfBounds { .. } => {
+            DecodeError::Unsupported(err.to_string())
+        }
+    }
+}
+
+fn read_all_from_source<S: RandomAccessSource>(source: &mut S) -> Result<Vec<u8>, DecodeError> {
+    let source_len = source.len();
+    let source_len_usize = usize::try_from(source_len).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "Input source is too large to decode on this platform: {source_len} bytes"
+        ))
+    })?;
+    source
+        .read_range(0, source_len_usize)
+        .map_err(decode_error_from_source_read_error)
+}
+
+fn decode_source_to_rgba_with_hint<S: RandomAccessSource>(
+    source: &mut S,
+    hint: Option<HeifInputFamily>,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let input = read_all_from_source(source)?;
+    decode_bytes_to_rgba_with_hint(&input, hint)
+}
+
+fn decode_source_to_png_with_hint<S: RandomAccessSource>(
+    source: &mut S,
+    hint: Option<HeifInputFamily>,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let input = read_all_from_source(source)?;
+    decode_bytes_to_png_with_hint(&input, hint, output_path)
+}
+
 /// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bytes_to_rgba_with_hint(input, None)
@@ -5173,8 +5212,8 @@ pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, Decode
             input_path.display()
         )));
     }
-    let input = std::fs::read(input_path)?;
-    decode_bytes_to_rgba_with_hint(&input, extension_family_hint(input_path))
+    let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
+    decode_source_to_rgba_with_hint(&mut source, extension_family_hint(input_path))
 }
 
 /// Backward-compatible alias for [`decode_path_to_rgba`].
@@ -5213,8 +5252,8 @@ pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
             input_path.display()
         )));
     }
-    let input = std::fs::read(input_path)?;
-    decode_bytes_to_png_with_hint(&input, extension_family_hint(input_path), output_path)
+    let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
+    decode_source_to_png_with_hint(&mut source, extension_family_hint(input_path), output_path)
 }
 
 /// Backward-compatible alias for [`decode_path_to_png`].
