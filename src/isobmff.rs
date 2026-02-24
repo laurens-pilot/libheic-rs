@@ -3408,7 +3408,12 @@ pub fn parse_primary_avif_item_properties(
     let resolved = meta
         .resolve_primary_item()
         .map_err(ParsePrimaryAvifPropertiesError::ResolvePrimaryItem)?;
+    parse_primary_avif_item_properties_from_resolved_graph(&resolved)
+}
 
+pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
+    resolved: &ResolvedPrimaryItemGraph<'_>,
+) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
         .primary_item
@@ -3862,15 +3867,7 @@ fn extract_primary_avif_item_data_internal(
     // Provenance: mirrors the primary-item selection and extent read flow from
     // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::set_decoder_input_data
     // and libheif/libheif/box.cc:Box_iloc::read_data.
-    let top_level = parse_boxes(input).map_err(ExtractAvifItemDataError::TopLevelBoxes)?;
-    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
-        .ok_or(ExtractAvifItemDataError::MissingMetaBox)?;
-    let meta = meta_box
-        .parse_meta()
-        .map_err(ExtractAvifItemDataError::Meta)?;
-    let resolved = meta
-        .resolve_primary_item()
-        .map_err(ExtractAvifItemDataError::ResolvePrimaryItem)?;
+    let (meta, resolved) = resolve_primary_avif_item_graph(input)?;
 
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
@@ -3885,7 +3882,43 @@ fn extract_primary_avif_item_data_internal(
         });
     }
 
-    let location = &resolved.primary_item.location;
+    let (construction_method, payload) = extract_avif_item_payload_from_location(
+        input,
+        source,
+        &meta,
+        &resolved.primary_item.location,
+        item_id,
+    )?;
+
+    Ok(AvifPrimaryItemData {
+        item_id,
+        construction_method,
+        payload,
+    })
+}
+
+pub(crate) fn resolve_primary_avif_item_graph<'a>(
+    input: &'a [u8],
+) -> Result<(MetaBox<'a>, ResolvedPrimaryItemGraph<'a>), ExtractAvifItemDataError> {
+    let top_level = parse_boxes(input).map_err(ExtractAvifItemDataError::TopLevelBoxes)?;
+    let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
+        .ok_or(ExtractAvifItemDataError::MissingMetaBox)?;
+    let meta = meta_box
+        .parse_meta()
+        .map_err(ExtractAvifItemDataError::Meta)?;
+    let resolved = meta
+        .resolve_primary_item()
+        .map_err(ExtractAvifItemDataError::ResolvePrimaryItem)?;
+    Ok((meta, resolved))
+}
+
+pub(crate) fn extract_avif_item_payload_from_location(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &MetaBox<'_>,
+    location: &ItemLocationItem,
+    item_id: u32,
+) -> Result<(u8, Vec<u8>), ExtractAvifItemDataError> {
     if location.data_reference_index != 0 {
         return Err(ExtractAvifItemDataError::UnsupportedDataReferenceIndex {
             item_id,
@@ -3938,11 +3971,7 @@ fn extract_primary_avif_item_data_internal(
         }
     }
 
-    Ok(AvifPrimaryItemData {
-        item_id,
-        construction_method: location.construction_method,
-        payload,
-    })
+    Ok((location.construction_method, payload))
 }
 
 /// Extract the primary uncompressed (`unci`) payload from `iloc` extents.

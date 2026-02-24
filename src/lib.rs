@@ -1188,16 +1188,32 @@ fn decode_primary_avif_to_image_internal(
     // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
     // AVIF configuration extraction in
     // libheif/libheif/codecs/avif_dec.cc:Decoder_AVIF::read_bitstream_configuration_data.
-    let item_data = if let Some(source) = source.as_mut() {
-        isobmff::extract_primary_avif_item_data_from_source(source, input)?
-    } else {
-        isobmff::extract_primary_avif_item_data(input)?
-    };
-    let payload = item_data.payload;
+    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)?;
+    let item_id = resolved.primary_item.item_id;
+    let item_type = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .ok_or(isobmff::ExtractAvifItemDataError::MissingPrimaryItemType { item_id })?;
+    if item_type.as_bytes() != AV01_ITEM_TYPE {
+        return Err(DecodeAvifError::ExtractPrimaryPayload(
+            isobmff::ExtractAvifItemDataError::UnexpectedPrimaryItemType {
+                item_id,
+                actual: item_type,
+            },
+        ));
+    }
+    let (_, payload) = isobmff::extract_avif_item_payload_from_location(
+        input,
+        source,
+        &meta,
+        &resolved.primary_item.location,
+        item_id,
+    )?;
     let mut ycbcr_range = YCbCrRange::Full;
     let mut ycbcr_matrix = YCbCrMatrixCoefficients::default();
     let (elementary_stream, expected_geometry) =
-        match isobmff::parse_primary_avif_item_properties(input) {
+        match isobmff::parse_primary_avif_item_properties_from_resolved_graph(&resolved) {
             Ok(properties) => {
                 ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
                 ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
@@ -1234,8 +1250,14 @@ fn decode_primary_avif_to_image_internal(
         }
     }
 
-    decoded.alpha_plane =
-        decode_primary_avif_auxiliary_alpha_plane(input, source, decoded.width, decoded.height);
+    decoded.alpha_plane = decode_primary_avif_auxiliary_alpha_plane(
+        input,
+        source,
+        &meta,
+        &resolved,
+        decoded.width,
+        decoded.height,
+    );
 
     Ok(decoded)
 }
@@ -4866,6 +4888,8 @@ const ALPHA_AUX_TYPES: [&[u8]; 3] = [
 fn decode_primary_avif_auxiliary_alpha_plane(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'_>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
     expected_width: u32,
     expected_height: u32,
 ) -> Option<AvifAuxiliaryAlphaPlane> {
@@ -4873,10 +4897,6 @@ fn decode_primary_avif_auxiliary_alpha_plane(
     // libheif/libheif/context.cc (`auxl` reference direction and aux-type
     // filtering) and ImageItem alpha composition flow in
     // libheif/libheif/image-items/image_item.cc (`decode_image`).
-    let top_level = isobmff::parse_boxes(input).ok()?;
-    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
-    let meta = meta_box.parse_meta().ok()?;
-    let resolved = meta.resolve_primary_item().ok()?;
     let iref = resolved.iref.as_ref()?;
     let primary_item_id = resolved.primary_item.item_id;
 
@@ -4891,8 +4911,8 @@ fn decode_primary_avif_auxiliary_alpha_plane(
         let Some(alpha_plane) = decode_auxiliary_alpha_avif_item_candidate(
             input,
             source,
-            &meta,
-            &resolved,
+            meta,
+            resolved,
             reference.from_item_id,
         ) else {
             continue;
