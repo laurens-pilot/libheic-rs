@@ -7106,11 +7106,14 @@ mod tests {
         DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane,
         HevcNalClass, TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
         UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
-        YCbCrRange, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
-        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        YCbCrRange, CMPC_PROPERTY_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
+        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
+        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
+        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::Cursor;
+    use std::ops::Range;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7497,6 +7500,97 @@ mod tests {
         let _guard = TempFileGuard(output.clone());
         decode_file_to_png(&fixture, &output)
             .expect("generic-compressed brotli fixture should write PNG");
+    }
+
+    #[test]
+    fn rejects_generic_compressed_row_unit_type_without_icef_units() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_brotli.heif");
+        let mut input =
+            std::fs::read(&fixture).expect("generic-compressed brotli fixture must be readable");
+        assert!(
+            primary_property_payload_range(&input, ICEF_PROPERTY_TYPE).is_none(),
+            "brotli fixture should exercise cmpC without icef"
+        );
+        mutate_primary_property_payload(&mut input, CMPC_PROPERTY_TYPE, |payload| {
+            payload[8] = GENERIC_COMPRESSED_UNIT_IMAGE_ROW;
+        });
+
+        let err = decode_primary_uncompressed_to_image(&input)
+            .expect_err("row/unit generic-compression without icef entries must fail");
+        assert!(matches!(
+            err,
+            DecodeUncompressedError::InvalidInput { ref detail }
+                if detail.contains("requires associated icef unit entries")
+        ));
+    }
+
+    #[test]
+    fn rejects_generic_compressed_unsupported_image_pixel_unit_type() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_brotli.heif");
+        let mut input =
+            std::fs::read(&fixture).expect("generic-compressed brotli fixture must be readable");
+        mutate_primary_property_payload(&mut input, CMPC_PROPERTY_TYPE, |payload| {
+            payload[8] = GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL;
+        });
+
+        let err = decode_primary_uncompressed_to_image(&input)
+            .expect_err("unsupported image-pixel generic-compression unit type must fail");
+        assert!(matches!(
+            err,
+            DecodeUncompressedError::UnsupportedFeature { ref detail }
+                if detail.contains("compressed_unit_type 4")
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_generic_compressed_icef_table_in_rows_fixture() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_zlib_rows.heif");
+        let mut input =
+            std::fs::read(&fixture).expect("generic-compressed zlib-rows fixture must be readable");
+        mutate_primary_property_payload(&mut input, ICEF_PROPERTY_TYPE, |payload| {
+            let unit_count = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
+            payload[5..9].copy_from_slice(&unit_count.saturating_add(1).to_be_bytes());
+        });
+
+        let err = decode_primary_uncompressed_to_image(&input)
+            .expect_err("truncated generic-compression icef table must fail");
+        assert!(matches!(
+            err,
+            DecodeUncompressedError::InvalidInput { ref detail }
+                if detail.contains("icef payload too small")
+        ));
+    }
+
+    #[test]
+    fn rejects_generic_compressed_corrupted_icef_unit_slice_in_rows_fixture() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../libheif/tests/data/rgb_generic_compressed_zlib_rows.heif");
+        let mut input =
+            std::fs::read(&fixture).expect("generic-compressed zlib-rows fixture must be readable");
+        mutate_primary_property_payload(&mut input, ICEF_PROPERTY_TYPE, |payload| {
+            let codes = payload[4];
+            let offset_code = usize::from((codes & 0b1110_0000) >> 5);
+            let size_code = usize::from((codes & 0b0001_1100) >> 2);
+            let offset_bytes = usize::from(ICEF_OFFSET_BITS_TABLE[offset_code] / 8);
+            let size_bytes = usize::from(ICEF_SIZE_BITS_TABLE[size_code] / 8);
+            let first_size = 9 + offset_bytes;
+            write_be_uint(&mut payload[first_size..first_size + size_bytes], 1);
+        });
+
+        let err = decode_primary_uncompressed_to_image(&input)
+            .expect_err("corrupted generic-compression unit slice must fail");
+        assert!(
+            matches!(
+                err,
+                DecodeUncompressedError::InvalidInput { ref detail }
+                    if detail.contains("failed to decompress zlib generic-compressed unit")
+                        || detail.contains("generic-compressed unit")
+            ),
+            "unexpected error for corrupted icef row-unit slicing: {err}"
+        );
     }
 
     #[test]
@@ -8621,6 +8715,52 @@ mod tests {
                 value.split_whitespace().next()?.parse::<usize>().ok()
             })
             .collect()
+    }
+
+    fn primary_property_payload_range(
+        input: &[u8],
+        property_type: [u8; 4],
+    ) -> Option<Range<usize>> {
+        let top_level = crate::isobmff::parse_boxes(input).ok()?;
+        let meta_box = super::find_first_box_by_type(&top_level, META_BOX_TYPE)?;
+        let meta = meta_box.parse_meta().ok()?;
+        let resolved = meta.resolve_primary_item().ok()?;
+        let property = resolved
+            .primary_item
+            .properties
+            .iter()
+            .find(|entry| entry.property.header.box_type.as_bytes() == property_type)?
+            .property
+            .clone();
+        let start = usize::try_from(property.payload_offset()).ok()?;
+        let payload_size = usize::try_from(property.header.payload_size()).ok()?;
+        let end = start.checked_add(payload_size)?;
+        if end > input.len() {
+            return None;
+        }
+        Some(start..end)
+    }
+
+    fn mutate_primary_property_payload(
+        input: &mut [u8],
+        property_type: [u8; 4],
+        mutator: impl FnOnce(&mut [u8]),
+    ) {
+        let range = primary_property_payload_range(input, property_type).unwrap_or_else(|| {
+            panic!(
+                "primary property {} should exist",
+                String::from_utf8_lossy(&property_type)
+            )
+        });
+        mutator(&mut input[range]);
+    }
+
+    fn write_be_uint(bytes: &mut [u8], value: u64) {
+        let len = bytes.len();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let shift = (len - index - 1) * 8;
+            *byte = ((value >> shift) & 0xFF) as u8;
+        }
     }
 
     fn assert_plane_len(plane: &AvifPlane, expected_samples: usize) {
