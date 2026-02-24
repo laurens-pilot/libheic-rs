@@ -20,6 +20,8 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
+#[cfg(feature = "image-integration")]
+use std::io::Seek;
 use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -5185,23 +5187,54 @@ fn decode_source_to_png_with_hint<S: RandomAccessSource>(
     decode_bytes_to_png_with_hint(&input, hint, output_path)
 }
 
+fn read_all_from_reader<R: Read>(mut input_reader: R) -> Result<Vec<u8>, DecodeError> {
+    let mut input = Vec::new();
+    input_reader.read_to_end(&mut input)?;
+    Ok(input)
+}
+
+fn decode_read_to_rgba_with_hint<R: Read>(
+    input_reader: R,
+    hint: Option<HeifInputFamily>,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let input = read_all_from_reader(input_reader)?;
+    decode_bytes_to_rgba_with_hint(&input, hint)
+}
+
+fn decode_read_to_png_with_hint<R: Read>(
+    input_reader: R,
+    hint: Option<HeifInputFamily>,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    let input = read_all_from_reader(input_reader)?;
+    decode_bytes_to_png_with_hint(&input, hint, output_path)
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_seekable_to_rgba_with_hint<R: Read + Seek>(
+    input_reader: R,
+    hint: Option<HeifInputFamily>,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let mut source =
+        source::SeekableSource::new(input_reader).map_err(decode_error_from_source_read_error)?;
+    decode_source_to_rgba_with_hint(&mut source, hint)
+}
+
 /// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bytes_to_rgba_with_hint(input, None)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input into an owned RGBA buffer.
-pub fn decode_read_to_rgba<R: Read>(mut input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
-    let mut input = Vec::new();
-    input_reader.read_to_end(&mut input)?;
-    decode_bytes_to_rgba(&input)
+pub fn decode_read_to_rgba<R: Read>(input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
+    decode_read_to_rgba_with_hint(input_reader, None)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `BufRead` input into an owned RGBA buffer.
 pub fn decode_bufread_to_rgba<R: BufRead>(
     input_reader: R,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    decode_read_to_rgba(input_reader)
+    decode_read_to_rgba_with_hint(input_reader, None)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
@@ -5227,13 +5260,8 @@ pub fn decode_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), Decod
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `Read` input and write a PNG to `output_path`.
-pub fn decode_read_to_png<R: Read>(
-    mut input_reader: R,
-    output_path: &Path,
-) -> Result<(), DecodeError> {
-    let mut input = Vec::new();
-    input_reader.read_to_end(&mut input)?;
-    decode_bytes_to_png(&input, output_path)
+pub fn decode_read_to_png<R: Read>(input_reader: R, output_path: &Path) -> Result<(), DecodeError> {
+    decode_read_to_png_with_hint(input_reader, None, output_path)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from a `BufRead` input and write a PNG to `output_path`.
@@ -5241,7 +5269,7 @@ pub fn decode_bufread_to_png<R: BufRead>(
     input_reader: R,
     output_path: &Path,
 ) -> Result<(), DecodeError> {
-    decode_read_to_png(input_reader, output_path)
+    decode_read_to_png_with_hint(input_reader, None, output_path)
 }
 
 /// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.

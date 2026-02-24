@@ -1,6 +1,7 @@
 use crate::{
     decode_bufread_to_rgba, decode_bytes_to_rgba, decode_path_to_rgba, decode_read_to_rgba,
-    DecodeError, DecodedRgbaImage, DecodedRgbaPixels,
+    decode_seekable_to_rgba_with_hint, DecodeError, DecodedRgbaImage, DecodedRgbaPixels,
+    HeifInputFamily,
 };
 use image::error::{
     DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
@@ -11,7 +12,7 @@ use image::{ColorType, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Imag
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
-use std::io::{BufRead, Read};
+use std::io::{BufRead, Read, Seek};
 use std::path::Path;
 use std::sync::Once;
 
@@ -72,6 +73,11 @@ impl HeifImageDecoder {
         Self::from_decoded(decoded)
     }
 
+    /// Decode a seekable `Read` source into an `image::ImageDecoder` adapter.
+    pub fn from_seekable<R: Read + Seek>(input_reader: R) -> ImageResult<Self> {
+        Self::from_seekable_with_hint(input_reader, None)
+    }
+
     /// Decode a `BufRead` source into an `image::ImageDecoder` adapter.
     pub fn from_bufread<R: BufRead>(input_reader: R) -> ImageResult<Self> {
         let decoded = decode_bufread_to_rgba(input_reader).map_err(decode_error_to_image_error)?;
@@ -87,6 +93,15 @@ impl HeifImageDecoder {
     /// Consume the adapter and return the owned decoded RGBA buffer.
     pub fn into_decoded_rgba(self) -> DecodedRgbaImage {
         self.decoded
+    }
+
+    fn from_seekable_with_hint<R: Read + Seek>(
+        input_reader: R,
+        hint: Option<HeifInputFamily>,
+    ) -> ImageResult<Self> {
+        let decoded = decode_seekable_to_rgba_with_hint(input_reader, hint)
+            .map_err(decode_error_to_image_error)?;
+        Self::from_decoded(decoded)
     }
 
     fn storage_color_type(&self) -> ColorType {
@@ -186,21 +201,24 @@ pub fn register_image_decoder_hooks() -> ImageHookRegistration {
     let heic_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIC),
         Box::new(|reader| {
-            let decoder = HeifImageDecoder::from_bufread(reader)?;
+            let decoder =
+                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Heif))?;
             Ok(Box::new(decoder))
         }),
     );
     let heif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIF),
         Box::new(|reader| {
-            let decoder = HeifImageDecoder::from_bufread(reader)?;
+            let decoder =
+                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Heif))?;
             Ok(Box::new(decoder))
         }),
     );
     let avif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_AVIF),
         Box::new(|reader| {
-            let decoder = HeifImageDecoder::from_bufread(reader)?;
+            let decoder =
+                HeifImageDecoder::from_seekable_with_hint(reader, Some(HeifInputFamily::Avif))?;
             Ok(Box::new(decoder))
         }),
     );
