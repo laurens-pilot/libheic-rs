@@ -4,8 +4,14 @@ use std::process::ExitCode;
 
 fn usage(program_name: &str) {
     eprintln!(
-        "Usage: {program_name} [--max-input-bytes <bytes>] [--max-pixels <pixels>] [--max-temp-spool-bytes <bytes>] [--temp-spool-directory <path>] <input.heif|.heic|.avif> <output.png>"
+        "Usage: {program_name} [--orientation <auto|preserve>] [--max-input-bytes <bytes>] [--max-pixels <pixels>] [--max-temp-spool-bytes <bytes>] [--temp-spool-directory <path>] <input.heif|.heic|.avif> <output.png>"
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrientationMode {
+    Auto,
+    Preserve,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -13,6 +19,7 @@ struct CliInvocation {
     input_path: PathBuf,
     output_path: PathBuf,
     guardrails: DecodeGuardrails,
+    orientation_mode: OrientationMode,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -27,17 +34,34 @@ fn parse_u64_option(flag: &str, value: String) -> Result<u64, CliParseError> {
     })
 }
 
+fn parse_orientation_mode(value: String) -> Result<OrientationMode, CliParseError> {
+    match value.as_str() {
+        "auto" => Ok(OrientationMode::Auto),
+        "preserve" => Ok(OrientationMode::Preserve),
+        _ => Err(CliParseError::InvalidArguments(format!(
+            "--orientation expects one of: auto, preserve (got '{value}')"
+        ))),
+    }
+}
+
 fn parse_cli_invocation<I>(args: I) -> Result<CliInvocation, CliParseError>
 where
     I: IntoIterator<Item = String>,
 {
     let mut positional = Vec::new();
     let mut guardrails = DecodeGuardrails::default();
+    let mut orientation_mode = OrientationMode::Auto;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--help" | "-h" => return Err(CliParseError::HelpRequested),
+            "--orientation" => {
+                let value = iter.next().ok_or_else(|| {
+                    CliParseError::InvalidArguments("missing value for --orientation".to_string())
+                })?;
+                orientation_mode = parse_orientation_mode(value)?;
+            }
             "--max-input-bytes" => {
                 let value = iter.next().ok_or_else(|| {
                     CliParseError::InvalidArguments(
@@ -88,6 +112,7 @@ where
         input_path: PathBuf::from(&positional[0]),
         output_path: PathBuf::from(&positional[1]),
         guardrails,
+        orientation_mode,
     })
 }
 
@@ -114,11 +139,42 @@ fn main() -> ExitCode {
         }
     };
 
-    match libheic_rs::decode_path_to_png_with_guardrails(
-        Path::new(&invocation.input_path),
-        Path::new(&invocation.output_path),
-        invocation.guardrails,
-    ) {
+    let input_path = Path::new(&invocation.input_path);
+    let output_path = Path::new(&invocation.output_path);
+    let mut decoded =
+        match libheic_rs::decode_path_to_rgba_with_guardrails(input_path, invocation.guardrails) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                eprintln!("{}", format_decode_failure(&err));
+                return ExitCode::from(1);
+            }
+        };
+
+    if invocation.orientation_mode == OrientationMode::Auto
+        && libheic_rs::path_extension_is_heif(input_path)
+    {
+        match libheic_rs::exif_orientation_hint_from_path(input_path) {
+            Ok(hint) => {
+                if let Some(orientation) = hint.orientation_to_apply() {
+                    match decoded.apply_exif_orientation(orientation) {
+                        Ok(oriented) => decoded = oriented,
+                        Err(err) => {
+                            eprintln!("{}", format_decode_failure(&err));
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to inspect EXIF orientation for {}: {err}",
+                    input_path.display()
+                );
+            }
+        }
+    }
+
+    match libheic_rs::write_decoded_rgba_to_png(&decoded, output_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{}", format_decode_failure(&err));
@@ -129,7 +185,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_decode_failure, parse_cli_invocation, CliInvocation, CliParseError};
+    use super::{
+        format_decode_failure, parse_cli_invocation, CliInvocation, CliParseError, OrientationMode,
+    };
     use libheic_rs::{DecodeError, DecodeGuardrails, DecodeHeicError};
     use std::path::PathBuf;
 
@@ -159,6 +217,7 @@ mod tests {
                 input_path: PathBuf::from("input.heic"),
                 output_path: PathBuf::from("output.png"),
                 guardrails: DecodeGuardrails::default(),
+                orientation_mode: OrientationMode::Auto,
             })
         );
     }
@@ -169,6 +228,8 @@ mod tests {
             parse_cli_invocation([
                 "--max-input-bytes".to_string(),
                 "1048576".to_string(),
+                "--orientation".to_string(),
+                "preserve".to_string(),
                 "--max-pixels".to_string(),
                 "262144".to_string(),
                 "--max-temp-spool-bytes".to_string(),
@@ -187,7 +248,23 @@ mod tests {
                     max_temp_spool_bytes: Some(2_097_152),
                     temp_spool_directory: Some(PathBuf::from("/tmp/libheic-spool")),
                 },
+                orientation_mode: OrientationMode::Preserve,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_orientation_mode() {
+        assert_eq!(
+            parse_cli_invocation([
+                "--orientation".to_string(),
+                "invalid".to_string(),
+                "input.heic".to_string(),
+                "output.png".to_string(),
+            ]),
+            Err(CliParseError::InvalidArguments(
+                "--orientation expects one of: auto, preserve (got 'invalid')".to_string()
+            ))
         );
     }
 

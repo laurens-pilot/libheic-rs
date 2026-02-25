@@ -6375,6 +6375,14 @@ pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), D
     decode_path_to_png(input_path, output_path)
 }
 
+/// Write an already-decoded RGBA image buffer to PNG.
+pub fn write_decoded_rgba_to_png(
+    decoded: &DecodedRgbaImage,
+    output_path: &Path,
+) -> Result<(), DecodeError> {
+    write_decoded_rgba_image_to_png(decoded, output_path)
+}
+
 fn primary_icc_profile_from_resolved_avif_graph(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
 ) -> Option<Vec<u8>> {

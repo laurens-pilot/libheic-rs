@@ -18,7 +18,7 @@ This document is the practical API reference for integrating `libheic-rs` in app
 
 ```toml
 [dependencies]
-libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.3" }
+libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.4" }
 # or:
 # libheic-rs = { path = "../libheic-rs" }
 ```
@@ -27,7 +27,7 @@ With `image` integration:
 
 ```toml
 [dependencies]
-libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.3", features = ["image-integration"] }
+libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.4", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 
