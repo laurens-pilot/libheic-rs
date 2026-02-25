@@ -601,6 +601,33 @@ pub struct DecodedRgbaImage {
     pub icc_profile: Option<Vec<u8>>,
 }
 
+/// HEIF EXIF-orientation inspection result for caller-controlled display transforms.
+///
+/// `exif_orientation` is the raw EXIF orientation value (`1..=8`) when present.
+/// `primary_item_has_orientation_transform` reports whether `irot`/`imir` is already
+/// signalled on the primary item. When this is true, applying EXIF orientation on top
+/// may double-rotate or double-mirror the decoded output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExifOrientationHint {
+    pub exif_orientation: Option<u8>,
+    pub primary_item_has_orientation_transform: bool,
+}
+
+impl ExifOrientationHint {
+    /// Return true when EXIF orientation should be applied by the caller.
+    pub fn should_apply_exif_orientation(self) -> bool {
+        matches!(self.exif_orientation, Some(2..=8)) && !self.primary_item_has_orientation_transform
+    }
+
+    /// Return the EXIF orientation value to apply, if any.
+    pub fn orientation_to_apply(self) -> Option<u8> {
+        if self.should_apply_exif_orientation() {
+            return self.exif_orientation;
+        }
+        None
+    }
+}
+
 impl DecodedRgbaImage {
     /// Return the storage bit depth of the RGBA pixel buffer (8 or 16).
     pub fn storage_bit_depth(&self) -> u8 {
@@ -625,6 +652,55 @@ impl DecodedRgbaImage {
     /// Consume this image and return owned RGBA16 samples when present.
     pub fn into_rgba16(self) -> Option<Vec<u16>> {
         self.pixels.into_rgba16()
+    }
+
+    /// Apply a raw EXIF orientation (`1..=8`) to this decoded RGBA image.
+    ///
+    /// This is useful when you keep decode parity with libheif and want to apply
+    /// orientation at the UI/application layer.
+    pub fn apply_exif_orientation(self, exif_orientation: u8) -> Result<Self, DecodeError> {
+        let Some(transforms) =
+            exif_orientation_to_primary_item_transforms(u16::from(exif_orientation))
+        else {
+            return Ok(self);
+        };
+
+        if transforms.is_empty() {
+            return Ok(self);
+        }
+
+        let DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth,
+            pixels,
+            icc_profile,
+        } = self;
+
+        match pixels {
+            DecodedRgbaPixels::U8(samples) => {
+                let (next_width, next_height, next_pixels) =
+                    apply_primary_item_transforms_rgba(width, height, samples, &transforms)?;
+                Ok(Self {
+                    width: next_width,
+                    height: next_height,
+                    source_bit_depth,
+                    pixels: DecodedRgbaPixels::U8(next_pixels),
+                    icc_profile,
+                })
+            }
+            DecodedRgbaPixels::U16(samples) => {
+                let (next_width, next_height, next_pixels) =
+                    apply_primary_item_transforms_rgba(width, height, samples, &transforms)?;
+                Ok(Self {
+                    width: next_width,
+                    height: next_height,
+                    source_bit_depth,
+                    pixels: DecodedRgbaPixels::U16(next_pixels),
+                    icc_profile,
+                })
+            }
+        }
     }
 }
 
@@ -4820,6 +4896,15 @@ const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
 const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
+const CDSC_REFERENCE_TYPE: [u8; 4] = *b"cdsc";
+const EXIF_ITEM_TYPE: [u8; 4] = *b"Exif";
+const MIME_ITEM_TYPE: [u8; 4] = *b"mime";
+const EXIF_ORIENTATION_TAG: u16 = 0x0112;
+const EXIF_HEADER: &[u8] = b"Exif\0\0";
+const TIFF_TAG_TYPE_SHORT: u16 = 3;
+const TIFF_MAGIC_NUMBER: u16 = 42;
+const EXIF_CONTENT_TYPE_APPLICATION_EXIF: &[u8] = b"application/exif";
+const EXIF_CONTENT_TYPE_IMAGE_TIFF: &[u8] = b"image/tiff";
 const AUXC_PROPERTY_TYPE: [u8; 4] = *b"auxC";
 const AV1C_PROPERTY_TYPE: [u8; 4] = *b"av1C";
 const HVCC_PROPERTY_TYPE: [u8; 4] = *b"hvcC";
@@ -4856,6 +4941,349 @@ const ALPHA_AUX_TYPES: [&[u8]; 3] = [
     b"urn:mpeg:hevc:2015:auxid:1",
     b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
 ];
+
+/// Return `true` when the primary item already carries `irot` or `imir`.
+///
+/// When this is `true`, applying EXIF orientation in addition to decode output may
+/// double-rotate or double-mirror the image.
+pub fn primary_item_has_orientation_transform(input: &[u8]) -> bool {
+    let Ok(transforms) = isobmff::parse_primary_item_transform_properties(input) else {
+        return false;
+    };
+    transforms_include_orientation(&transforms.transforms)
+}
+
+/// Parse the raw EXIF orientation (`1..=8`) associated with the primary HEIF item.
+///
+/// Returns `None` when no primary-linked EXIF orientation is present.
+pub fn primary_exif_orientation(input: &[u8]) -> Option<u8> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    primary_exif_orientation_from_heif(input, &mut source)
+        .and_then(|orientation| u8::try_from(orientation).ok())
+        .filter(|orientation| (1..=8).contains(orientation))
+}
+
+/// Inspect EXIF orientation and primary-item transform signalling for caller-controlled orientation handling.
+pub fn exif_orientation_hint(input: &[u8]) -> ExifOrientationHint {
+    ExifOrientationHint {
+        exif_orientation: primary_exif_orientation(input),
+        primary_item_has_orientation_transform: primary_item_has_orientation_transform(input),
+    }
+}
+
+/// Parse the raw EXIF orientation (`1..=8`) from a HEIF/HEIC file path without decoding pixel data.
+///
+/// This reads container metadata and the EXIF item payload (when present), but does
+/// not decode image planes into RGB/RGBA.
+pub fn primary_exif_orientation_from_path(input_path: &Path) -> Result<Option<u8>, DecodeError> {
+    Ok(exif_orientation_hint_from_path(input_path)?.exif_orientation)
+}
+
+/// Inspect EXIF orientation and primary-item transform signalling from a file path.
+///
+/// This path-based variant avoids loading the whole file into memory and avoids
+/// full image decode.
+pub fn exif_orientation_hint_from_path(
+    input_path: &Path,
+) -> Result<ExifOrientationHint, DecodeError> {
+    if !input_path.exists() {
+        return Err(DecodeError::Unsupported(format!(
+            "Input file does not exist: {}",
+            input_path.display()
+        )));
+    }
+
+    // Cheap caller-facing gate: only HEIF/HEIC extensions participate in EXIF
+    // orientation handling. AVIF and unknown extensions short-circuit.
+    if !path_extension_is_heif(input_path) {
+        return Ok(ExifOrientationHint {
+            exif_orientation: None,
+            primary_item_has_orientation_transform: false,
+        });
+    }
+
+    let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
+    let selected =
+        read_selected_top_level_boxes_from_source(&mut source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
+    let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
+    if source_family_hint != Some(HeifInputFamily::Heif) {
+        return Ok(ExifOrientationHint {
+            exif_orientation: None,
+            primary_item_has_orientation_transform: false,
+        });
+    }
+
+    let input = encode_source_selected_top_level_boxes(&selected);
+    let primary_item_has_orientation_transform =
+        isobmff::parse_primary_item_transform_properties(&input)
+            .map(|transforms| transforms_include_orientation(&transforms.transforms))
+            .unwrap_or(false);
+
+    let mut source_handle: Option<&mut dyn RandomAccessSource> = Some(&mut source);
+    let exif_orientation = primary_exif_orientation_from_heif(&input, &mut source_handle)
+        .and_then(|orientation| u8::try_from(orientation).ok())
+        .filter(|orientation| (1..=8).contains(orientation));
+
+    Ok(ExifOrientationHint {
+        exif_orientation,
+        primary_item_has_orientation_transform,
+    })
+}
+
+fn transforms_include_orientation(transforms: &[isobmff::PrimaryItemTransformProperty]) -> bool {
+    transforms.iter().any(|transform| {
+        matches!(
+            transform,
+            isobmff::PrimaryItemTransformProperty::Rotation(rotation)
+                if rotation.rotation_ccw_degrees % 360 != 0
+        ) || matches!(transform, isobmff::PrimaryItemTransformProperty::Mirror(_))
+    })
+}
+
+fn primary_exif_orientation_from_heif(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Option<u16> {
+    let top_level = isobmff::parse_boxes(input).ok()?;
+    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
+    let meta = meta_box.parse_meta().ok()?;
+    let resolved = meta.resolve_primary_item().ok()?;
+    let iref = resolved.iref.as_ref()?;
+    let primary_item_id = resolved.primary_item.item_id;
+
+    for reference in &iref.references {
+        if reference.reference_type.as_bytes() != CDSC_REFERENCE_TYPE {
+            continue;
+        }
+        if !reference.to_item_ids.contains(&primary_item_id) {
+            continue;
+        }
+
+        let item_id = reference.from_item_id;
+        let Some(item_info) = resolved
+            .iinf
+            .entries
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+        else {
+            continue;
+        };
+        if !item_info_is_exif_candidate(item_info) {
+            continue;
+        }
+
+        let Some(location) = resolved
+            .iloc
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+        else {
+            continue;
+        };
+        if location.data_reference_index != 0 {
+            continue;
+        }
+
+        let Some(payload) = extract_heic_item_payload_with_source(input, source, &meta, location)
+        else {
+            continue;
+        };
+        let Some(orientation) = parse_exif_orientation_from_item_payload(&payload) else {
+            continue;
+        };
+        if (1..=8).contains(&orientation) {
+            return Some(orientation);
+        }
+    }
+
+    None
+}
+
+fn item_info_is_exif_candidate(item_info: &isobmff::ItemInfoEntryBox) -> bool {
+    let Some(item_type) = item_info.item_type else {
+        return false;
+    };
+    if item_type.as_bytes() == EXIF_ITEM_TYPE {
+        return true;
+    }
+    if item_type.as_bytes() != MIME_ITEM_TYPE {
+        return false;
+    }
+
+    if bytes_eq_ignore_ascii_case(&item_info.item_name, b"Exif") {
+        return true;
+    }
+    let Some(content_type) = item_info.content_type.as_deref() else {
+        return false;
+    };
+    bytes_eq_ignore_ascii_case(content_type, EXIF_CONTENT_TYPE_APPLICATION_EXIF)
+        || bytes_eq_ignore_ascii_case(content_type, EXIF_CONTENT_TYPE_IMAGE_TIFF)
+}
+
+fn bytes_eq_ignore_ascii_case(lhs: &[u8], rhs: &[u8]) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn exif_orientation_to_primary_item_transforms(
+    orientation: u16,
+) -> Option<Vec<isobmff::PrimaryItemTransformProperty>> {
+    use isobmff::{
+        ImageMirrorDirection, ImageMirrorProperty, ImageRotationProperty,
+        PrimaryItemTransformProperty,
+    };
+
+    let mirror_horizontal = || {
+        PrimaryItemTransformProperty::Mirror(ImageMirrorProperty {
+            direction: ImageMirrorDirection::Horizontal,
+        })
+    };
+    let mirror_vertical = || {
+        PrimaryItemTransformProperty::Mirror(ImageMirrorProperty {
+            direction: ImageMirrorDirection::Vertical,
+        })
+    };
+    let rotate_ccw = |rotation_ccw_degrees| {
+        PrimaryItemTransformProperty::Rotation(ImageRotationProperty {
+            rotation_ccw_degrees,
+        })
+    };
+
+    match orientation {
+        1 => Some(Vec::new()),
+        2 => Some(vec![mirror_horizontal()]),
+        3 => Some(vec![rotate_ccw(180)]),
+        4 => Some(vec![mirror_vertical()]),
+        5 => Some(vec![mirror_horizontal(), rotate_ccw(90)]),
+        6 => Some(vec![rotate_ccw(270)]),
+        7 => Some(vec![mirror_horizontal(), rotate_ccw(270)]),
+        8 => Some(vec![rotate_ccw(90)]),
+        _ => None,
+    }
+}
+
+fn parse_exif_orientation_from_item_payload(payload: &[u8]) -> Option<u16> {
+    let mut candidates = Vec::new();
+    if payload.len() >= 4 {
+        let tiff_offset = u32::from_be_bytes(payload[0..4].try_into().ok()?);
+        let tiff_offset = usize::try_from(tiff_offset).ok()?;
+        let tiff_start = 4_usize.checked_add(tiff_offset)?;
+        candidates.push(tiff_start);
+    }
+    if let Some(exif_header_start) = find_subslice(payload, EXIF_HEADER) {
+        let tiff_start = exif_header_start.checked_add(EXIF_HEADER.len())?;
+        if !candidates.contains(&tiff_start) {
+            candidates.push(tiff_start);
+        }
+    }
+    if !candidates.contains(&0) {
+        candidates.push(0);
+    }
+
+    for tiff_start in candidates {
+        let Some(orientation) = parse_exif_orientation_from_tiff(payload, tiff_start) else {
+            continue;
+        };
+        if (1..=8).contains(&orientation) {
+            return Some(orientation);
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TiffByteOrder {
+    LittleEndian,
+    BigEndian,
+}
+
+fn parse_exif_orientation_from_tiff(payload: &[u8], tiff_start: usize) -> Option<u16> {
+    let byte_order = payload.get(tiff_start..tiff_start.checked_add(2)?)?;
+    let byte_order = match byte_order {
+        b"II" => TiffByteOrder::LittleEndian,
+        b"MM" => TiffByteOrder::BigEndian,
+        _ => return None,
+    };
+
+    let magic = read_tiff_u16(payload, tiff_start.checked_add(2)?, byte_order)?;
+    if magic != TIFF_MAGIC_NUMBER {
+        return None;
+    }
+
+    let first_ifd_offset = read_tiff_u32(payload, tiff_start.checked_add(4)?, byte_order)?;
+    let first_ifd_offset = usize::try_from(first_ifd_offset).ok()?;
+    let first_ifd = tiff_start.checked_add(first_ifd_offset)?;
+    parse_exif_orientation_from_ifd(payload, tiff_start, first_ifd, byte_order)
+}
+
+fn parse_exif_orientation_from_ifd(
+    payload: &[u8],
+    tiff_start: usize,
+    ifd_offset: usize,
+    byte_order: TiffByteOrder,
+) -> Option<u16> {
+    let entry_count = usize::from(read_tiff_u16(payload, ifd_offset, byte_order)?);
+    let entries_start = ifd_offset.checked_add(2)?;
+
+    for entry_index in 0..entry_count {
+        let entry_offset = entries_start.checked_add(entry_index.checked_mul(12)?)?;
+        let tag = read_tiff_u16(payload, entry_offset, byte_order)?;
+        if tag != EXIF_ORIENTATION_TAG {
+            continue;
+        }
+
+        let field_type = read_tiff_u16(payload, entry_offset.checked_add(2)?, byte_order)?;
+        let value_count = read_tiff_u32(payload, entry_offset.checked_add(4)?, byte_order)?;
+        if field_type != TIFF_TAG_TYPE_SHORT || value_count == 0 {
+            continue;
+        }
+
+        let orientation = if value_count == 1 {
+            read_tiff_u16(payload, entry_offset.checked_add(8)?, byte_order)?
+        } else {
+            let value_offset = read_tiff_u32(payload, entry_offset.checked_add(8)?, byte_order)?;
+            let value_offset = usize::try_from(value_offset).ok()?;
+            let value_position = tiff_start.checked_add(value_offset)?;
+            read_tiff_u16(payload, value_position, byte_order)?
+        };
+
+        if (1..=8).contains(&orientation) {
+            return Some(orientation);
+        }
+    }
+
+    None
+}
+
+fn read_tiff_u16(payload: &[u8], offset: usize, byte_order: TiffByteOrder) -> Option<u16> {
+    let bytes = payload.get(offset..offset.checked_add(2)?)?;
+    let bytes: [u8; 2] = bytes.try_into().ok()?;
+    Some(match byte_order {
+        TiffByteOrder::LittleEndian => u16::from_le_bytes(bytes),
+        TiffByteOrder::BigEndian => u16::from_be_bytes(bytes),
+    })
+}
+
+fn read_tiff_u32(payload: &[u8], offset: usize, byte_order: TiffByteOrder) -> Option<u32> {
+    let bytes = payload.get(offset..offset.checked_add(4)?)?;
+    let bytes: [u8; 4] = bytes.try_into().ok()?;
+    Some(match byte_order {
+        TiffByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+        TiffByteOrder::BigEndian => u32::from_be_bytes(bytes),
+    })
+}
 
 fn decode_primary_avif_auxiliary_alpha_plane(
     input: &[u8],
@@ -5270,8 +5698,9 @@ fn decode_heif_bytes_to_rgba(
         Ok(decoded) => {
             guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             let transforms = isobmff::parse_primary_item_transform_properties(input)
-                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
-            return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
+                .transforms;
+            return decoded_uncompressed_to_rgba_image(decoded, &transforms);
         }
         Err(DecodeUncompressedError::ParsePrimaryProperties(
             isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
@@ -5280,18 +5709,14 @@ fn decode_heif_bytes_to_rgba(
     }
 
     let transforms = isobmff::parse_primary_item_transform_properties(input)
-        .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
     let icc_profile = primary_icc_profile_from_heic(input);
     let decoded = decode_primary_heic_to_image(input)?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     let auxiliary_alpha =
         decode_primary_heic_auxiliary_alpha_plane(input, decoded.width, decoded.height);
-    decoded_heic_to_rgba_image(
-        &decoded,
-        &transforms.transforms,
-        auxiliary_alpha.as_ref(),
-        icc_profile,
-    )
+    decoded_heic_to_rgba_image(&decoded, &transforms, auxiliary_alpha.as_ref(), icc_profile)
 }
 
 fn decode_heif_source_to_rgba<S: RandomAccessSource>(
@@ -5304,8 +5729,9 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
         Ok(decoded) => {
             guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             let transforms = isobmff::parse_primary_item_transform_properties(input)
-                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?;
-            return decoded_uncompressed_to_rgba_image(decoded, &transforms.transforms);
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
+                .transforms;
+            return decoded_uncompressed_to_rgba_image(decoded, &transforms);
         }
         Err(DecodeUncompressedError::ParsePrimaryProperties(
             isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
@@ -5314,7 +5740,8 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
     }
 
     let transforms = isobmff::parse_primary_item_transform_properties(input)
-        .map_err(DecodeHeicError::ParsePrimaryTransforms)?;
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
     let icc_profile = primary_icc_profile_from_heic(input);
     let decoded = decode_primary_heic_to_image_internal(input, &mut source)?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
@@ -5324,12 +5751,7 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
         decoded.width,
         decoded.height,
     );
-    decoded_heic_to_rgba_image(
-        &decoded,
-        &transforms.transforms,
-        auxiliary_alpha.as_ref(),
-        icc_profile,
-    )
+    decoded_heic_to_rgba_image(&decoded, &transforms, auxiliary_alpha.as_ref(), icc_profile)
 }
 
 fn decode_avif_bytes_to_png(
@@ -5359,6 +5781,19 @@ fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
         return Some(HeifInputFamily::Heif);
     }
     None
+}
+
+/// Return `true` when the path extension is `.heif` or `.heic`.
+///
+/// This helper is intended as a cheap caller-side gate before HEIF-specific
+/// metadata handling such as EXIF orientation inspection.
+pub fn path_extension_is_heif(path: &Path) -> bool {
+    matches!(extension_family_hint(path), Some(HeifInputFamily::Heif))
+}
+
+/// Return `true` when the path extension is one of `.heif`, `.heic`, or `.avif`.
+pub fn path_extension_is_heif_family(path: &Path) -> bool {
+    extension_family_hint(path).is_some()
 }
 
 fn has_file_brand(ftyp: &isobmff::FileTypeBox, accepted: &[[u8; 4]]) -> bool {
@@ -8512,18 +8947,21 @@ mod tests {
         decode_primary_uncompressed_to_image, decode_read_to_png, decode_read_to_rgba,
         decode_read_to_rgba_with_guardrails, decode_source_to_rgba_with_hint_and_guardrails,
         decode_uncompressed_multi_y_interleave, detect_input_family_from_source,
-        parse_length_prefixed_hevc_nal_units, read_selected_top_level_boxes_from_source,
-        stitch_decoded_heic_grid_tiles, validate_decoded_heic_image_against_metadata,
-        write_rgba8_png, AvifAuxiliaryAlphaPlane, AvifPixelLayout, AvifPlane, AvifPlaneSamples,
-        DecodeAvifError, DecodeError, DecodeErrorCategory, DecodeGuardrailError, DecodeGuardrails,
-        DecodeHeicError, DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage,
-        DecodedHeicImageMetadata, HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass,
-        TransformGuardError, UncompressedBitReader, UncompressedChannelRole,
-        UncompressedComponentDecodeSpec, UncompressedDecodeTileRegion, YCbCrMatrixCoefficients,
-        YCbCrRange, CMPC_PROPERTY_TYPE, FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL,
-        GENERIC_COMPRESSED_UNIT_IMAGE_ROW, ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE,
-        ICEF_SIZE_BITS_TABLE, META_BOX_TYPE, UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT,
-        UNCOMPRESSED_CHANNEL_CR, UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
+        exif_orientation_hint_from_path, exif_orientation_to_primary_item_transforms,
+        parse_exif_orientation_from_item_payload, parse_length_prefixed_hevc_nal_units,
+        path_extension_is_heif, path_extension_is_heif_family, primary_exif_orientation_from_path,
+        read_selected_top_level_boxes_from_source, stitch_decoded_heic_grid_tiles,
+        validate_decoded_heic_image_against_metadata, write_rgba8_png, AvifAuxiliaryAlphaPlane,
+        AvifPixelLayout, AvifPlane, AvifPlaneSamples, DecodeAvifError, DecodeError,
+        DecodeErrorCategory, DecodeGuardrailError, DecodeGuardrails, DecodeHeicError,
+        DecodeUncompressedError, DecodedAvifImage, DecodedHeicImage, DecodedHeicImageMetadata,
+        HeicPixelLayout, HeicPlane, HeifInputFamily, HevcNalClass, TransformGuardError,
+        UncompressedBitReader, UncompressedChannelRole, UncompressedComponentDecodeSpec,
+        UncompressedDecodeTileRegion, YCbCrMatrixCoefficients, YCbCrRange, CMPC_PROPERTY_TYPE,
+        FTYP_BOX_TYPE, GENERIC_COMPRESSED_UNIT_IMAGE_PIXEL, GENERIC_COMPRESSED_UNIT_IMAGE_ROW,
+        ICEF_OFFSET_BITS_TABLE, ICEF_PROPERTY_TYPE, ICEF_SIZE_BITS_TABLE, META_BOX_TYPE,
+        UNCOMPRESSED_CHANNEL_CB, UNCOMPRESSED_CHANNEL_COUNT, UNCOMPRESSED_CHANNEL_CR,
+        UNCOMPRESSED_CHANNEL_LUMA, UNCOMPRESSED_SAMPLING_422,
     };
     use scuffle_h265::NALUnitType;
     use std::io::{BufReader, Cursor};
@@ -9975,6 +10413,137 @@ mod tests {
                 2_u8, 0, 0, 255, // B
                 4_u8, 0, 0, 255, // D
             ]
+        );
+    }
+
+    #[test]
+    fn parses_exif_orientation_from_big_endian_exif_item_payload() {
+        let payload = vec![
+            0x00, 0x00, 0x00, 0x06, // tiff_header_offset
+            b'E', b'x', b'i', b'f', 0x00, 0x00, // "Exif\0\0"
+            b'M', b'M', 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, // TIFF header
+            0x00, 0x01, // IFD entry count
+            0x01, 0x12, // tag: orientation
+            0x00, 0x03, // type: SHORT
+            0x00, 0x00, 0x00, 0x01, // count: 1
+            0x00, 0x06, 0x00, 0x00, // value: 6
+            0x00, 0x00, 0x00, 0x00, // next IFD offset
+        ];
+
+        let orientation = parse_exif_orientation_from_item_payload(&payload)
+            .expect("valid Exif payload should expose orientation");
+        assert_eq!(orientation, 6);
+    }
+
+    #[test]
+    fn parses_exif_orientation_from_little_endian_exif_item_payload() {
+        let payload = vec![
+            0x00, 0x00, 0x00, 0x06, // tiff_header_offset
+            b'E', b'x', b'i', b'f', 0x00, 0x00, // "Exif\0\0"
+            b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // TIFF header
+            0x01, 0x00, // IFD entry count
+            0x12, 0x01, // tag: orientation
+            0x03, 0x00, // type: SHORT
+            0x01, 0x00, 0x00, 0x00, // count: 1
+            0x05, 0x00, 0x00, 0x00, // value: 5
+            0x00, 0x00, 0x00, 0x00, // next IFD offset
+        ];
+
+        let orientation = parse_exif_orientation_from_item_payload(&payload)
+            .expect("valid Exif payload should expose orientation");
+        assert_eq!(orientation, 5);
+    }
+
+    #[test]
+    fn maps_exif_orientation_6_to_rotate_90_cw_geometry_and_pixel_order() {
+        let transforms = exif_orientation_to_primary_item_transforms(6)
+            .expect("orientation 6 should map to transforms");
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A
+            2_u8, 0, 0, 255, // B
+        ];
+
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(2, 1, pixels, &transforms)
+                .expect("orientation 6 transform should apply");
+        assert_eq!((width, height), (1, 2));
+        assert_eq!(
+            transformed,
+            vec![
+                1_u8, 0, 0, 255, // A (top)
+                2_u8, 0, 0, 255, // B (bottom)
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_exif_orientation_5_to_mirror_horizontal_rotate_270_cw() {
+        let transforms = exif_orientation_to_primary_item_transforms(5)
+            .expect("orientation 5 should map to transforms");
+        let pixels = vec![
+            1_u8, 0, 0, 255, // A (0,0)
+            2_u8, 0, 0, 255, // B (1,0)
+            3_u8, 0, 0, 255, // C (0,1)
+            4_u8, 0, 0, 255, // D (1,1)
+        ];
+
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(2, 2, pixels, &transforms)
+                .expect("orientation 5 transform should apply");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            transformed,
+            vec![
+                1_u8, 0, 0, 255, // A
+                3_u8, 0, 0, 255, // C
+                2_u8, 0, 0, 255, // B
+                4_u8, 0, 0, 255, // D
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_heif_family_extensions_from_path() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(path_extension_is_heif(
+            &base.join("tests/fixtures/sample.HEIC")
+        ));
+        assert!(path_extension_is_heif(
+            &base.join("tests/fixtures/sample.heif")
+        ));
+        assert!(!path_extension_is_heif(
+            &base.join("tests/fixtures/sample.avif")
+        ));
+        assert!(path_extension_is_heif_family(
+            &base.join("tests/fixtures/sample.avif")
+        ));
+        assert!(!path_extension_is_heif_family(
+            &base.join("tests/fixtures/sample.jpg")
+        ));
+    }
+
+    #[test]
+    fn reads_exif_orientation_hint_from_path_without_decode() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1718_rotate_90_cw.HEIC");
+        let hint =
+            exif_orientation_hint_from_path(&fixture).expect("path hint inspection should succeed");
+        assert_eq!(hint.exif_orientation, Some(6));
+        assert!(!hint.primary_item_has_orientation_transform);
+        assert_eq!(hint.orientation_to_apply(), Some(6));
+    }
+
+    #[test]
+    fn skips_orientation_hint_for_non_heif_extension_paths() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libheif/examples/example.avif");
+        let hint =
+            exif_orientation_hint_from_path(&fixture).expect("path hint inspection should succeed");
+        assert_eq!(hint.exif_orientation, None);
+        assert!(!hint.primary_item_has_orientation_transform);
+        assert_eq!(
+            primary_exif_orientation_from_path(&fixture).expect("path exif check should succeed"),
+            None
         );
     }
 

@@ -6,6 +6,13 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
 
 - Decode `.heif`, `.heic`, and `.avif` into RGBA buffers (`u8` or `u16`).
 - Decode from `bytes`, `Read`, `BufRead`, and file `Path`.
+- Keep default decode output aligned with primary-item transforms (`clap`/`irot`/`imir`) for libheif parity.
+- Expose explicit EXIF orientation helpers so callers can apply orientation at the app layer:
+  - `exif_orientation_hint`
+  - `exif_orientation_hint_from_path`
+  - `path_extension_is_heif`
+  - `DecodedRgbaImage::apply_exif_orientation`
+  - `image_integration::apply_exif_orientation_dynamic`
 - Optional guardrails for bounded production use:
   - max input bytes
   - max decoded pixel count
@@ -60,12 +67,56 @@ fn decode_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## EXIF Orientation Policy
+
+- `libheic-rs` does **not** implicitly apply EXIF orientation to decoded output.
+- This keeps default output behavior stable and aligned with libheif parity.
+- If your app wants display-oriented output, apply EXIF orientation explicitly:
+
+```rust
+use libheic_rs::{decode_path_to_rgba, exif_orientation_hint};
+use std::path::Path;
+
+fn decode_with_explicit_orientation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let input = std::fs::read(path)?;
+    let hint = exif_orientation_hint(&input);
+
+    let decoded = decode_path_to_rgba(path)?;
+    let decoded = if let Some(orientation) = hint.orientation_to_apply() {
+        decoded.apply_exif_orientation(orientation)?
+    } else {
+        decoded
+    };
+
+    println!("final dimensions: {}x{}", decoded.width, decoded.height);
+    Ok(())
+}
+```
+
+Path-based (no full file read, no pixel decode) orientation hint:
+
+```rust
+use libheic_rs::{exif_orientation_hint_from_path, path_extension_is_heif};
+use std::path::Path;
+
+fn orientation_from_path(path: &Path) -> Result<Option<u8>, libheic_rs::DecodeError> {
+    if !path_extension_is_heif(path) {
+        return Ok(None);
+    }
+    let hint = exif_orientation_hint_from_path(path)?;
+    Ok(hint.orientation_to_apply())
+}
+```
+
 ## Hook Into The `image` Crate
 
 ```rust
 use image::ImageReader;
-use libheic_rs::image_integration::register_image_decoder_hooks_with_guardrails;
-use libheic_rs::DecodeGuardrails;
+use libheic_rs::image_integration::{
+    apply_exif_orientation_dynamic,
+    register_image_decoder_hooks_with_guardrails,
+};
+use libheic_rs::{exif_orientation_hint, DecodeGuardrails};
 
 fn init_image_hooks() {
     let guardrails = DecodeGuardrails {
@@ -80,7 +131,20 @@ fn init_image_hooks() {
 }
 
 fn decode_with_image(path: &str) -> image::ImageResult<image::DynamicImage> {
-    ImageReader::open(path)?.with_guessed_format()?.decode()
+    let bytes = std::fs::read(path).map_err(image::ImageError::IoError)?;
+    let hint = exif_orientation_hint(&bytes);
+
+    let image = ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()?
+        .decode()?;
+
+    let image = if let Some(orientation) = hint.orientation_to_apply() {
+        apply_exif_orientation_dynamic(image, orientation)
+    } else {
+        image
+    };
+
+    Ok(image)
 }
 ```
 

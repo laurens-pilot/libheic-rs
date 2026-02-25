@@ -54,6 +54,23 @@ static REGISTER_IMAGE_FORMAT_DETECTION_HOOKS: Once = Once::new();
 pub type Rgba8ImageBuffer = ImageBuffer<Rgba<u8>, Vec<u8>>;
 pub type Rgba16ImageBuffer = ImageBuffer<Rgba<u16>, Vec<u16>>;
 
+/// Apply EXIF orientation (`1..=8`) to an `image::DynamicImage`.
+///
+/// This helper is intended for callers that decode with libheif-parity behavior
+/// and then apply orientation explicitly at the application layer.
+pub fn apply_exif_orientation_dynamic(image: DynamicImage, exif_orientation: u8) -> DynamicImage {
+    match exif_orientation {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.fliph().rotate270(),
+        6 => image.rotate90(),
+        7 => image.fliph().rotate90(),
+        8 => image.rotate270(),
+        _ => image,
+    }
+}
+
 /// Dedicated `image::ImageDecoder` adapter backed by decoded RGBA samples.
 ///
 /// This adapter decodes HEIF/HEIC/AVIF inputs directly into in-memory RGBA and
@@ -600,7 +617,10 @@ fn decode_error_to_image_error(err: DecodeError) -> ImageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HeifImageDecoder, ImageBufferKind, ImageConversionError, ImageHookRegistration};
+    use super::{
+        apply_exif_orientation_dynamic, HeifImageDecoder, ImageBufferKind, ImageConversionError,
+        ImageHookRegistration,
+    };
     use crate::{DecodeGuardrails, DecodedRgbaImage, DecodedRgbaPixels};
     use image::error::ParameterErrorKind;
     use image::{DynamicImage, ImageDecoder, ImageError};
@@ -783,5 +803,18 @@ mod tests {
         };
         assert!(status.any_decoder_hook_registered());
         assert!(!status.all_decoder_hooks_registered());
+    }
+
+    #[test]
+    fn applies_exif_orientation_on_dynamic_image() {
+        let image = DynamicImage::ImageRgba8(
+            image::ImageBuffer::from_raw(2, 1, vec![1, 0, 0, 255, 2, 0, 0, 255])
+                .expect("test image should construct"),
+        );
+
+        let oriented = apply_exif_orientation_dynamic(image, 6);
+        let oriented = oriented.to_rgba8();
+        assert_eq!(oriented.dimensions(), (1, 2));
+        assert_eq!(oriented.into_raw(), vec![1, 0, 0, 255, 2, 0, 0, 255]);
     }
 }

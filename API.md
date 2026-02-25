@@ -7,6 +7,7 @@ This document is the practical API reference for integrating `libheic-rs` in app
 - Decode HEIF/HEIC/AVIF to RGBA (`u8` or `u16` storage).
 - Decode from bytes, `Read`, `BufRead`, and file paths.
 - Optional `image` crate integration through hook registration.
+- Keep default decode output aligned with primary item transforms (`clap`/`irot`/`imir`) and expose explicit EXIF orientation helpers.
 
 ## Feature Flags
 
@@ -17,7 +18,7 @@ This document is the practical API reference for integrating `libheic-rs` in app
 
 ```toml
 [dependencies]
-libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.0" }
+libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.1" }
 # or:
 # libheic-rs = { path = "../libheic-rs" }
 ```
@@ -26,7 +27,7 @@ With `image` integration:
 
 ```toml
 [dependencies]
-libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.0", features = ["image-integration"] }
+libheic-rs = { git = "https://github.com/laurens-pilot/libheic-rs.git", tag = "v0.1.1", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 
@@ -42,6 +43,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
   - `source_bit_depth`
   - `pixels: DecodedRgbaPixels` (`U8(Vec<u8>)` or `U16(Vec<u16>)`)
   - `icc_profile: Option<Vec<u8>>`
+- `ExifOrientationHint`
+  - `exif_orientation: Option<u8>`
+  - `primary_item_has_orientation_transform: bool`
+  - `should_apply_exif_orientation()`
+  - `orientation_to_apply()`
 - `DecodeError`, `DecodeErrorCategory`, `DecodeGuardrailError`
 
 ## Core Decode Entry Points
@@ -177,6 +183,62 @@ Helpers on `DecodedRgbaImage` / `DecodedRgbaPixels`:
 - `storage_bit_depth()`
 - `as_rgba8()`, `as_rgba16()`
 - `into_rgba8()`, `into_rgba16()`
+- `apply_exif_orientation(exif_orientation)`
+
+## EXIF Orientation Handling
+
+Default decode behavior:
+
+- Decode applies HEIF primary item transforms from `clap`/`irot`/`imir`.
+- Decode does not implicitly apply EXIF orientation.
+- This keeps output stable for libheif parity and avoids hidden double-rotation behavior.
+
+Orientation APIs:
+
+- `exif_orientation_hint(input_bytes)` -> `ExifOrientationHint`
+- `exif_orientation_hint_from_path(input_path)` -> `Result<ExifOrientationHint, DecodeError>`
+- `primary_exif_orientation(input_bytes)` -> `Option<u8>`
+- `primary_exif_orientation_from_path(input_path)` -> `Result<Option<u8>, DecodeError>`
+- `primary_item_has_orientation_transform(input_bytes)` -> `bool`
+- `path_extension_is_heif(path)` -> `bool`
+- `path_extension_is_heif_family(path)` -> `bool`
+- `DecodedRgbaImage::apply_exif_orientation(exif_orientation)` -> `Result<DecodedRgbaImage, DecodeError>`
+
+Recommended pattern:
+
+```rust
+use libheic_rs::{decode_path_to_rgba, exif_orientation_hint};
+use std::path::Path;
+
+fn decode_with_explicit_orientation(path: &Path) -> Result<(), libheic_rs::DecodeError> {
+    let input = std::fs::read(path).map_err(libheic_rs::DecodeError::Io)?;
+    let hint = exif_orientation_hint(&input);
+
+    let decoded = decode_path_to_rgba(path)?;
+    let decoded = if let Some(orientation) = hint.orientation_to_apply() {
+        decoded.apply_exif_orientation(orientation)?
+    } else {
+        decoded
+    };
+
+    eprintln!("{}x{}", decoded.width, decoded.height);
+    Ok(())
+}
+```
+
+Path-only variant (no full input read, no image decode):
+
+```rust
+use libheic_rs::{exif_orientation_hint_from_path, path_extension_is_heif};
+use std::path::Path;
+
+fn orientation_to_apply(path: &Path) -> Result<Option<u8>, libheic_rs::DecodeError> {
+    if !path_extension_is_heif(path) {
+        return Ok(None);
+    }
+    Ok(exif_orientation_hint_from_path(path)?.orientation_to_apply())
+}
+```
 
 ## image Integration
 
@@ -202,10 +264,21 @@ assert!(registration.any_decoder_hook_registered());
 
 ```rust
 use image::ImageReader;
+use libheic_rs::exif_orientation_hint;
+use libheic_rs::image_integration::apply_exif_orientation_dynamic;
 
-let img = ImageReader::open("input.heic")?
+let bytes = std::fs::read("input.heic").map_err(image::ImageError::IoError)?;
+let hint = exif_orientation_hint(&bytes);
+
+let img = ImageReader::new(std::io::Cursor::new(&bytes))
     .with_guessed_format()?
     .decode()?;
+
+let img = if let Some(orientation) = hint.orientation_to_apply() {
+    apply_exif_orientation_dynamic(img, orientation)
+} else {
+    img
+};
 ```
 
 ### 3) Direct adapter usage (optional)
@@ -236,6 +309,10 @@ Possible conversion failures:
 
 - `ImageConversionError::SampleCountOverflow`
 - `ImageConversionError::SampleCountMismatch`
+
+Additional helper under `image-integration`:
+
+- `apply_exif_orientation_dynamic(image, exif_orientation)`
 
 ## AI/Automation Usage Rules
 
