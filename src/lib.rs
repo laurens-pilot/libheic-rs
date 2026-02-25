@@ -1,3 +1,11 @@
+//! Pure Rust HEIF/HEIC/AVIF decoding APIs.
+//!
+//! For production usage, prefer the `*_with_guardrails` entry points and set
+//! explicit [`DecodeGuardrails`] values for input bytes, decoded pixels, and
+//! non-seek temp spool limits.
+//!
+//! See `API.md` in the crate root for an integration-oriented API guide.
+
 use brotli::Decompressor as BrotliDecompressor;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use heic_decoder::DecodedFrame as HeicDecoderFrame;
@@ -5591,6 +5599,9 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
 }
 
 /// Configurable decode guardrails for bounded ingestion.
+///
+/// Default values are fully unbounded (`None` for all fields). For production
+/// environments, set explicit limits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeGuardrails {
     /// Optional maximum accepted input size in bytes for all decode entry points.

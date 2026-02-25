@@ -1,3 +1,12 @@
+//! Optional `image` crate integration helpers.
+//!
+//! Enable the `image-integration` feature to:
+//! - register HEIF/HEIC/AVIF decoder hooks for `image::ImageReader`
+//! - convert [`DecodedRgbaImage`](crate::DecodedRgbaImage) into `image` buffers
+//!   and `DynamicImage` values.
+//!
+//! See `API.md` in the crate root for end-to-end examples.
+
 use crate::{
     decode_bufread_to_rgba_with_guardrails, decode_bytes_to_rgba_with_guardrails,
     decode_path_to_rgba_with_guardrails, decode_read_to_rgba_with_guardrails,

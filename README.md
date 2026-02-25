@@ -13,6 +13,10 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
   - custom temp spool directory
 - Optional `image` integration feature that registers decoder hooks so `image::ImageReader` can open HEIF/HEIC/AVIF directly.
 
+## API Docs
+
+- Detailed API guide: [`API.md`](API.md)
+
 ## Install
 
 `Cargo.toml` (local path dependency):
